@@ -37,7 +37,7 @@
   {
     "name": "server persisted name/skill/tags",
     "ok": true,
-    "detail": "{'id': 'f9518883-3dc3-491f-bd30-2c86ec34daf9', 'name': 'E2E One', 'skill': 10, 'tags': ['sniper', 'igl'], 'sittingOut': False, 'createdAt': 1795687187619, 'updatedAt': 1795687187619}"
+    "detail": "{'id': 'e1a1df43-e147-4e6a-886e-f88e4118062f', 'name': 'E2E One', 'skill': 10, 'tags': ['sniper', 'igl'], 'sittingOut': False, 'createdAt': 1795687466999, 'updatedAt': 1795687466999}"
   },
   {
     "name": "skill rating writes one PATCH per tick",
@@ -72,7 +72,7 @@
   {
     "name": "fairness suggestion appears for uneven roster",
     "ok": true,
-    "detail": "13 available across 3 teams leaves 1 on the bench. Fewest rounds sat: E2E B.  Sit them out"
+    "detail": "13 available across 3 teams leaves 1 on the bench. Fewest rounds sat: E2E A.  Sit them out"
   },
   {
     "name": "sit-out dims the row",
@@ -97,7 +97,7 @@
   {
     "name": "generate completes in ~a second",
     "ok": true,
-    "detail": "118 ms"
+    "detail": "127 ms"
   },
   {
     "name": "arrangements returned",
@@ -182,7 +182,7 @@
   {
     "name": "30 players / 6 teams generates under 3s",
     "ok": true,
-    "detail": "123 ms"
+    "detail": "113 ms"
   },
   {
     "name": "large search reports its coverage honestly",
@@ -197,7 +197,7 @@
   {
     "name": "UI stays responsive during a large search",
     "ok": true,
-    "detail": "worst frame gap 18 ms"
+    "detail": "worst frame gap 19 ms"
   },
   {
     "name": "no console errors",

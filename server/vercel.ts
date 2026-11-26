@@ -5,9 +5,13 @@ import { currentUser, getAuth, type Env } from '../src/worker/auth'
 import type { Database } from '../src/worker/db'
 
 /**
- * Vercel entrypoint. It runs the same Hono app as the Cloudflare Worker behind
- * `/api/*` and `/auth/freebuff/*` (see vercel.json); Vercel serves the files in
- * dist-client itself, so there is no ASSETS binding here.
+ * Vercel entrypoint (compiled into the committed `api/index.js` bundle by
+ * `bun run build:api`, because Vercel does not bundle relative imports outside
+ * `api/` for an ESM project).
+ *
+ * It runs the same Hono app as the Cloudflare Worker behind `/api/*` and
+ * `/auth/freebuff/*` (see vercel.json); Vercel serves the files in dist-client
+ * itself, so there is no ASSETS binding here.
  *
  * Environment: APP_ORIGIN, FREEBUFF_CLIENT_ID, FREEBUFF_ISSUER,
  * TURSO_DATABASE_URL, TURSO_AUTH_TOKEN. Without the database URL the app stays

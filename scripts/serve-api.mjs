@@ -1,7 +1,7 @@
 /**
- * Runs the built Vercel function (`.tmp-api/api.mjs`) under plain Node, the
- * runtime Vercel uses, against a local SQLite file. This is the closest local
- * stand-in for production: real `node`, real `@libsql/client`, real
+ * Runs the built Vercel function (`api/index.js`, the file Vercel deploys) under
+ * plain Node, the runtime Vercel uses, against a local SQLite file. This is the
+ * closest local stand-in for production: real `node`, real libSQL driver, real
  * `@hono/node-server` (req, res) plumbing.
  *
  *   bun run build:api && bun run serve:api
@@ -22,7 +22,7 @@ if (databasePath !== ':memory:') {
 process.env.TURSO_DATABASE_URL ??=
   'file:' + process.cwd().replaceAll('\\', '/') + '/' + databasePath
 
-const { default: handler } = await import('../.tmp-api/api.mjs')
+const { default: handler } = await import('../api/index.js')
 
 const server = http.createServer(handler)
 const port = Number(process.env.PORT ?? 5175)

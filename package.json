@@ -6,8 +6,8 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "vite build && node scripts/postbuild.mjs",
-    "build:vercel": "vite build --config vite.vercel.config.ts",
-    "build:api": "bun build api/index.ts --target node --format esm --packages external --outfile .tmp-api/api.mjs",
+    "build:vercel": "vite build --config vite.vercel.config.ts && bun run build:api",
+    "build:api": "bun build server/vercel.ts --target node --format esm --packages external --outfile api/index.js",
     "serve:api": "node scripts/serve-api.mjs",
     "serve:node": "bun run scripts/serve-node.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.worker.json",

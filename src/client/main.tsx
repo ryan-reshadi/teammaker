@@ -250,13 +250,15 @@ function App() {
             roster and saved rounds across sessions.
           </p>
         )}
-        {session?.mode === 'setup' && session.database === false && (
+        {/* An unreachable server sets `error` below, so these notices only
+            describe a server that answered without storage or sign-in. */}
+        {session?.mode === 'setup' && session.database === false && !error && (
           <p className="notice">
-            The workspace server is unavailable, so this roster lives in your
-            browser for now.
+            This deployment has no database configured, so this roster is saved
+            in this browser only.
           </p>
         )}
-        {session?.mode === 'setup' && session.database && (
+        {session?.mode === 'setup' && session.database && !error && (
           <p className="notice">
             Sign-in is not configured on this deployment, so this roster is
             saved in this browser only.

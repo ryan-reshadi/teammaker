@@ -244,6 +244,15 @@ implements it over [libSQL/Turso](https://turso.tech) for Node hosts.
 | Database | D1 binding `DB` | libSQL over HTTP |
 | Static files | Worker `ASSETS` binding | Vercel's own CDN |
 
+The Vercel function is a **committed bundle**: `bun run build:api` compiles
+`server/vercel.ts` into the single self-contained `api/index.js`. Vercel's Node
+builder transpiles an `api/*.ts` entry without bundling it, so relative imports
+into `src/` break at runtime with `ERR_MODULE_NOT_FOUND`; one file with only
+package imports cannot fail that way. `bun run build:vercel` runs the client
+build and this bundle together, so the deployed copy is always regenerated —
+run `bun run build:api` and commit `api/index.js` after changing anything under
+`src/worker`, `src/server` or `server/`.
+
 `vercel.json` rewrites `/api/*` and `/auth/freebuff/*` to the function, then
 falls back to `index.html` for deep links; `api/index.ts` binds the same Hono
 app with `@hono/node-server` and wraps it in `auth.wrap` exactly like the

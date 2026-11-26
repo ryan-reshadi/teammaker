@@ -1,4 +1,3 @@
-import { createClient } from '@libsql/client'
 import type { Database, Statement } from '../worker/db'
 
 /**
@@ -77,12 +76,34 @@ export function databaseFromExecutor(executor: Executor): Database {
   return new LibsqlDatabase(executor)
 }
 
+type LibsqlClient = {
+  execute(input: { sql: string; args: unknown[] }): Promise<{
+    columns: string[]
+    rows: Record<string, unknown>[]
+  }>
+  batch(
+    statements: { sql: string; args: unknown[] }[],
+    mode: 'write',
+  ): Promise<unknown>
+}
+
 export function createLibsqlDatabase(url: string, authToken?: string): Database {
-  const client = createClient({ url, authToken })
+  // The HTTP client has no native dependencies, which is what a serverless host
+  // needs. The native driver is only loaded for local `file:` databases (the
+  // test harnesses), and only when a query actually runs.
+  let clientPromise: Promise<LibsqlClient> | null = null
+  const client = async (): Promise<LibsqlClient> => {
+    clientPromise ??= (url.startsWith('file:')
+      ? import('@libsql/client')
+      : import('@libsql/client/web')
+    ).then((module) => module.createClient({ url, authToken }) as unknown as LibsqlClient)
+    return clientPromise
+  }
+
   return databaseFromExecutor({
     async execute({ sql, args }) {
       // libSQL hands rows back as arrays that also carry column names.
-      const result = await client.execute({ sql, args: args as never })
+      const result = await (await client()).execute({ sql, args: args as never })
       const columns = result.columns
       const values = result.rows.map((row) =>
         columns.map((column) => row[column]),
@@ -90,7 +111,7 @@ export function createLibsqlDatabase(url: string, authToken?: string): Database 
       return [values, columns]
     },
     async batch(statements) {
-      await client.batch(
+      await (await client()).batch(
         statements.map(({ sql, args }) => ({ sql, args: args as never })),
         'write',
       )
