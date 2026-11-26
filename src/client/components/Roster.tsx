@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { clampElo, skillFromElo } from '../../shared/elo'
 import { roleLabel } from '../../shared/roles'
 import type { Player } from '../../shared/types'
 import type { PlayerDraft, PlayerPatch } from '../store'
@@ -33,14 +34,16 @@ export function Roster({
   const [draftSkill, setDraftSkill] = useState(5)
   const [draftTags, setDraftTags] = useState<string[]>([])
   const [roleEditor, setRoleEditor] = useState<string | null>(null)
+  const [eloEditor, setEloEditor] = useState<string | null>(null)
+  const [eloDraft, setEloDraft] = useState('')
   const [bulk, setBulk] = useState(false)
   const [bulkText, setBulkText] = useState('')
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editingName, setEditingName] = useState('')
 
-  const total = players.reduce((sum, player) => sum + player.skill, 0)
+  const total = players.reduce((sum, player) => sum + player.elo, 0)
   const benched = players.filter((player) => player.sittingOut).length
-  const average = players.length ? (total / players.length).toFixed(1) : '0'
+  const average = players.length ? Math.round(total / players.length) : 0
 
   const add = async (event: React.FormEvent) => {
     event.preventDefault()
@@ -67,6 +70,19 @@ export function Roster({
     if (name && name !== player.name) void onUpdate(player.id, { name })
   }
 
+  const openElo = (player: Player) => {
+    setEloDraft(String(player.elo))
+    setEloEditor(player.id)
+  }
+
+  const commitElo = (player: Player) => {
+    const parsed = Number(eloDraft)
+    setEloEditor(null)
+    if (!Number.isFinite(parsed)) return
+    const elo = clampElo(parsed)
+    if (elo !== player.elo) void onUpdate(player.id, { elo })
+  }
+
   return (
     <section className="panel roster" aria-labelledby="roster-title">
       <div className="panel-head">
@@ -74,7 +90,7 @@ export function Roster({
           <h2 id="roster-title">Roster</h2>
           <p className="sub">
             <strong>{players.length}</strong> {players.length === 1 ? 'player' : 'players'} ·{' '}
-            <strong>{total}</strong> total skill · avg <strong>{average}</strong>
+            <strong>{total}</strong> total elo · avg <strong>{average}</strong>
             {benched > 0 && <> · {benched} sitting out</>}
           </p>
         </div>
@@ -94,7 +110,7 @@ export function Roster({
           <SkillPicker
             value={draftSkill}
             onChange={setDraftSkill}
-            label="Skill for the new player"
+            label="Starting rating for the new player"
           />
           <button
             className="primary"
@@ -149,120 +165,156 @@ export function Roster({
 
       {players.length === 0 ? (
         <p className="empty-state">
-          Add your players and rate each one from 1 to 10. Skill 5 is a good
-          starting guess — you can fine-tune it any time.
+          Add your players and rate each one from 1 to 10. That rating seeds their
+          elo (100 points a point); matches tune it from there.
         </p>
       ) : (
         <ul className="player-list">
-          {players.map((player) => (
-            <li
-              key={player.id}
-              className={`player-row${player.sittingOut ? ' benched' : ''}`}
-            >
-              {editingId === player.id ? (
-                <input
-                  className="player-name-input"
-                  autoFocus
-                  maxLength={40}
-                  value={editingName}
-                  aria-label={`Name for ${player.name}`}
-                  onChange={(event) => setEditingName(event.target.value)}
-                  onBlur={() => commitName(player)}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter') {
-                      event.preventDefault()
-                      commitName(player)
-                    }
-                    if (event.key === 'Escape') setEditingId(null)
-                  }}
-                />
-              ) : (
-                <button
-                  type="button"
-                  className="player-name"
-                  title="Rename"
-                  onClick={() => {
-                    setEditingId(player.id)
-                    setEditingName(player.name)
-                  }}
-                >
-                  <span className="player-name-text">{player.name}</span>
-                  {suggestions.includes(player.id) && (
-                    <span className="suggest-badge">bench?</span>
-                  )}
-                </button>
-              )}
-              <SkillPicker
-                value={player.skill}
-                onChange={(skill) => void onUpdate(player.id, { skill })}
-                label={`Skill for ${player.name}`}
-              />
-              <button
-                type="button"
-                className="sit-toggle"
-                aria-pressed={player.sittingOut}
-                title={
-                  player.sittingOut
-                    ? `${player.name} is sitting out — bring them back in`
-                    : `Sit ${player.name} out of this round`
-                }
-                onClick={() =>
-                  void onUpdate(player.id, { sittingOut: !player.sittingOut })
-                }
+          {players.map((player) => {
+            const band = skillFromElo(player.elo)
+            return (
+              <li
+                key={player.id}
+                className={`player-row${player.sittingOut ? ' benched' : ''}`}
               >
-                <span className="sit-dot" aria-hidden="true" />
-                {player.sittingOut ? 'Out' : 'Sit out'}
-              </button>
-              <button
-                type="button"
-                className="icon-button"
-                aria-label={`Remove ${player.name}`}
-                title={`Remove ${player.name}`}
-                onClick={() => void onRemove(player.id)}
-              >
-                ×
-              </button>
-              <div className="player-roles">
-                {roleEditor === player.id ? (
-                  <div className="role-editor">
-                    <RolePicker
-                      value={player.tags}
-                      onChange={(tags) => void onUpdate(player.id, { tags })}
-                      label={`Roles for ${player.name}`}
-                    />
-                    <button
-                      type="button"
-                      className="quiet"
-                      onClick={() => setRoleEditor(null)}
-                    >
-                      Done
-                    </button>
-                  </div>
+                {editingId === player.id ? (
+                  <input
+                    className="player-name-input"
+                    autoFocus
+                    maxLength={40}
+                    value={editingName}
+                    aria-label={`Name for ${player.name}`}
+                    onChange={(event) => setEditingName(event.target.value)}
+                    onBlur={() => commitName(player)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault()
+                        commitName(player)
+                      }
+                      if (event.key === 'Escape') setEditingId(null)
+                    }}
+                  />
                 ) : (
                   <button
                     type="button"
-                    className="role-summary"
-                    aria-label={`Roles for ${player.name}: ${
-                      player.tags.length
-                        ? player.tags.map(roleLabel).join(', ')
-                        : 'none yet'
-                    }`}
-                    onClick={() => setRoleEditor(player.id)}
+                    className="player-name"
+                    title="Rename"
+                    onClick={() => {
+                      setEditingId(player.id)
+                      setEditingName(player.name)
+                    }}
                   >
-                    {player.tags.length ? (
-                      player.tags.map((tag) => (
-                        <span key={tag} className="role-chip">
-                          {roleLabel(tag)}
-                        </span>
-                      ))
-                    ) : (
-                      <span className="role-empty">+ roles</span>
+                    <span className="player-name-text">{player.name}</span>
+                    {suggestions.includes(player.id) && (
+                      <span className="suggest-badge">bench?</span>
                     )}
                   </button>
                 )}
-              </div>
-            </li>
-          ))}
+                {eloEditor === player.id ? (
+                  <input
+                    className="elo-input"
+                    type="number"
+                    min={100}
+                    max={1000}
+                    step={1}
+                    autoFocus
+                    value={eloDraft}
+                    aria-label={`Elo for ${player.name}`}
+                    onChange={(event) => setEloDraft(event.target.value)}
+                    onBlur={() => commitElo(player)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault()
+                        event.currentTarget.blur()
+                      }
+                      if (event.key === 'Escape') setEloEditor(null)
+                    }}
+                  />
+                ) : (
+                  <button
+                    type="button"
+                    className="elo-badge"
+                    aria-label={`Advanced elo for ${player.name}: ${player.elo}`}
+                    title={`Advanced · edit ${player.elo} elo directly`}
+                    onClick={() => openElo(player)}
+                  >
+                    {player.elo}
+                  </button>
+                )}
+                <SkillPicker
+                  value={band}
+                  onChange={(skill) => {
+                    if (skill !== band) void onUpdate(player.id, { skill })
+                  }}
+                  label={`Rating for ${player.name}`}
+                />
+                <button
+                  type="button"
+                  className="sit-toggle"
+                  aria-pressed={player.sittingOut}
+                  title={
+                    player.sittingOut
+                      ? `${player.name} is sitting out — bring them back in`
+                      : `Sit ${player.name} out of this round`
+                  }
+                  onClick={() =>
+                    void onUpdate(player.id, { sittingOut: !player.sittingOut })
+                  }
+                >
+                  <span className="sit-dot" aria-hidden="true" />
+                  {player.sittingOut ? 'Out' : 'Sit out'}
+                </button>
+                <button
+                  type="button"
+                  className="icon-button"
+                  aria-label={`Remove ${player.name}`}
+                  title={`Remove ${player.name}`}
+                  onClick={() => void onRemove(player.id)}
+                >
+                  ×
+                </button>
+                <div className="player-roles">
+                  {roleEditor === player.id ? (
+                    <div className="role-editor">
+                      <RolePicker
+                        value={player.tags}
+                        onChange={(tags) => void onUpdate(player.id, { tags })}
+                        label={`Roles for ${player.name}`}
+                      />
+                      <button
+                        type="button"
+                        className="quiet"
+                        onClick={() => setRoleEditor(null)}
+                      >
+                        Done
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      className="role-summary"
+                      aria-label={`Roles for ${player.name}: ${
+                        player.tags.length
+                          ? player.tags.map(roleLabel).join(', ')
+                          : 'none yet'
+                      }`}
+                      onClick={() => setRoleEditor(player.id)}
+                    >
+                      {player.tags.length ? (
+                        player.tags.map((tag) => (
+                          <span key={tag} className="role-chip">
+                            {roleLabel(tag)}
+                          </span>
+                        ))
+                      ) : (
+                        <span className="role-empty">+ roles</span>
+                      )}
+                    </button>
+                  )}
+                </div>
+              </li>
+            )
+          })}
         </ul>
       )}
     </section>

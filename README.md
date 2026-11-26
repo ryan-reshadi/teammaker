@@ -1,10 +1,11 @@
 # Teammaker
 
-Balanced teams from a rated roster. Rate everyone once from 1 to 10, choose how
-many teams you need and how close their totals must be, and Teammaker returns
-every split that fits — ranked by tightness and deliberately different from each
-other. Players can sit out a round, and the app suggests who should sit next so
-the bench stays fair.
+Balanced teams from an elo-rated roster. Rate everyone once from 1 to 10 to seed
+their elo (100 points a point, 100–1000), log the damage from real matches, and
+the ratings tune themselves from there. Choose how many teams you need and how
+close their elo totals must be, and Teammaker returns every split that fits —
+ranked by tightness and deliberately different from each other. Players can sit
+out a round, and the app suggests who should sit next so the bench stays fair.
 
 A single-page React app served by a Hono Worker on Freebuff Sites, with a D1
 database for signed-in rosters and a device-local fallback that works without an
@@ -28,22 +29,27 @@ sign-in configuration.
 
 ## What it does
 
-- **Roster** — add a player with a name and a skill. The skill is set on a
-  ten-tick control with a numeric readout, names rename inline, and
-  "Add several at once" pastes a newline- or comma-separated list (everyone joins
-  at skill 5). The header tracks player count, total skill, average and how many
-  are sitting out.
+- **Roster** — add a player with a name and a rating. The ten-tick control shows
+  the elo band and seeds a new player at rating × 100; the badge beside it shows
+  the exact elo and opens an advanced field that edits it directly. Names rename
+  inline, and "Add several at once" pastes a newline- or comma-separated list
+  (everyone joins at 5 / 500). The header tracks player count, total elo, average
+  and how many are sitting out.
 - **Roles** — every player can carry any number of shooter roles (sniper, push,
   anti-push, entry, support, flank, IGL, flex). They persist with the player and
   are used to give each team a working composition, not just equal totals.
-- **Build** — pick 2–8 teams and a tolerance from 0 to 20, then generate. Each
-  result is a set of colour-coded team columns with per-team sums, a proportional
-  balance bar and a spread chip, paged with next/previous through up to 12
-  arrangements.
+- **Build** — pick 2–8 teams and an elo tolerance from 0 to 2000, then generate.
+  Each result is a set of colour-coded team columns with per-team elo sums, a
+  proportional balance bar and a spread chip, paged with next/previous through up
+  to 12 arrangements.
 - **Sit out** — a per-player toggle removes someone from generation and dims their
   row. When the available players do not divide evenly, the helper names who
   should sit (fewest saved rounds sat, then lowest skill) and can apply it in one
   click.
+- **Matches** — log a played match: pick roster players or add unnamed randoms,
+  enter each player's damage, and pick the winner. Every match is kept in an
+  editable, reorderable log; editing or deleting one replays the ratings that
+  follow it. A K control tunes how hard ratings move.
 - **Saved rounds** — save a result to keep a snapshot of the teams, tolerance,
   spread and bench. Sit-out counts are derived from these saved rounds.
 - **Accounts** — works immediately on this device; signing in with Freebuff syncs
@@ -57,7 +63,7 @@ server.
 
 1. **Even team sizes.** With `P` available players and `N` teams,
    `base = floor(P/N)` and exactly `P % N` teams hold one extra player.
-2. **A global bound.** For total skill `S` and tolerance `t`, any valid split must
+2. **A global bound.** For total elo `S` and tolerance `t`, any valid split must
    keep every team sum inside
 
    ```
@@ -88,7 +94,7 @@ server.
   sizes as even as possible.
 - With `exhaustive: true`, the arrangements cover every valid split of that
   roster at that tolerance, up to the 12 shown.
-- Skills are integers 1–10, so sums and spreads are exact — no floating point
+- Elos are integers 100–1000, so sums and spreads are exact — no floating point
   drift.
 
 ### Limits
@@ -103,6 +109,36 @@ server.
   permissive tolerance shows a varied sample rather than every combination.
 - Saved rounds are capped at the newest 100 per account; new saves prune older
   ones.
+
+## How the ratings work
+
+`src/shared/elo.ts` is pure and deterministic, like the solver.
+
+- **Scale.** 100–1000, where 100 points is one point on the 1–10 control. Creating
+a player at 1–10 sets their elo to rating × 100; the control always mirrors the
+current band, and changing it snaps the elo to the new band's anchor. The
+advanced field sets any elo in 100–1000.
+- **One match, two terms.** The result term is ordinary Elo on the weighted rating
+sums, so a five-stack is favoured over a four-stack. The performance term is
+centred on zero and compares each player's share of the match's size-normalized
+damage with the share their rating predicts. It carries 0.6 of K while the
+result carries the full K, which is what makes a top-damage player on a losing
+team land at roughly zero; the rest of the losing team still pays.
+- **Uneven teams.** Damage is divided by the number of enemies the player faced
+before shares are compared, so the smaller team's extra targets do not inflate
+their rating.
+- **Randoms.** An unnamed player records damage but has no rating row. Their
+rating is inferred from the lobby's known elo, shifted by their relative damage,
+clamped to the scale, and counted at half a player's weight in both the
+expectation and the damage pool. They are never updated.
+- **K.** An account setting from 8 to 64, default 32. Changing it replays the
+whole log, because tuning is the point.
+- **Replay.** Ratings start at each player's creation elo and are recomputed from
+the ordered event log. Every match and every manual elo edit stores each
+player's before/after elo, so editing, reordering or deleting an event restores
+exactly the ratings history would have produced. The log holds up to 1000 events.
+- **Deleting players.** A player named in a match cannot be removed until those
+matches are edited or deleted. Manual rating entries are removed with the player.
 
 ## Roles (the tag framework)
 
@@ -145,26 +181,46 @@ signature like any other input.
 
 ```sql
 players(id TEXT PRIMARY KEY, owner_sub TEXT, name TEXT, skill INTEGER,
-        tags TEXT, sitting_out INTEGER, created_at INTEGER, updated_at INTEGER)
+        elo INTEGER, base_elo INTEGER, tags TEXT, sitting_out INTEGER,
+        created_at INTEGER, updated_at INTEGER)
 
 rounds(id TEXT PRIMARY KEY, owner_sub TEXT, config TEXT, created_at INTEGER)
+
+rating_events(id TEXT PRIMARY KEY, owner_sub TEXT, position INTEGER,
+              kind TEXT, payload TEXT, created_at INTEGER, updated_at INTEGER)
+
+rating_results(event_id TEXT, owner_sub TEXT, slot TEXT, player_id TEXT,
+               name TEXT, elo_before INTEGER, elo_after INTEGER, delta INTEGER)
+
+settings(owner_sub TEXT PRIMARY KEY, k_factor INTEGER, updated_at INTEGER)
 ```
 
-`players.tags` is a JSON array of role ids (`'["sniper","igl"]'`). Workspaces
-created before roles existed are migrated in place: `ensureSchema` checks
-`PRAGMA table_info(players)` and adds the column once with a default of `[]`.
+`players.tags` is a JSON array of role ids (`'["sniper","igl"]'`). `elo` is the
+live rating, `base_elo` is the creation anchor replay starts from, and `skill` is
+a derived mirror (round(elo / 100)) kept so older readers and saved rounds still
+work. Workspaces created before roles or elo existed are migrated in place:
+`ensureSchema` reads `PRAGMA table_info(players)`, adds the missing columns and
+sets `elo = base_elo = skill × 100` for existing players. No history is invented.
 
-`rounds.config` is a JSON snapshot:
+`rating_events.payload` is either a match (label, two teams of players with
+damage, winner) or a manual adjustment (player id, elo, reason).
+`rating_results` holds the per-player before/after bookkeeping for each event,
+rewritten whenever the affected part of the log is replayed. Rows are scoped by
+`owner_sub = user.sub`.
+
+`rounds.config` is a JSON snapshot (version 2 uses the elo scale; rounds saved
+before elo are scaled ×100 when read):
 
 ```json
 {
+  "version": 2,
   "teamCount": 3,
-  "tolerance": 0,
+  "tolerance": 300,
   "spread": 0,
   "teams": [
     {
-      "sum": 24,
-      "players": [{ "id": "…", "name": "Ada", "skill": 9, "tags": ["sniper", "igl"] }]
+      "sum": 2500,
+      "players": [{ "id": "…", "name": "Ada", "elo": 900, "tags": ["sniper", "igl"] }]
     }
   ],
   "benchedIds": ["…"]
@@ -198,8 +254,15 @@ device.
 | GET | `/api/health` | liveness |
 | GET | `/api/players` | oldest first |
 | POST | `/api/players` | `{ name, skill, tags? }` or `{ players: [...] }` (max 50) |
-| PATCH | `/api/players/:id` | any of `name`, `skill`, `tags`, `sittingOut` |
-| DELETE | `/api/players/:id` | |
+| PATCH | `/api/players/:id` | any of `name`, `skill`, `elo`, `tags`, `sittingOut` |
+| POST | `/api/players/:id/elo` | `{ elo, reason? }`, logs a manual adjustment |
+| DELETE | `/api/players/:id` | 409 while the player has match history |
+| GET | `/api/matches` | the ordered rating log, with before/after elo |
+| POST | `/api/matches` | `{ label?, teams: [team, team], winner }` |
+| PATCH | `/api/matches/:id` | `{ input }` and/or `{ position }`, then replays |
+| DELETE | `/api/matches/:id` | removes the event and replays the rest |
+| GET | `/api/settings` | `{ kFactor }` |
+| PUT | `/api/settings` | `{ kFactor }` 8–64, replays the whole log |
 | GET | `/api/rounds` | newest 60 snapshots |
 | POST | `/api/rounds` | `{ config }`, validated and pruned to 100 |
 | DELETE | `/api/rounds/:id` | |
@@ -210,8 +273,11 @@ invalid input, 413 above 64 KB and 503 when no database is bound. Responses are
 
 ## Tests
 
-`bun test` runs four suites:
+`bun test` runs five suites:
 
+- `tests/elo.test.ts` — the 100-point scale, even and uneven matches, loss
+  protection, random inference and half weight, clamping, manual adjustments,
+  deterministic replay, edit/delete/reorder and K changes.
 - `tests/balance.test.ts` — team sizes, a known perfect split, all 15 partitions
   of six equal players, **brute-force cross-checks** for equal and unequal team
   sizes, the strong-player-singleton case that a per-index size vector would

@@ -66,22 +66,23 @@ const call = (
   )
 
 const roundConfig = {
+  version: 2,
   teamCount: 2,
-  tolerance: 2,
-  spread: 1,
+  tolerance: 200,
+  spread: 100,
   teams: [
     {
-      sum: 16,
+      sum: 1600,
       players: [
-        { id: 'a', name: 'Ada', skill: 9 },
-        { id: 'b', name: 'Bo', skill: 7 },
+        { id: 'a', name: 'Ada', elo: 900 },
+        { id: 'b', name: 'Bo', elo: 700 },
       ],
     },
     {
-      sum: 15,
+      sum: 1500,
       players: [
-        { id: 'c', name: 'Cy', skill: 8 },
-        { id: 'd', name: 'Di', skill: 7 },
+        { id: 'c', name: 'Cy', elo: 800 },
+        { id: 'd', name: 'Di', elo: 700 },
       ],
     },
   ],
@@ -97,6 +98,13 @@ test('unauthenticated data routes refuse access and public assets remain public'
     ['/api/rounds', 'GET'],
     ['/api/rounds', 'POST'],
     ['/api/rounds/absent', 'DELETE'],
+    ['/api/matches', 'GET'],
+    ['/api/matches', 'POST'],
+    ['/api/matches/absent', 'PATCH'],
+    ['/api/matches/absent', 'DELETE'],
+    ['/api/players/absent/elo', 'POST'],
+    ['/api/settings', 'GET'],
+    ['/api/settings', 'PUT'],
   ]) {
     const response = await call(path!, undefined, method)
     expect(response.status).toBe(401)
@@ -118,7 +126,7 @@ test('players can be added in bulk, renamed, rated, benched and removed by their
     players: { id: string; name: string; skill: number; sittingOut: boolean }[]
   }
   expect(players).toHaveLength(2)
-  expect(players[0]).toMatchObject({ name: 'Ada', skill: 9, sittingOut: false })
+  expect(players[0]).toMatchObject({ name: 'Ada', skill: 9, elo: 900, sittingOut: false })
 
   expect(
     ((await (await call('/api/players', 'alice')).json()) as { players: unknown[] })
@@ -137,7 +145,7 @@ test('players can be added in bulk, renamed, rated, benched and removed by their
   })
   expect(patched.status).toBe(200)
   expect(await patched.json()).toMatchObject({
-    player: { name: 'Bea', skill: 6, sittingOut: true },
+    player: { name: 'Bea', skill: 6, elo: 600, sittingOut: true },
   })
 
   expect(
@@ -214,12 +222,12 @@ test('role tags round-trip, reject unknown ids and survive in round snapshots', 
     ...roundConfig,
     teams: [
       {
-        sum: 13,
-        players: [{ id: 'a', name: 'Sam', skill: 8, tags: ['sniper'] }],
+        sum: 800,
+        players: [{ id: 'a', name: 'Sam', elo: 800, tags: ['sniper'] }],
       },
       {
-        sum: 5,
-        players: [{ id: 'b', name: 'Pat', skill: 5, tags: ['sniper', 'antipush'] }],
+        sum: 500,
+        players: [{ id: 'b', name: 'Pat', elo: 500, tags: ['sniper', 'antipush'] }],
       },
     ],
   }
@@ -306,7 +314,7 @@ test('rejects foreign and absent origins, spoofing, malformed input and oversize
       await call('/api/rounds', 'alice', 'POST', {
         config: {
           ...roundConfig,
-          teams: [{ sum: 1, players: [{ id: 'a', name: 'Ada', skill: 99 }] }],
+          teams: [{ sum: 1, players: [{ id: 'a', name: 'Ada', elo: 9900 }] }],
         },
       })
     ).status,
@@ -331,4 +339,232 @@ test('missing database reports setup and local preview identity never activates 
   expect(
     await currentUser(new Request('http://localhost:5000/'), {} as Env),
   ).toMatchObject({ sub: 'local-preview' })
+})
+
+test('matches tune elo, replay edits, log manual ratings and stay private', async () => {
+  type PlayerRow = { id: string; name: string; elo: number; skill: number }
+  type Logged = {
+    kFactor: number
+    events: {
+      id: string
+      kind: string
+      position: number
+      winner?: number
+      teams?: {
+        players: {
+          name: string
+          delta: number
+          eloBefore: number
+          eloAfter: number
+        }[]
+      }[]
+    }[]
+  }
+
+  const created = await call('/api/players', 'frank', 'POST', {
+    players: [
+      { name: 'Ada', skill: 5 },
+      { name: 'Bo', skill: 5 },
+      { name: 'Cy', skill: 5 },
+      { name: 'Di', skill: 5 },
+    ],
+  })
+  expect(created.status).toBe(201)
+  const roster = ((await created.json()) as { players: PlayerRow[] }).players
+  const byName = new Map(roster.map((player) => [player.name, player]))
+  const ada = byName.get('Ada')!
+  const team = (names: string[]) => ({
+    players: names.map((name) => ({
+      id: byName.get(name)!.id,
+      name,
+      damage: 100,
+      tracked: true,
+    })),
+  })
+  const body = {
+    label: 'Scrim',
+    winner: 0,
+    teams: [team(['Ada', 'Bo']), team(['Cy', 'Di'])],
+  }
+  const listed = async () =>
+    ((await (await call('/api/players', 'frank')).json()) as {
+      players: PlayerRow[]
+    }).players
+  const eloOf = async (name: string) =>
+    (await listed()).find((player) => player.name === name)!.elo
+
+  const logged = await call('/api/matches', 'frank', 'POST', body)
+  expect(logged.status).toBe(201)
+  expect(await eloOf('Ada')).toBe(516)
+  expect(await eloOf('Bo')).toBe(516)
+  expect(await eloOf('Cy')).toBe(484)
+  expect(await eloOf('Di')).toBe(484)
+
+  let log = (await (await call('/api/matches', 'frank')).json()) as Logged
+  expect(log.kFactor).toBe(32)
+  expect(log.events).toHaveLength(1)
+  const matchId = log.events[0]!.id
+  expect(log.events[0]!.kind).toBe('match')
+  expect(log.events[0]!.teams![0]!.players[0]).toMatchObject({
+    name: 'Ada',
+    delta: 16,
+    eloBefore: 500,
+    eloAfter: 516,
+  })
+
+  // The first three teams, a winner outside 0/1 and all-random teams are invalid.
+  expect(
+    (await call('/api/matches', 'frank', 'POST', { ...body, teams: [team(['Ada', 'Bo'])] }))
+      .status,
+  ).toBe(400)
+  expect((await call('/api/matches', 'frank', 'POST', { ...body, winner: 2 })).status).toBe(
+    400,
+  )
+  expect(
+    (
+      await call('/api/matches', 'frank', 'POST', {
+        label: '',
+        winner: 0,
+        teams: [
+          { players: [{ id: 'r1', name: 'Random 1', damage: 100, tracked: false }] },
+          { players: [{ id: 'r2', name: 'Random 2', damage: 100, tracked: false }] },
+        ],
+      })
+    ).status,
+  ).toBe(400)
+  expect(
+    (
+      await call('/api/matches', 'frank', 'POST', {
+        ...body,
+        teams: [
+          { players: [{ id: ada.id, name: 'Ada', damage: 100, tracked: true }] },
+          { players: [{ id: ada.id, name: 'Ada', damage: 100, tracked: true }] },
+        ],
+      })
+    ).status,
+  ).toBe(400)
+  expect(
+    (
+      await call('/api/matches', 'frank', 'POST', {
+        ...body,
+        teams: [
+          { players: [{ id: 'nope', name: 'Ghost', damage: 100, tracked: true }] },
+          { players: [{ id: byName.get('Cy')!.id, name: 'Cy', damage: 0, tracked: true }] },
+        ],
+      })
+    ).status,
+  ).toBe(400)
+  expect(
+    (
+      await call('/api/matches', 'frank', 'POST', {
+        ...body,
+        teams: [
+          {
+            players: [
+              { id: ada.id, name: 'Ada', damage: 0, tracked: true },
+              { id: byName.get('Bo')!.id, name: 'Bo', damage: 0, tracked: true },
+            ],
+          },
+          {
+            players: [
+              { id: byName.get('Cy')!.id, name: 'Cy', damage: 0, tracked: true },
+              { id: byName.get('Di')!.id, name: 'Di', damage: 0, tracked: true },
+            ],
+          },
+        ],
+      })
+    ).status,
+  ).toBe(400)
+
+  // Editing the winner replays the match.
+  const edited = await call(`/api/matches/${matchId}`, 'frank', 'PATCH', {
+    input: { ...body, winner: 1 },
+  })
+  expect(edited.status).toBe(200)
+  expect(await eloOf('Ada')).toBe(484)
+  expect(await eloOf('Cy')).toBe(516)
+
+  // K applies to the whole history.
+  expect((await call('/api/settings', 'frank', 'PUT', { kFactor: 7 })).status).toBe(400)
+  const tuned = await call('/api/settings', 'frank', 'PUT', { kFactor: 8 })
+  expect(tuned.status).toBe(200)
+  expect((await (await call('/api/settings', 'frank')).json()) as { kFactor: number }).toEqual(
+    { kFactor: 8 },
+  )
+  expect(await eloOf('Ada')).toBe(496)
+  expect(await eloOf('Cy')).toBe(504)
+
+  // A manual rating lands in the same log and survives the match's deletion.
+  const adjusted = await call(`/api/players/${ada.id}/elo`, 'frank', 'POST', {
+    elo: 700,
+    reason: 'VOD review',
+  })
+  expect(adjusted.status).toBe(200)
+  expect(((await adjusted.json()) as { player: PlayerRow }).player.elo).toBe(700)
+  log = (await (await call('/api/matches', 'frank')).json()) as Logged
+  expect(log.events.map((event) => event.kind)).toEqual(['match', 'adjust'])
+
+  // Match history pins a player to the log until those matches are gone.
+  expect((await call(`/api/players/${ada.id}`, 'frank', 'DELETE')).status).toBe(409)
+
+  const removed = await call(`/api/matches/${matchId}`, 'frank', 'DELETE')
+  expect(removed.status).toBe(200)
+  log = (await (await call('/api/matches', 'frank')).json()) as Logged
+  expect(log.events.map((event) => event.kind)).toEqual(['adjust'])
+  expect(await eloOf('Ada')).toBe(700)
+  expect(await eloOf('Cy')).toBe(500)
+
+  // With the match gone only a manual edit remains, and the player can leave
+  // with it; the adjustment event disappears from the log too.
+  expect((await call(`/api/players/${ada.id}`, 'frank', 'DELETE')).status).toBe(200)
+  expect((await listed()).some((player) => player.id === ada.id)).toBe(false)
+  expect((await call(`/api/players/${byName.get('Cy')!.id}`, 'frank', 'DELETE')).status).toBe(
+    200,
+  )
+
+  // Another account sees none of it.
+  const strangers = (await (await call('/api/matches', 'gina')).json()) as Logged
+  expect(strangers.events).toHaveLength(0)
+  expect((await call(`/api/matches/${matchId}`, 'gina', 'DELETE')).status).toBe(404)
+})
+
+test('a match can be reordered within the log', async () => {
+  type RosterPlayer = { id: string; name: string }
+  type Log = { events: { id: string; position: number }[] }
+  const created = await call('/api/players', 'hank', 'POST', {
+    players: [
+      { name: 'Ace', skill: 5 },
+      { name: 'Bee', skill: 5 },
+    ],
+  })
+  const roster = ((await created.json()) as { players: RosterPlayer[] }).players
+  const [ace, bee] = roster
+  const duel = (winner: number) => ({
+    label: '',
+    winner,
+    teams: [
+      { players: [{ id: ace!.id, name: 'Ace', damage: 100, tracked: true }] },
+      { players: [{ id: bee!.id, name: 'Bee', damage: 100, tracked: true }] },
+    ],
+  })
+  expect((await call('/api/matches', 'hank', 'POST', duel(0))).status).toBe(201)
+  expect((await call('/api/matches', 'hank', 'POST', duel(1))).status).toBe(201)
+
+  const listed = async () =>
+    (await (await call('/api/matches', 'hank')).json()) as Log
+  let log = await listed()
+  const [first, second] = log.events
+  expect(log.events.map((event) => event.position)).toEqual([0, 1])
+
+  const moved = await call(`/api/matches/${second!.id}`, 'hank', 'PATCH', {
+    position: 0,
+  })
+  expect(moved.status).toBe(200)
+  log = await listed()
+  expect(log.events.map((event) => event.id)).toEqual([second!.id, first!.id])
+  expect(log.events.map((event) => event.position)).toEqual([0, 1])
+  expect(
+    (await call(`/api/matches/${second!.id}`, 'hank', 'PATCH', { position: 1.5 }))
+      .status,
+  ).toBe(400)
 })

@@ -45,7 +45,7 @@ export function History({ rounds, onRemove }: Props) {
                       {round.config.teamCount} teams · spread {round.config.spread}{' '}
                     </span>
                     <span className="round-meta-sub">
-                      tolerance {round.config.tolerance}
+                      tolerance ±{Math.round(round.config.tolerance)} elo
                       {round.config.benchedIds.length > 0 &&
                         ` · ${round.config.benchedIds.length} sat out`}
                     </span>

@@ -1,14 +1,17 @@
 /**
  * Pure, deterministic team balancing. No React, no DOM, no network — so the
  * same module runs in the browser Worker, in tests, and on the server.
+ *
+ * Ratings are elo (100 - 1000) integers, so sums and spreads stay exact.
  */
 
+import { clampElo } from './elo'
 import { normalizeTags, ROLE_COUNT, roleMask } from './roles'
 
 export type SolverPlayer = {
   id: string
   name: string
-  skill: number
+  elo: number
   tags?: string[]
 }
 
@@ -22,6 +25,7 @@ export type Arrangement = {
 
 export type SolverOptions = {
   teamCount: number
+  /** Maximum elo spread between the strongest and weakest team. */
   tolerance: number
   /** How many valid splits the search keeps before it stops. */
   maxResults?: number
@@ -45,7 +49,7 @@ export type SolveResult = {
   playerCount: number
   teamCount: number
   tolerance: number
-  totalSkill: number
+  totalElo: number
 }
 
 export type SolverRequest = {
@@ -64,9 +68,6 @@ const now = () =>
   typeof performance !== 'undefined' && typeof performance.now === 'function'
     ? performance.now()
     : Date.now()
-
-const clampSkill = (value: number): number =>
-  Number.isFinite(value) ? Math.min(10, Math.max(1, Math.round(value))) : 5
 
 /** Team sizes as even as possible: the first teams take the extra players. */
 export function teamSizes(playerCount: number, teamCount: number): number[] {
@@ -149,7 +150,7 @@ function tightestReachable(
   teamCount: number,
 ): Arrangement | null {
   if (players.length === 0 || players.length < teamCount) return null
-  const order = [...players].sort((a, b) => b.skill - a.skill)
+  const order = [...players].sort((a, b) => b.elo - a.elo)
   const groups: SolverPlayer[][] = Array.from({ length: teamCount }, () => [])
   const sums = new Array<number>(teamCount).fill(0)
   for (const player of order) {
@@ -160,7 +161,7 @@ function tightestReachable(
     }
     if (target === -1) return null
     groups[target].push(player)
-    sums[target] += player.skill
+    sums[target] += player.elo
   }
 
   const total = sums.reduce((sum, value) => sum + value, 0)
@@ -188,7 +189,7 @@ function tightestReachable(
       for (let j = i + 1; j < teamCount; j++) {
         for (let a = 0; a < groups[i].length; a++) {
           for (let b = 0; b < groups[j].length; b++) {
-            const delta = groups[i][a].skill - groups[j][b].skill
+            const delta = groups[i][a].elo - groups[j][b].elo
             if (delta === 0) continue
             const nextSums = sums.slice()
             nextSums[i] -= delta
@@ -205,14 +206,14 @@ function tightestReachable(
     const arriving = groups[best.j][best.b]
     groups[best.i][best.a] = arriving
     groups[best.j][best.b] = leaving
-    sums[best.i] += arriving.skill - leaving.skill
-    sums[best.j] += leaving.skill - arriving.skill
+    sums[best.i] += arriving.elo - leaving.elo
+    sums[best.j] += leaving.elo - arriving.elo
     current = best.next
   }
 
   const teams = groups.map((list) => ({
-    players: [...list].sort((a, b) => b.skill - a.skill || a.name.localeCompare(b.name)),
-    sum: list.reduce((sum, player) => sum + player.skill, 0),
+    players: [...list].sort((a, b) => b.elo - a.elo || a.name.localeCompare(b.name)),
+    sum: list.reduce((sum, player) => sum + player.elo, 0),
   }))
   const spread = arrangementSpread(teams)
   return { teams, spread, withinTolerance: false }
@@ -225,7 +226,7 @@ export function solve(
   const players = playersIn.map((player) => ({
     id: player.id,
     name: player.name,
-    skill: clampSkill(player.skill),
+    elo: clampElo(player.elo),
     tags: normalizeTags(player.tags),
   }))
   const spreadRoles = options.spreadRoles !== false
@@ -237,7 +238,7 @@ export function solve(
   const maxNodes = options.maxNodes ?? 500_000
 
   const playerCount = players.length
-  const totalSkill = players.reduce((sum, player) => sum + player.skill, 0)
+  const totalElo = players.reduce((sum, player) => sum + player.elo, 0)
   const empty: SolveResult = {
     arrangements: [],
     validCount: 0,
@@ -245,7 +246,7 @@ export function solve(
     playerCount,
     teamCount,
     tolerance,
-    totalSkill,
+    totalElo,
   }
   if (playerCount < teamCount) return empty
 
@@ -258,12 +259,12 @@ export function solve(
   const hi = extra > 0 ? base + 1 : base
   const order = players
     .map((_, index) => index)
-    .sort((a, b) => players[b].skill - players[a].skill || a - b)
+    .sort((a, b) => players[b].elo - players[a].elo || a - b)
 
   // For a valid split every team sum must sit inside these bounds, because
   // max - min <= tolerance implies max <= (S + (n-1)t)/n and min >= (S - (n-1)t)/n.
-  const upper = Math.floor((totalSkill + (teamCount - 1) * tolerance) / teamCount)
-  const lower = Math.ceil((totalSkill - (teamCount - 1) * tolerance) / teamCount)
+  const upper = Math.floor((totalElo + (teamCount - 1) * tolerance) / teamCount)
+  const lower = Math.ceil((totalElo - (teamCount - 1) * tolerance) / teamCount)
 
   const assign = new Int8Array(playerCount)
   const members: number[][] = Array.from({ length: teamCount }, () => [])
@@ -279,7 +280,7 @@ export function solve(
   const startedAt = now()
 
   // Teams missing a role that at least `teamCount` players could cover: the
-  // secondary criterion once two splits are equally close on skill.
+  // secondary criterion once two splits are equally close on elo.
   const roleGapNow = () => {
     let gap = 0
     for (let bit = 0; bit < ROLE_COUNT; bit++) {
@@ -307,7 +308,7 @@ export function solve(
     }
     const spread = max - min
     if (spread > tolerance) return
-    const mean = totalSkill / teamCount
+    const mean = totalElo / teamCount
     let deviation = 0
     for (const sum of sums) deviation += (sum - mean) ** 2
     const key = members
@@ -352,23 +353,23 @@ export function solve(
       }
     }
     const playerIndex = order[slot]
-    const skill = players[playerIndex].skill
+    const elo = players[playerIndex].elo
 
     // Teams open in order, so a partition is produced exactly once and no team
     // can be empty in the middle. Try the emptiest team first: balanced splits
     // are then found early, which matters when the budget is short.
     const candidates: number[] = []
     for (let team = 0; team < opened; team++) {
-      if (members[team].length < hi && sums[team] + skill <= upper)
+      if (members[team].length < hi && sums[team] + elo <= upper)
         candidates.push(team)
     }
-    if (opened < teamCount && sums[opened] + skill <= upper) candidates.push(opened)
+    if (opened < teamCount && sums[opened] + elo <= upper) candidates.push(opened)
     candidates.sort((a, b) => sums[a] - sums[b] || a - b)
 
     for (const team of candidates) {
       const opening = team === opened
       members[team].push(playerIndex)
-      sums[team] += skill
+      sums[team] += elo
       assign[playerIndex] = team
       if (opening) opened++
       const full = members[team].length === hi
@@ -380,7 +381,7 @@ export function solve(
       if (!dead) walk(slot + 1)
       if (full) extras--
       if (opening) opened--
-      sums[team] -= skill
+      sums[team] -= elo
       members[team].pop()
       if (cut) return
     }
@@ -393,8 +394,8 @@ export function solve(
       const teams = Array.from({ length: teamCount }, (_, team) => {
         const list = players
           .filter((_, index) => candidate.assign[index] === team)
-          .sort((a, b) => b.skill - a.skill || a.name.localeCompare(b.name))
-        return { players: list, sum: list.reduce((sum, player) => sum + player.skill, 0) }
+          .sort((a, b) => b.elo - a.elo || a.name.localeCompare(b.name))
+        return { players: list, sum: list.reduce((sum, player) => sum + player.elo, 0) }
       })
       const spread = arrangementSpread(teams)
       return { teams, spread, withinTolerance: spread <= tolerance }
@@ -420,17 +421,17 @@ export function solve(
     playerCount,
     teamCount,
     tolerance,
-    totalSkill,
+    totalElo,
   }
 }
 
 /**
  * Who should sit when the available players do not divide evenly: fewest rounds
- * sat first, then the lowest skill, so the bench stays fair and the teams stay
+ * sat first, then the lowest elo, so the bench stays fair and the teams stay
  * as strong as possible.
  */
 export function suggestSitOuts(
-  players: { id: string; skill: number; sittingOut: boolean }[],
+  players: { id: string; elo: number; sittingOut: boolean }[],
   teamCount: number,
   sitCounts: Record<string, number>,
 ): string[] {
@@ -441,7 +442,7 @@ export function suggestSitOuts(
     .sort(
       (a, b) =>
         (sitCounts[a.id] ?? 0) - (sitCounts[b.id] ?? 0) ||
-        a.skill - b.skill ||
+        a.elo - b.elo ||
         a.id.localeCompare(b.id),
     )
     .slice(0, needed)

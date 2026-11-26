@@ -9,10 +9,10 @@ import {
   ROLES,
 } from '../src/shared/roles'
 
-const player = (id: string, tags: string[], skill = 5): SolverPlayer => ({
+const player = (id: string, tags: string[], elo = 500): SolverPlayer => ({
   id,
   name: id,
-  skill,
+  elo,
   tags,
 })
 
@@ -78,7 +78,7 @@ function lopsided2() {
 }
 
 test('roles break ties between equally balanced splits', () => {
-  // 6 players at skill 5: every split has spread 0, so roles decide the order.
+  // 6 players at the same elo: every split has spread 0, so roles decide the order.
   const players = [
     player('s1', ['sniper']),
     player('s2', ['sniper']),
@@ -101,10 +101,10 @@ test('roles break ties between equally balanced splits', () => {
 
 test('turning role spreading off leaves the balance ranking intact', () => {
   const players = [
-    player('s1', ['sniper'], 9),
-    player('s2', ['sniper'], 3),
-    player('a1', ['antipush'], 8),
-    player('a2', ['antipush'], 4),
+    player('s1', ['sniper'], 900),
+    player('s2', ['sniper'], 300),
+    player('a1', ['antipush'], 800),
+    player('a2', ['antipush'], 400),
   ]
   const withRoles = solve(players, { teamCount: 2, tolerance: 0 })
   const without = solve(players, { teamCount: 2, tolerance: 0, spreadRoles: false })

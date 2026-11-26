@@ -58,7 +58,7 @@ function TeamColumn({ team, index, max }: { team: SolverTeam; index: number; max
         {team.players.map((player) => (
           <li key={player.id}>
             <span className="team-player">{player.name}</span>
-            <span className="team-skill">{player.skill}</span>
+            <span className="team-skill">{player.elo}</span>
           </li>
         ))}
       </ul>
@@ -69,9 +69,9 @@ function TeamColumn({ team, index, max }: { team: SolverTeam; index: number; max
 const toleranceHint = (tolerance: number) =>
   tolerance === 0
     ? 'Only a perfect split counts.'
-    : tolerance <= 2
-      ? 'Very tight — a point or two between teams.'
-      : tolerance <= 5
+    : tolerance <= 50
+      ? 'Very tight — under half a rating point between teams.'
+      : tolerance <= 150
         ? 'Balanced, with room to move.'
         : 'Loose — more combinations, more lopsided teams.'
 
@@ -107,7 +107,7 @@ export function Build({
   const currentSignature = `${teamCount}:${tolerance}:${spreadRoles}:${players
     .map(
       (player) =>
-        `${player.id}${player.skill}${player.sittingOut ? 'x' : ''}${player.tags.join('+')}`,
+        `${player.id}${player.elo}${player.sittingOut ? 'x' : ''}${player.tags.join('+')}`,
     )
     .join('|')}`
   const stale = Boolean(result) && signature !== currentSignature
@@ -127,7 +127,7 @@ export function Build({
         available.map((player) => ({
           id: player.id,
           name: player.name,
-          skill: player.skill,
+          elo: player.elo,
           tags: player.tags,
         })),
         { teamCount, tolerance, spreadRoles: hasRoles ? spreadRoles : false },
@@ -156,7 +156,7 @@ export function Build({
         <div>
           <h2 id="build-title">Build</h2>
           <p className="sub">
-            {available.length} available · {teamCount} teams · tolerance {tolerance}
+            {available.length} available · {teamCount} teams · tolerance ±{tolerance} elo
           </p>
         </div>
       </div>
@@ -188,15 +188,15 @@ export function Build({
         </div>
         <div className="control grow">
           <label className="control-label" htmlFor="tolerance">
-            Tolerance <span className="control-value">{tolerance}</span>
+            Tolerance <span className="control-value">±{tolerance} elo</span>
           </label>
           <input
             id="tolerance"
             className="range"
             type="range"
             min={0}
-            max={20}
-            step={1}
+            max={2000}
+            step={25}
             value={tolerance}
             onChange={(event) => onTolerance(Number(event.target.value))}
           />
@@ -295,8 +295,8 @@ export function Build({
               <span className={`chip${shown.withinTolerance ? ' good' : ' warn'}`}>
                 Spread {shown.spread}
               </span>
-              <span className="muted">
-                Total skill {shown.teams.reduce((sum, team) => sum + team.sum, 0)}
+                              <span className="muted">
+                Total elo {shown.teams.reduce((sum, team) => sum + team.sum, 0)}
               </span>
             </div>
 
@@ -362,6 +362,7 @@ export function Build({
                 }
                 onClick={() =>
                   void onSaveRound({
+                    version: 2,
                     teamCount,
                     tolerance,
                     spread: shown.spread,
@@ -370,7 +371,7 @@ export function Build({
                       players: team.players.map((player) => ({
                         id: player.id,
                         name: player.name,
-                        skill: player.skill,
+                        elo: player.elo,
                         tags: player.tags,
                       })),
                     })),

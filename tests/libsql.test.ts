@@ -49,12 +49,23 @@ describe('libSQL adapter', () => {
         skill INTEGER NOT NULL, sitting_out INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
     )
+    executor.raw.run(
+      `INSERT INTO players (id, owner_sub, name, skill, sitting_out, created_at, updated_at)
+        VALUES ('old', 'owner', 'Old Timer', 9, 0, 1, 1)`,
+    )
     const db = databaseFromExecutor(executor)
     await ensureSchema(db)
     const columns = await db
       .prepare('PRAGMA table_info(players)')
       .all<{ name: string }>()
-    expect(columns.results.map((column) => column.name)).toContain('tags')
+    expect(columns.results.map((column) => column.name)).toEqual(
+      expect.arrayContaining(['tags', 'elo', 'base_elo']),
+    )
+    const migrated = await db
+      .prepare('SELECT elo, base_elo, tags FROM players WHERE id = ?')
+      .bind('old')
+      .first<{ elo: number; base_elo: number; tags: string }>()
+    expect(migrated).toEqual({ elo: 900, base_elo: 900, tags: '[]' })
     // The guard is idempotent: a second run must not try to add the column again.
     await ensureSchema(db)
   })
@@ -67,8 +78,11 @@ describe('libSQL adapter', () => {
       ],
     })
     expect(created.status).toBe(201)
-    const players = ((await created.json()) as { players: { id: string; tags: string[] }[] })
-      .players
+    const players = ((await created.json()) as {
+      players: { id: string; tags: string[]; elo: number }[]
+    }).players
+    expect(players[0]!.elo).toBe(900)
+    expect(players[1]!.elo).toBe(400)
     expect(players[0]!.tags).toEqual(['sniper', 'igl'])
     expect(players[1]!.tags).toEqual([])
 
@@ -89,14 +103,15 @@ describe('libSQL adapter', () => {
 
     const round = await call(env, '/api/rounds', 'alice', 'POST', {
       config: {
+        version: 2,
         teamCount: 1,
-        tolerance: 3,
+        tolerance: 300,
         spread: 0,
         benchedIds: [],
         teams: [
           {
-            sum: 13,
-            players: [{ id: players[0]!.id, name: 'Ada L', skill: 9, tags: ['sniper'] }],
+            sum: 900,
+            players: [{ id: players[0]!.id, name: 'Ada L', elo: 900, tags: ['sniper'] }],
           },
         ],
       },
@@ -214,5 +229,96 @@ describe('libSQL adapter', () => {
       .all<{ name: string }>()
     expect(columns.results.map((column) => column.name)).toContain('tags')
     expect(sent.some((sql) => sql.includes('pragma_table_info'))).toBe(true)
+  })
+
+  test('a match replays through the libSQL adapter', async () => {
+    const created = await call(env, '/api/players', 'zoe', 'POST', {
+      players: [
+        { name: 'Ada', skill: 5 },
+        { name: 'Bo', skill: 5 },
+      ],
+    })
+    expect(created.status).toBe(201)
+    const roster = ((await created.json()) as {
+      players: { id: string; name: string; elo: number }[]
+    }).players
+    const [ada, bo] = roster
+    const body = {
+      label: 'Duel',
+      winner: 0,
+      teams: [
+        { players: [{ id: ada!.id, name: 'Ada', damage: 100, tracked: true }] },
+        { players: [{ id: bo!.id, name: 'Bo', damage: 100, tracked: true }] },
+      ],
+    }
+    const logged = await call(env, '/api/matches', 'zoe', 'POST', body)
+    expect(logged.status).toBe(201)
+    const eloOf = async (name: string) => {
+      const list = ((await (await call(env, '/api/players', 'zoe')).json()) as {
+        players: { name: string; elo: number }[]
+      }).players
+      return list.find((player) => player.name === name)!.elo
+    }
+    expect(await eloOf('Ada')).toBe(516)
+    expect(await eloOf('Bo')).toBe(484)
+
+    const log = (await (await call(env, '/api/matches', 'zoe')).json()) as {
+      events: { id: string; teams: { players: { delta: number }[] }[] }[]
+    }
+    expect(log.events[0]!.teams[0]!.players[0]!.delta).toBe(16)
+
+    await call(env, '/api/settings', 'zoe', 'PUT', { kFactor: 64 })
+    expect(await eloOf('Ada')).toBe(532)
+    expect(await eloOf('Bo')).toBe(468)
+
+    const removed = await call(env, `/api/matches/${log.events[0]!.id}`, 'zoe', 'DELETE')
+    expect(removed.status).toBe(200)
+    expect(await eloOf('Ada')).toBe(500)
+    expect(await eloOf('Bo')).toBe(500)
+  })
+
+  test('rounds saved before elo are scaled onto the elo axis when read', async () => {
+    const executor = bunSqliteExecutor(':memory:')
+    const db = databaseFromExecutor(executor)
+    await ensureSchema(db)
+    executor.raw.run(
+      `INSERT INTO rounds (id, owner_sub, config, created_at) VALUES (?, ?, ?, ?)`,
+      [
+        'legacy',
+        'alice',
+        JSON.stringify({
+          teamCount: 1,
+          tolerance: 2,
+          spread: 1,
+          teams: [
+            {
+              sum: 9,
+              players: [{ id: 'a', name: 'Ada', skill: 9, tags: ['sniper'] }],
+            },
+          ],
+          benchedIds: [],
+        }),
+        1,
+      ],
+    )
+    const response = await call(makeEnv(db), '/api/rounds', 'alice')
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as {
+      rounds: {
+        config: {
+          version: number
+          tolerance: number
+          spread: number
+          teams: { sum: number; players: { elo: number }[] }[]
+        }
+      }[]
+    }
+    expect(body.rounds[0]!.config).toMatchObject({
+      version: 2,
+      tolerance: 200,
+      spread: 100,
+    })
+    expect(body.rounds[0]!.config.teams[0]!.sum).toBe(900)
+    expect(body.rounds[0]!.config.teams[0]!.players[0]!.elo).toBe(900)
   })
 })

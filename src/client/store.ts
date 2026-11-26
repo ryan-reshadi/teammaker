@@ -1,9 +1,17 @@
+import {
+  DEFAULT_K_FACTOR,
+  clampElo,
+  eloFromSkill,
+  skillFromElo,
+  type MatchInput,
+  type MatchesResponse,
+} from '../shared/elo'
 import { normalizeTags } from '../shared/roles'
 import type { Player, Round, RoundConfig } from '../shared/types'
 
 export type PlayerDraft = { name: string; skill: number; tags?: string[] }
 export type PlayerPatch = Partial<
-  Pick<Player, 'name' | 'skill' | 'tags' | 'sittingOut'>
+  Pick<Player, 'name' | 'skill' | 'elo' | 'tags' | 'sittingOut'>
 >
 
 export type Store = {
@@ -11,6 +19,12 @@ export type Store = {
   addPlayers: (drafts: PlayerDraft[]) => Promise<Player[]>
   updatePlayer: (id: string, patch: PlayerPatch) => Promise<Player>
   removePlayer: (id: string) => Promise<void>
+  matches: () => Promise<MatchesResponse>
+  addMatch: (input: MatchInput) => Promise<Player[]>
+  updateMatch: (id: string, input: MatchInput) => Promise<Player[]>
+  moveMatch: (id: string, position: number) => Promise<Player[]>
+  removeMatch: (id: string) => Promise<Player[]>
+  setKFactor: (kFactor: number) => Promise<{ kFactor: number; players: Player[] }>
   rounds: () => Promise<Round[]>
   addRound: (config: RoundConfig) => Promise<Round>
   removeRound: (id: string) => Promise<void>
@@ -38,6 +52,14 @@ function writeLocal<T>(key: string, value: T[]) {
   }
 }
 
+/** Guests who rated players before elo existed start at skill x 100. */
+function withElo(player: Player): Player {
+  const elo = clampElo(
+    Number.isFinite(player.elo) ? player.elo : (player.skill ?? 5) * 100,
+  )
+  return { ...player, elo, skill: skillFromElo(elo) }
+}
+
 /** Used by the import prompt when a guest signs in on a device with a roster. */
 export function readLocalPlayers(): Player[] {
   return readLocal<Player>(PLAYERS_KEY)
@@ -48,34 +70,44 @@ export function readLocalPlayers(): Player[] {
         typeof player.name === 'string' &&
         Number.isInteger(player.skill),
     )
-    .map((player) => ({ ...player, tags: normalizeTags(player.tags) }))
+    .map((player) => ({
+      ...withElo(player),
+      tags: normalizeTags(player.tags),
+    }))
 }
 
 function localStore(): Store {
+  const unsupported = async (): Promise<never> => {
+    throw new Error('Sign in to track matches and tune elo.')
+  }
   return {
     async players() {
-      return readLocal<Player>(PLAYERS_KEY)
+      return readLocal<Player>(PLAYERS_KEY).map(withElo)
     },
     async addPlayers(drafts) {
-      const players = readLocal<Player>(PLAYERS_KEY)
+      const players = readLocal<Player>(PLAYERS_KEY).map(withElo)
       const now = Date.now()
-      const created = drafts.map((draft, index) => ({
-        id: crypto.randomUUID(),
-        name: draft.name.trim().slice(0, 40),
-        skill: Math.min(10, Math.max(1, Math.round(draft.skill))),
-        tags: normalizeTags(draft.tags),
-        sittingOut: false,
-        createdAt: now + index,
-        updatedAt: now + index,
-      }))
+      const created = drafts.map((draft, index) => {
+        const elo = eloFromSkill(Math.min(10, Math.max(1, Math.round(draft.skill))))
+        return {
+          id: crypto.randomUUID(),
+          name: draft.name.trim().slice(0, 40),
+          skill: skillFromElo(elo),
+          elo,
+          tags: normalizeTags(draft.tags),
+          sittingOut: false,
+          createdAt: now + index,
+          updatedAt: now + index,
+        }
+      })
       writeLocal(PLAYERS_KEY, [...players, ...created])
       return created
     },
     async updatePlayer(id, patch) {
-      const players = readLocal<Player>(PLAYERS_KEY)
+      const players = readLocal<Player>(PLAYERS_KEY).map(withElo)
       const current = players.find((player) => player.id === id)
       if (!current) throw new Error('That player is no longer on the roster.')
-      const next: Player = { ...current, ...patch, updatedAt: Date.now() }
+      const next = withElo({ ...current, ...patch, updatedAt: Date.now() })
       writeLocal(
         PLAYERS_KEY,
         players.map((player) => (player.id === id ? next : player)),
@@ -88,6 +120,12 @@ function localStore(): Store {
         readLocal<Player>(PLAYERS_KEY).filter((player) => player.id !== id),
       )
     },
+    matches: unsupported,
+    addMatch: unsupported,
+    updateMatch: unsupported,
+    moveMatch: unsupported,
+    removeMatch: unsupported,
+    setKFactor: unsupported,
     async rounds() {
       return readLocal<Round>(ROUNDS_KEY)
     },
@@ -123,17 +161,14 @@ const json = (method: string, body: unknown): RequestInit => ({
 })
 
 function remoteStore(): Store {
+  const playerList = async (url: string, init: RequestInit) =>
+    (await request<{ players: Player[] }>(url, init)).players
   return {
     async players() {
-      return (await request<{ players: Player[] }>('/api/players')).players
+      return playerList('/api/players', { method: 'GET' })
     },
     async addPlayers(drafts) {
-      return (
-        await request<{ players: Player[] }>(
-          '/api/players',
-          json('POST', { players: drafts }),
-        )
-      ).players
+      return playerList('/api/players', json('POST', { players: drafts }))
     },
     async updatePlayer(id, patch) {
       return (
@@ -145,6 +180,27 @@ function remoteStore(): Store {
     },
     async removePlayer(id) {
       await request(`/api/players/${id}`, { method: 'DELETE' })
+    },
+    async matches() {
+      return request<MatchesResponse>('/api/matches')
+    },
+    async addMatch(input) {
+      return playerList('/api/matches', json('POST', input))
+    },
+    async updateMatch(id, input) {
+      return playerList(`/api/matches/${id}`, json('PATCH', { input }))
+    },
+    async moveMatch(id, position) {
+      return playerList(`/api/matches/${id}`, json('PATCH', { position }))
+    },
+    async removeMatch(id) {
+      return playerList(`/api/matches/${id}`, { method: 'DELETE' })
+    },
+    async setKFactor(kFactor) {
+      return request<{ kFactor: number; players: Player[] }>(
+        '/api/settings',
+        json('PUT', { kFactor }),
+      )
     },
     async rounds() {
       return (await request<{ rounds: Round[] }>('/api/rounds')).rounds
@@ -159,6 +215,7 @@ function remoteStore(): Store {
   }
 }
 
+export { DEFAULT_K_FACTOR }
 export function createStore(remote: boolean): Store {
   return remote ? remoteStore() : localStore()
 }

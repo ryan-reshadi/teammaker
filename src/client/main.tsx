@@ -1,9 +1,18 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { suggestSitOuts } from '../shared/balance'
+import {
+  DEFAULT_K_FACTOR,
+  clampElo,
+  eloFromSkill,
+  skillFromElo,
+  type MatchInput,
+  type RatingEventView,
+} from '../shared/elo'
 import type { Player, Round, RoundConfig, Session } from '../shared/types'
 import { Build } from './components/Build'
 import { History } from './components/History'
+import { Matches } from './components/Matches'
 import { Roster } from './components/Roster'
 import {
   createStore,
@@ -19,13 +28,28 @@ const message = (problem: unknown) =>
     ? problem.message
     : 'Something went wrong. Please try again.'
 
+/** Keep the elo and its 1-10 mirror consistent while a request is in flight. */
+function applyPatch(player: Player, patch: PlayerPatch): Player {
+  const next = { ...player, ...patch }
+  if (patch.elo !== undefined) {
+    next.elo = clampElo(patch.elo)
+    next.skill = skillFromElo(next.elo)
+  } else if (patch.skill !== undefined) {
+    next.elo = eloFromSkill(patch.skill)
+    next.skill = skillFromElo(next.elo)
+  }
+  return next
+}
+
 function App() {
   const [session, setSession] = useState<Session | null>(null)
   const [ready, setReady] = useState(false)
   const [players, setPlayers] = useState<Player[]>([])
   const [rounds, setRounds] = useState<Round[]>([])
+  const [events, setEvents] = useState<RatingEventView[]>([])
+  const [kFactor, setKFactor] = useState(DEFAULT_K_FACTOR)
   const [teamCount, setTeamCount] = useState(3)
-  const [tolerance, setTolerance] = useState(3)
+  const [tolerance, setTolerance] = useState(300)
   const [error, setError] = useState('')
   const [saved, setSaved] = useState('')
   const [importable, setImportable] = useState<Player[]>([])
@@ -61,13 +85,16 @@ function App() {
     setReady(false)
     void (async () => {
       try {
-        const [loadedPlayers, loadedRounds] = await Promise.all([
+        const [loadedPlayers, loadedRounds, loadedMatches] = await Promise.all([
           store.players(),
           store.rounds(),
+          store.matches(),
         ])
         if (!live) return
         setPlayers(loadedPlayers)
         setRounds(loadedRounds)
+        setEvents(loadedMatches.events)
+        setKFactor(loadedMatches.kFactor)
       } catch (problem) {
         if (live) setError(message(problem))
       } finally {
@@ -88,6 +115,13 @@ function App() {
     setImportable(readLocalPlayers())
   }, [remote, ready, players.length])
 
+  const refreshMatches = useCallback(async () => {
+    if (!store) return
+    const loaded = await store.matches()
+    setEvents(loaded.events)
+    setKFactor(loaded.kFactor)
+  }, [store])
+
   const addPlayers = useCallback(
     async (drafts: PlayerDraft[]) => {
       if (!store) return
@@ -106,7 +140,9 @@ function App() {
     async (id: string, patch: PlayerPatch) => {
       if (!store) return
       setPlayers((previous) =>
-        previous.map((player) => (player.id === id ? { ...player, ...patch } : player)),
+        previous.map((player) =>
+          player.id === id ? applyPatch(player, patch) : player,
+        ),
       )
       try {
         const next = await store.updatePlayer(id, patch)
@@ -114,12 +150,15 @@ function App() {
           previous.map((player) => (player.id === id ? next : player)),
         )
         setError('')
+        // A re-rating is a logged adjustment: every later match is replayed.
+        if (patch.skill !== undefined || patch.elo !== undefined)
+          await refreshMatches()
       } catch (problem) {
         setError(message(problem))
         setPlayers(await store.players())
       }
     },
-    [store],
+    [store, refreshMatches],
   )
 
   const removePlayer = useCallback(
@@ -129,12 +168,61 @@ function App() {
       try {
         await store.removePlayer(id)
         setError('')
+        // Removing a player can also remove their manual rating entries.
+        await refreshMatches()
       } catch (problem) {
         setError(message(problem))
         setPlayers(await store.players())
       }
     },
-    [store],
+    [store, refreshMatches],
+  )
+
+  const saveMatch = useCallback(
+    async (input: MatchInput, id?: string) => {
+      if (!store) return
+      const next = id
+        ? await store.updateMatch(id, input)
+        : await store.addMatch(input)
+      setPlayers(next)
+      await refreshMatches()
+      setError('')
+    },
+    [store, refreshMatches],
+  )
+
+  const removeMatch = useCallback(
+    async (id: string) => {
+      if (!store) return
+      const next = await store.removeMatch(id)
+      setPlayers(next)
+      await refreshMatches()
+      setError('')
+    },
+    [store, refreshMatches],
+  )
+
+  const moveMatch = useCallback(
+    async (id: string, position: number) => {
+      if (!store) return
+      const next = await store.moveMatch(id, position)
+      setPlayers(next)
+      await refreshMatches()
+      setError('')
+    },
+    [store, refreshMatches],
+  )
+
+  const changeKFactor = useCallback(
+    async (k: number) => {
+      if (!store) return
+      const next = await store.setKFactor(k)
+      setPlayers(next.players)
+      setKFactor(next.kFactor)
+      await refreshMatches()
+      setError('')
+    },
+    [store, refreshMatches],
   )
 
   const saveRound = useCallback(
@@ -143,7 +231,7 @@ function App() {
       try {
         const round = await store.addRound(config)
         setRounds((previous) => [round, ...previous].slice(0, 60))
-        setSaved(`Round saved · spread ${config.spread}`)
+        setSaved(`Round saved · spread ${config.spread} elo`)
         window.setTimeout(() => setSaved(''), 3000)
         setError('')
       } catch (problem) {
@@ -238,8 +326,9 @@ function App() {
         <div className="intro">
           <h1>Balanced teams, every round.</h1>
           <p>
-            Rate everyone once. Then pick how many teams you need and how close
-            they have to be — we find every split that fits.
+            Rate everyone once, then let match damage tune their elo. Pick how
+            many teams you need and how close they have to be — we find every
+            split that fits.
           </p>
         </div>
 
@@ -247,7 +336,7 @@ function App() {
           <p className="notice">
             You are working on this device only.{' '}
             <a href="/auth/freebuff/signin?returnTo=%2F">Sign in</a> to keep the
-            roster and saved rounds across sessions.
+            roster, saved rounds and match ratings across sessions.
           </p>
         )}
         {/* An unreachable server sets `error` below, so these notices only
@@ -312,6 +401,17 @@ function App() {
             <History rounds={rounds} onRemove={removeRound} />
           </div>
         </div>
+
+        <Matches
+          players={players}
+          events={events}
+          kFactor={kFactor}
+          remote={remote}
+          onSave={saveMatch}
+          onDelete={removeMatch}
+          onMove={moveMatch}
+          onKFactor={changeKFactor}
+        />
       </main>
     </div>
   )

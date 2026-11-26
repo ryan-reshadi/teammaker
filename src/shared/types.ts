@@ -1,8 +1,10 @@
 export type Player = {
   id: string
   name: string
-  /** 1 - 10, whole numbers only. */
+  /** 1 - 10, derived from elo. Kept for readers that predate the elo scale. */
   skill: number
+  /** 100 - 1000. 100 points is one point on the 1-10 scale. */
+  elo: number
   /** Any number of ids from the role catalogue (see shared/roles.ts). */
   tags: string[]
   sittingOut: boolean
@@ -13,7 +15,7 @@ export type Player = {
 export type RoundPlayer = {
   id: string
   name: string
-  skill: number
+  elo: number
   tags?: string[]
 }
 
@@ -21,6 +23,7 @@ export type RoundTeam = { players: RoundPlayer[]; sum: number }
 
 /** A snapshot of a saved round: the teams as they were, plus who sat out. */
 export type RoundConfig = {
+  version: 2
   teamCount: number
   tolerance: number
   spread: number
