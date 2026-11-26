@@ -144,7 +144,35 @@ function readRoundConfig(value: unknown): RoundConfig | null {
 /** Tests inject identities; production always uses the Freebuff SDK. */
 export function createApp(authenticate: Authenticate = currentUser) {
   const app = new Hono<AppContext>()
-  app.get('/api/health', (c) => c.json({ ok: true }))
+  // Reachability probe: one real round trip, no authentication, no rows written.
+  // It answers the question the session flag cannot — `session.database` only
+  // says a URL was configured, not that the database answers.
+  app.get('/api/health', async (c) => {
+    c.header('Cache-Control', 'private, no-store')
+    const db = c.env.DB
+    if (!db) return c.json({ ok: true, database: 'unconfigured' })
+    try {
+      await db.prepare('SELECT 1 AS ok').first<{ ok: number }>()
+      const tables = await db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('players', 'rounds')",
+        )
+        .all<{ name: string }>()
+      return c.json({
+        ok: true,
+        database: 'ok',
+        schema: tables.results.length === 2 ? 'ready' : 'missing',
+      })
+    } catch (error) {
+      // The driver's message can name the host; it is not a secret, but keep it
+      // in the function logs rather than the public response.
+      console.error(
+        'Teammaker: database health check failed',
+        error instanceof Error ? error.message : error,
+      )
+      return c.json({ ok: false, database: 'unreachable' }, 503)
+    }
+  })
   app.use('/api/*', async (c, next) => {
     c.header('Cache-Control', 'private, no-store')
     await next()

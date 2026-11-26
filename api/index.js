@@ -209,17 +209,35 @@ var schema = [
   `CREATE INDEX IF NOT EXISTS rounds_owner ON rounds(owner_sub, created_at DESC, id DESC)`
 ];
 var TAG_COLUMN = `ALTER TABLE players ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'`;
+var TABLES = `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('players', 'rounds')`;
+var COLUMNS = "SELECT name FROM pragma_table_info('players')";
+var ensureTags = async (db) => {
+  const columns = await db.prepare(COLUMNS).all();
+  if (!columns.results.some((column) => column.name === "tags"))
+    await db.prepare(TAG_COLUMN).run();
+};
+var bootstrap = async (db) => {
+  const tables = await db.prepare(TABLES).all();
+  if (tables.results.length < 2) {
+    await db.batch(schema.map((sql) => db.prepare(sql)));
+    await ensureTags(db);
+    return;
+  }
+  await ensureTags(db);
+};
 var ready = new WeakMap;
 function ensureSchema(db) {
   let pending = ready.get(db);
   if (!pending) {
-    pending = db.batch(schema.map((sql) => db.prepare(sql))).then(async () => {
-      const columns = await db.prepare("PRAGMA table_info(players)").all();
-      if (!columns.results.some((column) => column.name === "tags"))
-        await db.prepare(TAG_COLUMN).run();
-    }).catch((error) => {
-      ready.delete(db);
-      throw error;
+    pending = bootstrap(db).catch(async (error) => {
+      console.warn("Teammaker: schema bootstrap failed, retrying once", error instanceof Error ? error.message : error);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      try {
+        await bootstrap(db);
+      } catch (retryError) {
+        ready.delete(db);
+        throw retryError;
+      }
     });
     ready.set(db, pending);
   }
@@ -366,7 +384,24 @@ function readRoundConfig(value) {
 }
 function createApp(authenticate = currentUser) {
   const app = new Hono;
-  app.get("/api/health", (c) => c.json({ ok: true }));
+  app.get("/api/health", async (c) => {
+    c.header("Cache-Control", "private, no-store");
+    const db = c.env.DB;
+    if (!db)
+      return c.json({ ok: true, database: "unconfigured" });
+    try {
+      await db.prepare("SELECT 1 AS ok").first();
+      const tables = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('players', 'rounds')").all();
+      return c.json({
+        ok: true,
+        database: "ok",
+        schema: tables.results.length === 2 ? "ready" : "missing"
+      });
+    } catch (error) {
+      console.error("Teammaker: database health check failed", error instanceof Error ? error.message : error);
+      return c.json({ ok: false, database: "unreachable" }, 503);
+    }
+  });
   app.use("/api/*", async (c, next) => {
     c.header("Cache-Control", "private, no-store");
     await next();

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
-import { databaseFromExecutor } from '../src/server/libsql'
+import { databaseFromExecutor, type Executor } from '../src/server/libsql'
 import { createBunSqliteDatabase, bunSqliteExecutor } from '../scripts/bun-sqlite'
 import { createApp } from '../src/worker/app'
 import type { Env } from '../src/worker/auth'
@@ -146,5 +146,73 @@ describe('libSQL adapter', () => {
     const body = (await session.json()) as { mode: string; database: boolean }
     expect(body).toMatchObject({ mode: 'setup', database: false })
     expect((await call({ APP_ORIGIN: ORIGIN }, '/api/players', 'alice')).status).toBe(503)
+    expect(
+      await (await call({ APP_ORIGIN: ORIGIN }, '/api/health')).json(),
+    ).toMatchObject({ ok: true, database: 'unconfigured' })
+  })
+
+  test('health proves the database answers, then reports the schema it finds', async () => {
+    const empty = await call(env, '/api/health')
+    expect(empty.status).toBe(200)
+    expect(await empty.json()).toEqual({
+      ok: true,
+      database: 'ok',
+      schema: 'missing',
+    })
+
+    await call(env, '/api/players', 'alice', 'POST', { name: 'Ada', skill: 9 })
+    const ready = await call(env, '/api/health')
+    expect(await ready.json()).toEqual({
+      ok: true,
+      database: 'ok',
+      schema: 'ready',
+    })
+  })
+
+  test('health fails loudly when the database cannot be reached', async () => {
+    const offline: Database = {
+      prepare() {
+        throw new Error('connect ECONNREFUSED libsql.example.test')
+      },
+      async batch() {
+        throw new Error('connect ECONNREFUSED libsql.example.test')
+      },
+    }
+    const response = await call({ DB: offline, APP_ORIGIN: ORIGIN }, '/api/health')
+    expect(response.status).toBe(503)
+    expect(await response.json()).toEqual({ ok: false, database: 'unreachable' })
+  })
+
+  test('the schema bootstrap sends only what the HTTP protocol accepts', async () => {
+    // Turso's /v2/pipeline takes one statement per execute, forbids BEGIN and
+    // COMMIT inside it, and keeps the transaction around a batch instead.
+    const inner = bunSqliteExecutor(':memory:')
+    const single = (sql: string) => {
+      const body = sql.trim().replace(/;$/, '')
+      if (body.includes(';')) throw new Error('multiple statements in one request')
+      if (/^(begin|commit|rollback)\b/i.test(body))
+        throw new Error('transaction statements are refused')
+      return body
+    }
+    const sent: string[] = []
+    const remote: Executor = {
+      async execute({ sql, args }) {
+        sent.push(single(sql))
+        return inner.execute({ sql, args })
+      },
+      async batch(statements) {
+        expect(statements.length).toBeGreaterThan(0)
+        statements.forEach((statement) => single(statement.sql))
+        await inner.batch(statements)
+      },
+    }
+
+    const db = databaseFromExecutor(remote)
+    await ensureSchema(db)
+    const columns = await db
+      .prepare("SELECT name FROM pragma_table_info('players')")
+      .all<{ name: string }>()
+    expect(columns.results.map((column) => column.name)).toContain('tags')
+    expect(sent.some((sql) => sql.includes('pragma_table_info'))).toBe(true)
   })
 })
