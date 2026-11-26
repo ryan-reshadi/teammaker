@@ -1,0 +1,217 @@
+[
+  {
+    "name": "title renders",
+    "ok": true,
+    "detail": "Teammaker \u2014 balanced teams, every round"
+  },
+  {
+    "name": "roster header shows count/total/average",
+    "ok": true,
+    "detail": "9 players \u00b7 45 total skill \u00b7 avg 5.0"
+  },
+  {
+    "name": "session chip is Synced",
+    "ok": true,
+    "detail": "Synced"
+  },
+  {
+    "name": "initial roster rows",
+    "ok": true,
+    "detail": "9"
+  },
+  {
+    "name": "row appears after add",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "name": "roles shown on the new row",
+    "ok": true,
+    "detail": "['Sniper', 'IGL']"
+  },
+  {
+    "name": "skill tick is 10",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "name": "server persisted name/skill/tags",
+    "ok": true,
+    "detail": "{'id': 'f9518883-3dc3-491f-bd30-2c86ec34daf9', 'name': 'E2E One', 'skill': 10, 'tags': ['sniper', 'igl'], 'sittingOut': False, 'createdAt': 1795687187619, 'updatedAt': 1795687187619}"
+  },
+  {
+    "name": "skill rating writes one PATCH per tick",
+    "ok": true,
+    "detail": "10 PATCHes for 10 clicks"
+  },
+  {
+    "name": "skill ends at 10",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "name": "rename commits on Enter",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "name": "Escape cancels a rename",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "name": "bulk add creates three players",
+    "ok": true,
+    "detail": "13"
+  },
+  {
+    "name": "bulk players join at 5",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "name": "fairness suggestion appears for uneven roster",
+    "ok": true,
+    "detail": "13 available across 3 teams leaves 1 on the bench. Fewest rounds sat: E2E B.  Sit them out"
+  },
+  {
+    "name": "sit-out dims the row",
+    "ok": true,
+    "detail": "player-row benched"
+  },
+  {
+    "name": "suggestion clears once the roster divides evenly",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "name": "multi-role player shows two chips",
+    "ok": true,
+    "detail": "['Sniper', 'Support']"
+  },
+  {
+    "name": "roles survive a reload",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "name": "generate completes in ~a second",
+    "ok": true,
+    "detail": "118 ms"
+  },
+  {
+    "name": "arrangements returned",
+    "ok": true,
+    "detail": "Arrangement 1 of 1"
+  },
+  {
+    "name": "spread chip equals max-min",
+    "ok": true,
+    "detail": "[25, 20, 20] vs Spread 5"
+  },
+  {
+    "name": "every arrangement is different",
+    "ok": true,
+    "detail": "0 duplicates of 1"
+  },
+  {
+    "name": "consecutive arrangements move at least two players",
+    "ok": true,
+    "detail": "[]"
+  },
+  {
+    "name": "paging wraps to the first arrangement",
+    "ok": true,
+    "detail": "Arrangement 1 of 1"
+  },
+  {
+    "name": "save confirms",
+    "ok": true,
+    "detail": "Round saved \u00b7 spread 5"
+  },
+  {
+    "name": "history gains a round",
+    "ok": true,
+    "detail": "5"
+  },
+  {
+    "name": "saved round expands to teams",
+    "ok": true,
+    "detail": "15"
+  },
+  {
+    "name": "spread-roles toggle is offered once roles exist",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "name": "toggling marks the result stale",
+    "ok": true,
+    "detail": "Roster changed \u2014 generate again to update."
+  },
+  {
+    "name": "regenerate clears the stale note",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "name": "over-tolerance split is explained",
+    "ok": true,
+    "detail": "No split fits a spread of 0. The closest achievable is 5.  Allow a spread of 5"
+  },
+  {
+    "name": "over-tolerance chip is flagged",
+    "ok": true,
+    "detail": "chip warn"
+  },
+  {
+    "name": "offer raises tolerance to the reachable spread",
+    "ok": true,
+    "detail": "5"
+  },
+  {
+    "name": "too-few-players is explained",
+    "ok": true,
+    "detail": "['You need at least 8 available players.']"
+  },
+  {
+    "name": "no horizontal overflow at 390px",
+    "ok": true,
+    "detail": "390 vs 390"
+  },
+  {
+    "name": "30 players / 6 teams generates under 3s",
+    "ok": true,
+    "detail": "123 ms"
+  },
+  {
+    "name": "large search reports its coverage honestly",
+    "ok": true,
+    "detail": "Found 200 valid splits \u2014 showing the 12 most different before the search wrapped up."
+  },
+  {
+    "name": "large result fills every team",
+    "ok": true,
+    "detail": "6"
+  },
+  {
+    "name": "UI stays responsive during a large search",
+    "ok": true,
+    "detail": "worst frame gap 18 ms"
+  },
+  {
+    "name": "no console errors",
+    "ok": true,
+    "detail": "[]"
+  },
+  {
+    "name": "no failed requests",
+    "ok": true,
+    "detail": "[]"
+  },
+  {
+    "name": "test data cleaned up",
+    "ok": true,
+    "detail": "9"
+  }
+]

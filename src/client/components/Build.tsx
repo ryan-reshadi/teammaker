@@ -349,9 +349,17 @@ export function Build({
               })()}
 
             <div className="result-actions">
+              {/* A stale arrangement no longer matches the roster: saving it
+                  would record a player both on a team and on the bench. */}
               <button
                 type="button"
                 className="primary"
+                disabled={stale || solving}
+                title={
+                  stale
+                    ? 'The roster changed — generate again before saving.'
+                    : undefined
+                }
                 onClick={() =>
                   void onSaveRound({
                     teamCount,
