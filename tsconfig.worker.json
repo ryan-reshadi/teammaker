@@ -4,5 +4,5 @@
     "lib": ["ES2022"],
     "types": ["@cloudflare/workers-types", "bun"]
   },
-  "include": ["src/worker", "src/shared", "tests"]
+  "include": ["src/worker", "src/shared", "src/server", "api", "scripts", "tests"]
 }

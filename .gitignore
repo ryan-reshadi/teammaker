@@ -1,5 +1,8 @@
 node_modules/
-dist/
+dist
+dist-client
+.data
+.tmp-api/
 .wrangler/
 .env
 .env.*

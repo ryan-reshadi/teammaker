@@ -210,7 +210,7 @@ invalid input, 413 above 64 KB and 503 when no database is bound. Responses are
 
 ## Tests
 
-`bun test` runs two suites:
+`bun test` runs four suites:
 
 - `tests/balance.test.ts` — team sizes, a known perfect split, all 15 partitions
   of six equal players, **brute-force cross-checks** for equal and unequal team
@@ -224,6 +224,79 @@ invalid input, 413 above 64 KB and 503 when no database is bound. Responses are
 - `tests/roles.test.ts` — the catalogue, tag normalisation and bitmasks, coverage
   gaps (including specialists being ignored), role ranking breaking ties between
   equally balanced splits, and a multi-role player counting for every role.
+- `tests/libsql.test.ts` — the production libSQL adapter running against Bun's
+  built-in SQLite: schema creation, the roles migration on a pre-roles table,
+  CRUD with tags, round snapshots, two-account isolation, 401s, foreign-origin
+  403s and the no-database path. This is the suite that covers the Vercel
+  deployment; `tests/app.test.ts` keeps covering D1.
+
+## Deploying to Vercel
+
+The app deploys to two hosts from one codebase. Nothing about the data layer is
+vendor-specific: `src/worker/db.ts` defines the small `Database` interface the
+routes use, Cloudflare D1 satisfies it directly, and `src/server/libsql.ts`
+implements it over [libSQL/Turso](https://turso.tech) for Node hosts.
+
+| Piece | Cloudflare (Sites) | Vercel |
+|---|---|---|
+| Browser bundle | `dist/client` | `dist-client` (`bun run build:vercel`) |
+| Server | `dist/teammaker/index.js` | `api/index.ts` → a Node function |
+| Database | D1 binding `DB` | libSQL over HTTP |
+| Static files | Worker `ASSETS` binding | Vercel's own CDN |
+
+`vercel.json` rewrites `/api/*` and `/auth/freebuff/*` to the function, then
+falls back to `index.html` for deep links; `api/index.ts` binds the same Hono
+app with `@hono/node-server` and wraps it in `auth.wrap` exactly like the
+Worker entry, so sign-in, CSRF checks and `Cache-Control: private, no-store`
+behave identically.
+
+### Steps
+
+1. **Project settings** — in the Vercel dashboard set Framework Preset to
+   **Other**, Build Command `bun run build:vercel`, Output Directory
+   `dist-client`, Install Command `bun install`, Node **22.x**. Dashboard values
+   win over `vercel.json`, so they must match.
+2. **Database** — Vercel Marketplace → Turso → install, then copy
+   `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`. No migration step: the first
+   request runs `CREATE TABLE IF NOT EXISTS` plus the roles-column guard.
+3. **Sign-in** — register the exact production origin:
+   `npx @freebuff/auth register --project teammaker --environment production
+   --redirect-uri https://<your-domain>/auth/freebuff/callback`, then set
+   `APP_ORIGIN`, `FREEBUFF_CLIENT_ID` and `FREEBUFF_ISSUER` in **Production**
+   only. Preview deployments rotate their domain, so leaving auth out of Preview
+   keeps them in a clean guest mode instead of a sign-in link that cannot
+   complete.
+4. **Check** — `/` must return HTML (not Vercel's 404), `/api/session` must
+   report `database: true`, and a signed-out `/api/players` must be 401.
+
+Without `TURSO_DATABASE_URL` the function reports `database: false` and the
+client stays in guest mode with a notice, so a deploy is never broken by a
+missing env var. The environment names are the same everywhere:
+
+| Variable | Where | Purpose |
+|---|---|---|
+| `TURSO_DATABASE_URL` | Vercel | libSQL connection |
+| `TURSO_AUTH_TOKEN` | Vercel | libSQL token |
+| `APP_ORIGIN` | Vercel / Sites | canonical origin for cookies and CSRF |
+| `FREEBUFF_CLIENT_ID` / `FREEBUFF_ISSUER` | Vercel / Sites | public OIDC client |
+
+`bun run serve:node` starts the same handler on `127.0.0.1:5174` under Bun
+against a SQLite file. To exercise the **actual Vercel runtime path** — plain
+Node, `@hono/node-server`'s `(req, res)` plumbing and the real libSQL driver —
+build the function and run it:
+
+```sh
+bun run build:api    # bundles api/index.ts for Node into .tmp-api/api.mjs
+bun run serve:api    # serves it on 127.0.0.1:5175 over .tmp-api/teammaker.db
+```
+
+It prints the port it actually bound (PORT overrides the default).
+
+That harness is a loopback origin with no auth config, so it answers as the
+local-preview identity and every route is reachable with curl. Point
+`TURSO_DATABASE_URL` at a real database to test the hosted driver instead of a
+file; set `APP_ORIGIN` and `FREEBUFF_CLIENT_ID` to exercise the sign-in redirect
+(it returns a 303 to the issuer's authorize endpoint without a session).
 
 ## Publishing
 

@@ -5,11 +5,18 @@ import { bodyLimit } from 'hono/body-limit'
 import { normalizeTags, ROLE_IDS } from '../shared/roles'
 import type { Player, RoundConfig, RoundTeam } from '../shared/types'
 import { appOrigin, currentUser, isLocalPreview, type Env } from './auth'
-import { ensureSchema, mapPlayer, mapRound, type PlayerRow, type RoundRow } from './db'
+import {
+  ensureSchema,
+  mapPlayer,
+  mapRound,
+  type Database,
+  type PlayerRow,
+  type RoundRow,
+} from './db'
 
 type AppContext = {
   Bindings: Env
-  Variables: { user: FreebuffUser; db: D1Database }
+  Variables: { user: FreebuffUser; db: Database }
 }
 type Authenticate = (request: Request, env: Env) => Promise<FreebuffUser | null>
 
@@ -367,7 +374,9 @@ export function createApp(authenticate: Authenticate = currentUser) {
   app.notFound((c) =>
     c.req.path === '/api' || c.req.path.startsWith('/api/')
       ? c.json({ error: 'Endpoint not found.' }, 404)
-      : c.env.ASSETS.fetch(c.req.raw),
+      : c.env.ASSETS
+        ? c.env.ASSETS.fetch(c.req.raw)
+        : c.text('Not found', 404),
   )
   app.onError((_error, c) =>
     c.json({ error: 'Something went wrong. Please try again.' }, 500),

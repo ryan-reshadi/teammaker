@@ -1,9 +1,11 @@
 import { createFreebuffAuth } from '@freebuff/auth'
 import type { FreebuffAuth, FreebuffUser } from '@freebuff/auth'
+import type { Database } from './db'
 
 export type Env = {
-  ASSETS: Fetcher
-  DB?: D1Database
+  /** Workers static assets; Vercel serves its own files, so this is absent there. */
+  ASSETS?: Fetcher
+  DB?: Database
   FREEBUFF_CLIENT_ID?: string
   FREEBUFF_ISSUER?: string
   APP_ORIGIN?: string

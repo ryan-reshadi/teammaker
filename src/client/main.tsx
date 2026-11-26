@@ -256,6 +256,12 @@ function App() {
             browser for now.
           </p>
         )}
+        {session?.mode === 'setup' && session.database && (
+          <p className="notice">
+            Sign-in is not configured on this deployment, so this roster is
+            saved in this browser only.
+          </p>
+        )}
         {session?.mode === 'local' && (
           <p className="notice">
             Local preview: everything works here. Published projects use your

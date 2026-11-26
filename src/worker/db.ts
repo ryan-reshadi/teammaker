@@ -1,6 +1,23 @@
 import { normalizeTags } from '../shared/roles'
 import type { Player, Round, RoundConfig } from '../shared/types'
 
+/**
+ * The slice of a SQLite driver this app uses. Cloudflare D1 satisfies it as-is
+ * and `src/server/libsql.ts` implements it over libSQL, so routes never mention
+ * a vendor type and the same queries run on either host.
+ */
+export type Statement = {
+  bind(...values: unknown[]): Statement
+  all<T = Record<string, unknown>>(): Promise<{ results: T[] }>
+  first<T = Record<string, unknown>>(): Promise<T | null>
+  run(): Promise<unknown>
+}
+
+export type Database = {
+  prepare(sql: string): Statement
+  batch(statements: Statement[]): Promise<unknown>
+}
+
 const schema = [
   `CREATE TABLE IF NOT EXISTS players (
     id TEXT PRIMARY KEY,
@@ -25,8 +42,8 @@ const schema = [
 // Workspaces created before role tags existed need the column added once.
 const TAG_COLUMN = `ALTER TABLE players ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'`
 
-const ready = new WeakMap<D1Database, Promise<void>>()
-export function ensureSchema(db: D1Database): Promise<void> {
+const ready = new WeakMap<Database, Promise<void>>()
+export function ensureSchema(db: Database): Promise<void> {
   let pending = ready.get(db)
   if (!pending) {
     pending = db

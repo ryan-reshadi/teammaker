@@ -6,11 +6,17 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "vite build && node scripts/postbuild.mjs",
+    "build:vercel": "vite build --config vite.vercel.config.ts",
+    "build:api": "bun build api/index.ts --target node --format esm --packages external --outfile .tmp-api/api.mjs",
+    "serve:api": "node scripts/serve-api.mjs",
+    "serve:node": "bun run scripts/serve-node.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.worker.json",
     "test": "bun test"
   },
   "dependencies": {
     "@freebuff/auth": "0.1.0",
+    "@hono/node-server": "^2.1.11",
+    "@libsql/client": "^0.18.0",
     "hono": "^4.13.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
