@@ -15,11 +15,11 @@ import { sessionGuard } from './guard'
  * The OCR call is bounded so a hung service cannot hold a request open.
  *
  * Vercel caps this function at 30 s (`vercel.json`), so the call has to finish
- * inside that with room for the function's own work. The slowest real capture
- * takes ~24 s while the service is warm — the table pass dominates — and the
- * first scan after a restart is slower still, which is what the old 25 s budget
- * did not allow for. A timeout here is reported as a retryable 502, never as a
- * failed import.
+ * inside that with room for the function's own work. Measured on the five real
+ * captures, a scan costs 2-5 s on a many-core host and 15-24 s on the two-vCPU
+ * container this project recommends, with the table pass dominating; one vCPU
+ * needs 30-51 s and can never fit, which is what the old 25 s budget hid. A
+ * timeout here is reported as a retryable 502, never as a failed import.
  */
 const OCR_TIMEOUT_MS = 28_000
 /** A health probe answers a panel; it must not hold the panel open for long. */

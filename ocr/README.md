@@ -203,6 +203,21 @@ of it (a reverse proxy or the host's ingress) — the Worker should reach it ove
 HTTPS, except on loopback during development. Do not expose it without the
 token: the service itself refuses to start without one.
 
+## CPU speed
+
+oneDNN is switched off on purpose. With Paddle 3.3.1 and the PP-OCRv6 models
+`requirements.txt` installs, enabling it fails on Windows *and* on Linux with
+`ConvertPirAttribute2RuntimeAttribute not support` (`onednn_instruction.cc`), so
+this is not a Windows-only problem and there is no oneDNN win to collect yet —
+re-measure after a Paddle upgrade.
+
+Without it, one capture costs roughly 2–5 s on a many-core machine and 15–24 s
+pinned to two vCPUs (measured on the five real captures, warm and cold). The
+table pass is a single OCR call over every line of text, so the cost tracks text
+lines per second of CPU rather than image size: there is nothing to gain from
+uploading smaller screenshots. The service wants **at least two vCPUs** to stay
+inside the Worker's 28 s budget; four or more leaves comfortable headroom.
+
 ## Why not Cloudflare or Vercel
 
 Cloudflare Workers (including Python Workers) cannot load OpenCV or

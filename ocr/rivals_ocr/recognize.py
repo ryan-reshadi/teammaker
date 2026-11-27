@@ -117,9 +117,11 @@ class PaddleTextReader:
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
                 use_textline_orientation=False,
-                # Paddle 3.x on Windows throws
-                # "ConvertPirAttribute2RuntimeAttribute not support" from the
-                # oneDNN path, so the CPU backend runs without MKLDNN.
+                # oneDNN is off on purpose. With Paddle 3.3.x and the PP-OCRv6
+                # models this requirements.txt installs, the oneDNN path raises
+                # "ConvertPirAttribute2RuntimeAttribute not support"
+                # (onednn_instruction.cc) on Windows *and* on Linux, so there is
+                # no speed win to collect until Paddle fixes the lowering.
                 enable_mkldnn=False,
             )
         except TypeError:

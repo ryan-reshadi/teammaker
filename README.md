@@ -301,11 +301,13 @@ both sides cap size (8 MB) and pixel dimensions (4096). The route has its own
 unchanged.
 
 The OCR call itself is bounded at **28 s**, which leaves 2 s for the rest of the
-function under Vercel's 30 s `maxDuration`. The slowest real capture takes about
-24 s warm, so a scan that arrives while the service is still settling can reach
-the limit; that is answered with a retryable 502 and never records anything.
-Recognition cost is dominated by the table pass (one call, every text line), not
-by image size, so keep that budget in mind before shrinking the container.
+function under Vercel's 30 s `maxDuration`. On the five real captures a cold
+first request costs 2–5 s on a many-core host and 15–24 s pinned to two vCPUs,
+so that is the smallest container the budget supports; one vCPU needs 30–51 s
+and always times out. A scan that overruns is answered with a retryable 502 and
+never records anything. Recognition cost is dominated by the table pass (one
+call, every text line), not by image size, so more pixels of CPU buy more than
+smaller screenshots.
 
 The service lives in `ocr/` and is optional at runtime: when it is not running,
 the import panel says exactly what is wrong and every other feature works as
@@ -596,9 +598,13 @@ variables below are set *and* the service behind them answers, the import mode
 reports the specific reason and no other feature changes.
 
 1. Run the container in `ocr/Dockerfile` on an always-on public **CPU** host:
-   at least 1 GB RAM and **no scale-to-zero**. The first request loads the
-   Paddle models, which outlasts the Worker's 28 s budget, so a cold container
-   looks like a broken service.
+   **at least 2 vCPUs** and 1 GB RAM, with **no scale-to-zero**. Measured on the
+   five real captures, a cold first request takes 15–24 s on two vCPUs (roughly
+   2–5 s on eight or more); the first request also loads the Paddle models, and
+   a scale-to-zero container pays that again after every idle period. oneDNN is
+   deliberately off — it crashes with the Paddle version pinned in
+   `ocr/requirements.txt` on Linux as well as Windows — so cores, not a flag,
+   are what buy headroom.
 2. Give it `OCR_HOST=0.0.0.0`, `OCR_PORT=8000` and a long random
    `OCR_SERVICE_TOKEN`. It speaks plain HTTP, so terminate TLS in front of it
    (the host's ingress or a reverse proxy) and confirm `https://<host>/health`
