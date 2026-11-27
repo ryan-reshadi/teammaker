@@ -55,11 +55,12 @@ sign-in configuration.
 - **Matches** — log a played match with two to eight teams: pick roster players
   or add unnamed randoms, enter each player's damage, add or remove teams, and
   pick the winning team. Every match is kept in an editable, reorderable log;
-  editing or deleting one replays the ratings that follow it. New players are
+  editing or deleting one replays the ratings that follow it.   New players are
   provisional for their first five rated matches (double K, capped at 64). A K
   control tunes future matches only. **Rematch** refills the form with the same
   line-ups and blank damage, and the elo badge opens a per-player sparkline and
-  before/after history.
+  before/after history. **Import from RIVALS Screenshot** reads a Tab scoreboard
+  into the same form for review — see below.
 - **Saved rounds** — save a result to keep a snapshot of the teams, tolerance,
   spread and bench. The snapshot is a memory aid; bench fairness prefers logged
   matches and falls back to these rounds before the first match exists.
@@ -252,6 +253,91 @@ Pair rules are also session-only and join the "roster changed" signature. If a
 player sits out or leaves the roster, rules that mention them are dropped and a
 notice says how many were removed.
 
+## Importing a RIVALS screenshot
+
+The match form has a second entry mode: **Import from RIVALS Screenshot**. Upload
+a screenshot of the in-game Tab scoreboard and the app reads the player rows,
+each player's DMG value, which team their row belongs to (gold or purple) and the
+two team scores at the top — then asks you to review everything before submitting
+an ordinary match.
+
+- **Review first.** Nothing is submitted until every row has a username, a
+  whole-number damage value and a team, at least one row is matched to a roster
+  player, and the winner is chosen. A genuine `0` damage stays valid; damage that
+  could not be read stays **blank** rather than becoming zero.
+- **Roster matching.** `players.username` is the Roblox handle and is what gets
+  compared. An exact, case-insensitive match is assigned automatically. A similar
+  handle is only a **suggestion** (82% similarity or better) and needs a click;
+  anything else can be kept as an untracked random. Two roster players with the
+  same handle, or the same player twice, are marked **Needs review**. The importer
+  never creates roster players.
+- **Corrections.** Every detected username, damage, team and the winner can be
+  edited, rows can be removed or moved between teams, the two teams can be
+  swapped, and the whole screenshot can be rejected.
+- **Submission.** A confirmed review becomes the same `MatchInput` the manual form
+  sends (`label`, `teams`, `winner` only) through the same authenticated
+  `POST /api/matches`. No OCR confidence, image data or extra properties are sent,
+  and the elo engine is untouched: replay stays the only source of ratings.
+- **No silent retries.** A failed or timed-out submission is never retried
+  automatically, because the endpoint has no idempotency key. The review stays on
+  screen, the match log is refreshed, and saving becomes possible again only after
+  you have checked the log.
+
+### The OCR service
+
+The browser never talks to an OCR provider. `POST /api/rivals/scan` on the Worker
+signs the request with a bearer token, forwards the image to a small Python
+service and validates the JSON before returning it; the credential never reaches
+the client. Screenshots are held in memory only, never written to storage, and
+both sides cap size (8 MB) and pixel dimensions (4096). The route has its own
+8 MB body limit, so the 64 KB limit every other data route depends on is
+unchanged.
+
+The service lives in `ocr/` and is optional at runtime: without
+`OCR_SERVICE_URL` and `OCR_SERVICE_TOKEN` the UI says import is not configured and
+everything else works as before. Run it locally with:
+
+```sh
+python -m venv ocr/.venv
+ocr/.venv/Scripts/python.exe -m pip install -r ocr/requirements.txt   # Windows
+# python3 -m venv ocr/.venv && ocr/.venv/bin/pip install -r ocr/requirements.txt
+OCR_SERVICE_TOKEN=dev-secret ocr/.venv/Scripts/python.exe ocr/serve.py
+```
+
+Then copy `.dev.vars.example` to `.dev.vars` (the token must match) and run
+`bun run dev`. `ocr/README.md` documents the request/response contract, the
+pipeline stages, the Docker image and the hosting constraints.
+
+### Measuring real screenshots
+
+The pipeline's geometry is checked by generated fixtures in every test run, and
+the real PaddleOCR engine is exercised by `ocr/tests/test_engine.py` against the
+same fixture, so the reader adapter is known to match the installed engine. What
+the fixtures cannot show is accuracy on the actual game UI.
+
+To measure that, drop real Tab scoreboard screenshots in
+`ocr/tests/captures/` — one image plus a `<name>.truth.json` sidecar holding what
+the screenshot really says — and run:
+
+```sh
+bun run ocr:captures
+```
+
+It scans each capture with the real engine and prints, row by row, the expected
+and read username, damage and team, then the two team scores and the winner,
+followed by per-field accuracy (`username`, `damage`, `team`, `score`, `winner`)
+with a `RESULT: PASS/FAIL` line and a non-zero exit when any field is below its
+threshold — 100% by default, overridable with `--min-damage 0.95` and friends.
+The captures directory is git-ignored, so screenshots stay on your machine;
+`ocr/tests/captures/README.md` documents the sidecar format and how to read a
+failure. `bun run ocr:test` runs the same measurement as a test and skips it
+while the directory is empty.
+
+Known limits: the layout is verified against synthetic fixtures and any captures
+you add, not against the live game; only two teams and the vertical Tab
+scoreboard are supported; the DMG column needs a readable header; and a row
+without a visible colour stripe is reported rather than guessed.
+
 ## Data model
 
 ```sql
@@ -346,14 +432,18 @@ device.
 | GET | `/api/rounds` | newest 60 snapshots |
 | POST | `/api/rounds` | `{ config }`, validated and pruned to 100 |
 | DELETE | `/api/rounds/:id` | |
+| GET | `/api/rivals/config` | screenshot import availability, size and type limits |
+| POST | `/api/rivals/scan` | multipart `image`, proxied to the OCR service |
 
 Data routes answer 401 when signed out, 403 for cross-origin mutations, 400 for
-invalid input, 413 above 64 KB and 503 when no database is bound. Responses are
-`Cache-Control: private, no-store` and every query binds parameters.
+invalid input, 413 above 64 KB and 503 when no database is bound. The screenshot
+route is the one exception to the body limit: it has its own 8 MB cap and its own
+session guard, mounted ahead of the JSON limit rather than widening it. Responses
+are `Cache-Control: private, no-store` and every query binds parameters.
 
 ## Tests
 
-`bun test` runs nine suites:
+`bun test` runs these suites:
 
 - `tests/elo.test.ts` — the 100-point scale, even and uneven matches, loss
   protection, random inference and half weight, clamping, manual adjustments,
@@ -390,6 +480,23 @@ invalid input, 413 above 64 KB and 503 when no database is bound. Responses are
   adjustments and the saved-round fallback.
 - `tests/rematch.test.ts` — line-up copying, fresh random keys, blank damage and
   missing-player refusal.
+- `tests/rivals.test.ts` — the screenshot extraction contract, exact and
+  case-insensitive roster matching, fuzzy suggestions that are never applied
+  automatically, duplicate usernames and duplicate players, team swaps, zero
+  damage, invalid damage and winner values, untracked randoms, the exact
+  `MatchInput` payload, and the scan validator.
+- `tests/rivals-import.test.ts` — the screenshot routes against Miniflare D1:
+  signed-out 401s, foreign-origin 403s, the unconfigured 503, magic-byte
+  rejection, the 8 MB cap, a 1 MB upload that the 64 KB JSON limit must not
+  block, the unweakened JSON limit, the proxied OCR call and its bearer token,
+  and upstream failures becoming 502s.
+
+`python ocr/tests/run_tests.py` runs the OCR service's own suite against
+synthetic scoreboard fixtures: username, damage, zero damage, team colours
+(including swapped order), winners, ties, obscured rows, missing damage, an
+unreadable header or score, ambiguous team colour, upload limits and the HTTP
+interface's authentication. It needs only the packages in
+`ocr/requirements.txt`; the PaddleOCR engine is not required for these tests.
 
 ## Deploying to Vercel
 
@@ -449,6 +556,16 @@ missing env var. The environment names are the same everywhere:
 | `TURSO_AUTH_TOKEN` | Vercel | libSQL token |
 | `APP_ORIGIN` | Vercel / Sites | canonical origin for cookies and CSRF |
 | `FREEBUFF_CLIENT_ID` / `FREEBUFF_ISSUER` | Vercel / Sites | public OIDC client |
+| `OCR_SERVICE_URL` | Vercel / Sites | base URL of the OCR service (loopback in development) |
+| `OCR_SERVICE_TOKEN` | Vercel / Sites | bearer token for that service; a secret, never public |
+
+The OCR service is the one piece that cannot live on Sites or in the Vercel
+function: Workers cannot run OpenCV/PaddlePaddle native code, and the Python
+function bundle limit is a poor fit for Paddle's wheels and models. Run it as the
+container in `ocr/Dockerfile` on any host that allows a small long-running
+service, expose it over HTTPS, then set `OCR_SERVICE_URL` and
+`OCR_SERVICE_TOKEN` for the app. Until both are set, the import mode reports that
+it is not configured and no other feature changes.
 
 `bun run serve:node` starts the same handler on `127.0.0.1:5174` under Bun
 against a SQLite file. To exercise the **actual Vercel runtime path** — plain

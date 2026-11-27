@@ -4,5 +4,6 @@
     "lib": ["ES2022"],
     "types": ["@cloudflare/workers-types", "bun"]
   },
-  "include": ["src/worker", "src/shared", "src/server", "server", "scripts", "tests"]
+  "include": ["src/worker", "src/shared", "src/server", "server", "scripts", "tests"],
+  "exclude": ["tests/rivals-browser.test.tsx"]
 }

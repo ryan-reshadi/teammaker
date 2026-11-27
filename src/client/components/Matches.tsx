@@ -9,12 +9,15 @@ import {
   type MatchInput,
   type RatingEventView,
 } from '../../shared/elo'
+import type { RivalsScan } from '../../shared/rivals'
 import type { Player } from '../../shared/types'
 import {
   rematchDraft,
   type RematchPlayer as DraftPlayer,
   type RematchTeam as DraftTeam,
 } from '../rematch'
+import type { RivalsConfig } from '../store'
+import { RivalsImport } from './RivalsImport'
 
 type Props = {
   players: Player[]
@@ -25,6 +28,9 @@ type Props = {
   onDelete: (id: string) => Promise<void>
   onMove: (id: string, position: number) => Promise<void>
   onKFactor: (kFactor: number) => Promise<void>
+  onRefresh: () => Promise<void>
+  onConfig: () => Promise<RivalsConfig>
+  onScan: (file: File) => Promise<RivalsScan>
 }
 
 const emptyTeams = (): DraftTeam[] => [[], []]
@@ -52,11 +58,15 @@ export function Matches({
   onDelete,
   onMove,
   onKFactor,
+  onRefresh,
+  onConfig,
+  onScan,
 }: Props) {
   const [label, setLabel] = useState('')
   const [teams, setTeams] = useState<DraftTeam[]>(emptyTeams)
   const [winner, setWinner] = useState(0)
   const [editing, setEditing] = useState<string | null>(null)
+  const [mode, setMode] = useState<'manual' | 'import'>('manual')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [kDraft, setKDraft] = useState(String(kFactor))
@@ -85,6 +95,7 @@ export function Matches({
       setError(result.error)
       return
     }
+    setMode('manual')
     setEditing(null)
     setLabel(result.draft.label)
     setTeams(result.draft.teams)
@@ -99,6 +110,7 @@ export function Matches({
   }
 
   const startEdit = (event: MatchEventView) => {
+    setMode('manual')
     setEditing(event.id)
     setLabel(event.label)
     setWinner(event.winner)
@@ -311,7 +323,37 @@ export function Matches({
           this device still work.
         </p>
       ) : (
-        <form className="match-form" onSubmit={save} ref={formRef}>
+        <>
+          <div className="match-mode" role="tablist" aria-label="Match entry">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mode === 'manual'}
+              className={`chip${mode === 'manual' ? ' good' : ''}`}
+              onClick={() => setMode('manual')}
+            >
+              Log manually
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mode === 'import'}
+              className={`chip${mode === 'import' ? ' good' : ''}`}
+              onClick={() => setMode('import')}
+            >
+              Import from RIVALS Screenshot
+            </button>
+          </div>
+          {mode === 'import' ? (
+            <RivalsImport
+              players={players}
+              onConfig={onConfig}
+              onScan={onScan}
+              onSave={onSave}
+              onRefresh={onRefresh}
+            />
+          ) : (
+          <form className="match-form" onSubmit={save} ref={formRef}>
           <div className="match-form-head">
             <input
               className="input"
@@ -443,6 +485,8 @@ export function Matches({
             </span>
           </div>
         </form>
+          )}
+        </>
       )}
 
       {events.length > 0 && (

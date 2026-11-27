@@ -79,9 +79,8 @@ function createLibsqlDatabase(url, authToken) {
 }
 
 // src/worker/app.ts
-import { isSameOriginRequest } from "@freebuff/auth";
-import { Hono } from "hono";
-import { bodyLimit } from "hono/body-limit";
+import { Hono as Hono2 } from "hono";
+import { bodyLimit as bodyLimit2 } from "hono/body-limit";
 
 // src/shared/elo.ts
 var ELO_MIN = 100;
@@ -552,11 +551,296 @@ var mapRound = (row) => {
   }
 };
 
+// src/worker/guard.ts
+import { isSameOriginRequest } from "@freebuff/auth";
+function sessionGuard(authenticate) {
+  return async (c, next) => {
+    const user = await authenticate(c.req.raw, c.env);
+    if (!user)
+      return c.json({ error: "Sign in required." }, 401);
+    if (!["GET", "HEAD", "OPTIONS"].includes(c.req.method)) {
+      const origin = appOrigin(c.req.raw, c.env);
+      if (!origin || !isSameOriginRequest(c.req.raw, origin))
+        return c.json({ error: "Cross-origin request refused." }, 403);
+    }
+    if (!c.env.DB)
+      return c.json({ error: "This app is still being set up. Please try again later." }, 503);
+    await ensureSchema(c.env.DB);
+    c.set("user", user);
+    c.set("db", c.env.DB);
+    await next();
+  };
+}
+
+// src/worker/rivals.ts
+import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
+
+// src/shared/rivals.ts
+var RIVALS_SCAN_VERSION = 1;
+var RIVALS_MAX_BYTES = 8 * 1024 * 1024;
+var RIVALS_MAX_ROWS = 20;
+var RIVALS_MAX_USERNAME = 64;
+var RIVALS_ACCEPTED_TYPES = ["image/png", "image/jpeg", "image/webp"];
+var RIVALS_ISSUE_CODES = [
+  "row_obscured",
+  "damage_unreadable",
+  "username_unreadable",
+  "team_ambiguous",
+  "header_unreadable",
+  "score_ambiguous",
+  "low_confidence"
+];
+var isRecord = (value) => Boolean(value) && typeof value === "object" && !Array.isArray(value);
+var isIndex = (value) => typeof value === "number" && Number.isInteger(value) && value >= 0;
+var isConfidence = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
+var isSlot = (value) => value === 0 || value === 1;
+var isColor = (value) => value === "gold" || value === "purple";
+function sniffImageType(bytes) {
+  if (bytes.length >= 8 && bytes[0] === 137 && bytes[1] === 80 && bytes[2] === 78 && bytes[3] === 71 && bytes[4] === 13 && bytes[5] === 10 && bytes[6] === 26 && bytes[7] === 10)
+    return "image/png";
+  if (bytes.length >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255)
+    return "image/jpeg";
+  if (bytes.length >= 12 && bytes[0] === 82 && bytes[1] === 73 && bytes[2] === 70 && bytes[3] === 70 && bytes[8] === 87 && bytes[9] === 69 && bytes[10] === 66 && bytes[11] === 80)
+    return "image/webp";
+  return null;
+}
+function readIssue(value) {
+  if (!isRecord(value))
+    return null;
+  const code = value.code;
+  if (typeof code !== "string" || !RIVALS_ISSUE_CODES.includes(code))
+    return null;
+  const message = value.message;
+  if (typeof message !== "string" || message.length === 0 || message.length > 240)
+    return null;
+  const issue = { code, message };
+  if (value.field === "username" || value.field === "damage" || value.field === "team" || value.field === "score")
+    issue.field = value.field;
+  if (isIndex(value.rowIndex))
+    issue.rowIndex = value.rowIndex;
+  return issue;
+}
+function readIssues(value) {
+  if (!Array.isArray(value))
+    return null;
+  const issues = [];
+  for (const item of value) {
+    const issue = readIssue(item);
+    if (!issue)
+      return null;
+    issues.push(issue);
+  }
+  return issues;
+}
+function readTeam(value) {
+  if (!isRecord(value))
+    return null;
+  if (!isSlot(value.slot) || !isColor(value.color))
+    return null;
+  if (value.score !== null && !isIndex(value.score))
+    return null;
+  if (value.score !== null && value.score > 999)
+    return null;
+  if (!isConfidence(value.confidence))
+    return null;
+  return {
+    slot: value.slot,
+    color: value.color,
+    score: value.score,
+    confidence: value.confidence
+  };
+}
+function readRow(value) {
+  if (!isRecord(value))
+    return null;
+  if (!isIndex(value.index))
+    return null;
+  if (value.teamSlot !== null && !isSlot(value.teamSlot))
+    return null;
+  if (value.color !== null && !isColor(value.color))
+    return null;
+  if (value.username !== null) {
+    if (typeof value.username !== "string")
+      return null;
+    if (value.username.length > RIVALS_MAX_USERNAME)
+      return null;
+  }
+  if (!isConfidence(value.usernameConfidence))
+    return null;
+  if (value.damage !== null) {
+    if (typeof value.damage !== "number" || !Number.isInteger(value.damage))
+      return null;
+    if (value.damage < 0 || value.damage > MAX_DAMAGE)
+      return null;
+  }
+  if (!isConfidence(value.damageConfidence))
+    return null;
+  if (value.rawDamageText !== undefined && value.rawDamageText !== null && typeof value.rawDamageText !== "string")
+    return null;
+  const issues = readIssues(value.issues);
+  if (!issues)
+    return null;
+  return {
+    index: value.index,
+    teamSlot: value.teamSlot,
+    color: value.color,
+    username: value.username,
+    usernameConfidence: value.usernameConfidence,
+    damage: value.damage,
+    damageConfidence: value.damageConfidence,
+    rawDamageText: value.rawDamageText ?? null,
+    issues
+  };
+}
+function readRivalsScan(value) {
+  if (!isRecord(value))
+    return null;
+  if (value.ok === false)
+    return null;
+  if (value.version !== RIVALS_SCAN_VERSION)
+    return null;
+  if (!isRecord(value.image))
+    return null;
+  const width = value.image.width;
+  const height = value.image.height;
+  if (!isIndex(width) || !isIndex(height))
+    return null;
+  if (width === 0 || height === 0)
+    return null;
+  if (!Array.isArray(value.teams) || value.teams.length !== 2)
+    return null;
+  const teams = [];
+  for (const item of value.teams) {
+    const team = readTeam(item);
+    if (!team)
+      return null;
+    teams.push(team);
+  }
+  if (teams[0].slot === teams[1].slot)
+    return null;
+  if (teams[0].color === teams[1].color)
+    return null;
+  if (value.winnerSlot !== null && !isSlot(value.winnerSlot))
+    return null;
+  if (!Array.isArray(value.rows) || value.rows.length === 0)
+    return null;
+  if (value.rows.length > RIVALS_MAX_ROWS)
+    return null;
+  const rows = [];
+  for (const item of value.rows) {
+    const row = readRow(item);
+    if (!row)
+      return null;
+    rows.push(row);
+  }
+  const issues = readIssues(value.issues);
+  if (!issues)
+    return null;
+  return {
+    version: RIVALS_SCAN_VERSION,
+    image: { width, height },
+    teams,
+    winnerSlot: value.winnerSlot,
+    rows,
+    issues
+  };
+}
+
+// src/worker/rivals.ts
+var OCR_TIMEOUT_MS = 25000;
+var MAX_LABEL = Math.round(RIVALS_MAX_BYTES / (1024 * 1024));
+var configured = (env) => Boolean(env.OCR_SERVICE_URL?.trim() && env.OCR_SERVICE_TOKEN?.trim());
+var serviceUrl = (base) => {
+  try {
+    const url = new URL(base);
+    url.pathname = `${url.pathname.replace(/\/+$/, "")}/scan`;
+    url.search = "";
+    url.hash = "";
+    return url;
+  } catch {
+    return null;
+  }
+};
+function createRivalsRoutes({
+  authenticate,
+  fetchOcr = fetch
+}) {
+  const app = new Hono;
+  const guard = sessionGuard(authenticate);
+  app.use("*", async (c, next) => {
+    c.header("Cache-Control", "private, no-store");
+    await next();
+  });
+  app.use("*", guard);
+  app.use("*", bodyLimit({
+    maxSize: RIVALS_MAX_BYTES,
+    onError: (c) => c.json({ error: `Screenshots are up to ${MAX_LABEL} MB.` }, 413)
+  }));
+  app.get("/config", (c) => c.json({
+    configured: configured(c.env),
+    maxBytes: RIVALS_MAX_BYTES,
+    acceptedTypes: [...RIVALS_ACCEPTED_TYPES]
+  }));
+  app.post("/scan", async (c) => {
+    const url = c.env.OCR_SERVICE_URL?.trim();
+    const token = c.env.OCR_SERVICE_TOKEN?.trim();
+    if (!url || !token)
+      return c.json({
+        error: "Screenshot import is not configured on this deployment. An OCR service URL and token are required."
+      }, 503);
+    const target = serviceUrl(url);
+    if (!target)
+      return c.json({ error: "Screenshot import is misconfigured." }, 503);
+    const form = await c.req.formData().catch(() => null);
+    if (!form)
+      return c.json({ error: "Send the screenshot as a multipart field named image." }, 400);
+    const file = form.get("image");
+    if (!file || typeof file === "string")
+      return c.json({ error: "Send the screenshot as an image file." }, 400);
+    if (file.size === 0)
+      return c.json({ error: "That screenshot is empty." }, 400);
+    if (file.size > RIVALS_MAX_BYTES)
+      return c.json({ error: `Screenshots are up to ${MAX_LABEL} MB.` }, 413);
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const type = sniffImageType(bytes);
+    if (!type)
+      return c.json({ error: "Only PNG, JPEG or WebP screenshots are supported." }, 415);
+    let upstream;
+    try {
+      upstream = await fetchOcr(target.toString(), {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": type,
+          Accept: "application/json"
+        },
+        body: bytes,
+        signal: AbortSignal.timeout(OCR_TIMEOUT_MS)
+      });
+    } catch {
+      console.error("Teammaker: OCR service unreachable");
+      return c.json({ error: "The screenshot service could not be reached. Please try again." }, 502);
+    }
+    if (!upstream.ok)
+      return c.json({
+        error: upstream.status === 422 ? "That does not look like a RIVALS scoreboard." : "The screenshot could not be read. Try a clearer image."
+      }, 502);
+    const payload = await upstream.json().catch(() => null);
+    const scan = readRivalsScan(payload);
+    if (!scan)
+      return c.json({ error: "The screenshot service returned an unreadable result." }, 502);
+    return c.json(scan);
+  });
+  app.notFound((c) => c.json({ error: "Endpoint not found." }, 404));
+  return app;
+}
+
 // src/worker/app.ts
 var ROSTER_LIMIT = 200;
 var MAX_BATCH = 50;
 var MAX_ROUNDS = 100;
-var MAX_LABEL = 60;
+var MAX_LABEL2 = 60;
 var MAX_REASON = 80;
 var MATCH_ERROR = "A match needs two to eight teams, damage for every player, a winner and at least one player from your roster.";
 var readName = (value) => {
@@ -614,7 +898,7 @@ function readMatchInput(value) {
   const record = value;
   if (Object.keys(record).some((key) => key !== "label" && key !== "teams" && key !== "winner"))
     return null;
-  const label = record.label === undefined ? "" : typeof record.label === "string" && record.label.trim().length <= MAX_LABEL ? record.label.trim() : null;
+  const label = record.label === undefined ? "" : typeof record.label === "string" && record.label.trim().length <= MAX_LABEL2 ? record.label.trim() : null;
   if (label === null)
     return null;
   if (!Array.isArray(record.teams) || record.teams.length < 2 || record.teams.length > MAX_MATCH_TEAMS)
@@ -874,8 +1158,8 @@ async function trackedIdsExist(db, owner, ids) {
   const rows = await db.prepare(`SELECT id FROM players WHERE owner_sub = ? AND id IN (${ids.map(() => "?").join(", ")})`).bind(owner, ...ids).all();
   return rows.results.length === new Set(ids).size;
 }
-function createApp(authenticate = currentUser) {
-  const app = new Hono;
+function createApp(authenticate = currentUser, options = {}) {
+  const app = new Hono2;
   app.get("/api/health", async (c) => {
     c.header("Cache-Control", "private, no-store");
     const db = c.env.DB;
@@ -898,7 +1182,8 @@ function createApp(authenticate = currentUser) {
     c.header("Cache-Control", "private, no-store");
     await next();
   });
-  app.use("/api/*", bodyLimit({
+  app.route("/api/rivals", createRivalsRoutes({ authenticate, fetchOcr: options.fetchOcr }));
+  app.use("/api/*", bodyLimit2({
     maxSize: 64 * 1024,
     onError: (c) => c.json({ error: "Request is too large." }, 413)
   }));
@@ -907,23 +1192,11 @@ function createApp(authenticate = currentUser) {
     mode: isLocalPreview(c.req.raw, c.env) ? "local" : c.env.FREEBUFF_CLIENT_ID && c.env.APP_ORIGIN ? "freebuff" : "setup",
     database: Boolean(c.env.DB)
   }));
+  const guard = sessionGuard(authenticate);
   app.use("/api/*", async (c, next) => {
     if (c.req.path === "/api/health" || c.req.path === "/api/session")
       return next();
-    const user = await authenticate(c.req.raw, c.env);
-    if (!user)
-      return c.json({ error: "Sign in required." }, 401);
-    if (!["GET", "HEAD", "OPTIONS"].includes(c.req.method)) {
-      const origin = appOrigin(c.req.raw, c.env);
-      if (!origin || !isSameOriginRequest(c.req.raw, origin))
-        return c.json({ error: "Cross-origin request refused." }, 403);
-    }
-    if (!c.env.DB)
-      return c.json({ error: "This app is still being set up. Please try again later." }, 503);
-    await ensureSchema(c.env.DB);
-    c.set("user", user);
-    c.set("db", c.env.DB);
-    await next();
+    return guard(c, next);
   });
   app.get("/api/players", async (c) => c.json({ players: await loadPlayers(c.get("db"), c.get("user").sub) }));
   app.post("/api/players", async (c) => {
@@ -1252,7 +1525,9 @@ function readEnv() {
     DB: url ? connectDatabase(url, process.env.TURSO_AUTH_TOKEN) : undefined,
     FREEBUFF_CLIENT_ID: process.env.FREEBUFF_CLIENT_ID,
     FREEBUFF_ISSUER: process.env.FREEBUFF_ISSUER,
-    APP_ORIGIN: process.env.APP_ORIGIN
+    APP_ORIGIN: process.env.APP_ORIGIN,
+    OCR_SERVICE_URL: process.env.OCR_SERVICE_URL,
+    OCR_SERVICE_TOKEN: process.env.OCR_SERVICE_TOKEN
   };
 }
 var env;

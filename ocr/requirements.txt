@@ -1,0 +1,7 @@
+# OCR service dependencies. PaddleOCR pulls PaddlePaddle (CPU build) and the
+# PP-OCR models (downloaded once, cached by PaddleX on first run).
+paddlepaddle>=3.0,<4
+paddleocr>=3.0,<4
+opencv-python-headless>=4.9
+numpy>=1.26
+Pillow>=10.2

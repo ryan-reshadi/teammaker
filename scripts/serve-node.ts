@@ -14,7 +14,13 @@ const databasePath = process.env.DB_PATH ?? '.data/serve-node.db'
 if (databasePath !== ':memory:')
   mkdirSync(dirname(databasePath), { recursive: true })
 
-const env: Env = { DB: createBunSqliteDatabase(databasePath) }
+const env: Env = {
+  DB: createBunSqliteDatabase(databasePath),
+  // Same names as the deployed function, so screenshot import can be exercised
+  // here without a Worker.
+  OCR_SERVICE_URL: process.env.OCR_SERVICE_URL,
+  OCR_SERVICE_TOKEN: process.env.OCR_SERVICE_TOKEN,
+}
 const app = createApp()
 
 const server = Bun.serve({

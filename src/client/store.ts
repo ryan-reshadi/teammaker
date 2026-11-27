@@ -7,6 +7,11 @@ import {
   type MatchesResponse,
 } from '../shared/elo'
 import { normalizeTags } from '../shared/roles'
+import {
+  RIVALS_ACCEPTED_TYPES,
+  RIVALS_MAX_BYTES,
+  type RivalsScan,
+} from '../shared/rivals'
 import type { Player, Round, RoundConfig } from '../shared/types'
 
 export type PlayerDraft = {
@@ -18,6 +23,12 @@ export type PlayerDraft = {
 export type PlayerPatch = Partial<
   Pick<Player, 'name' | 'username' | 'skill' | 'elo' | 'tags' | 'sittingOut'>
 >
+
+export type RivalsConfig = {
+  configured: boolean
+  maxBytes: number
+  acceptedTypes: readonly string[]
+}
 
 export type Store = {
   players: () => Promise<Player[]>
@@ -33,6 +44,8 @@ export type Store = {
   rounds: () => Promise<Round[]>
   addRound: (config: RoundConfig) => Promise<Round>
   removeRound: (id: string) => Promise<void>
+  rivalsConfig: () => Promise<RivalsConfig>
+  scanRivals: (file: File) => Promise<RivalsScan>
 }
 
 const PLAYERS_KEY = 'teammaker.players.v1'
@@ -149,6 +162,14 @@ function localStore(): Store {
         readLocal<Round>(ROUNDS_KEY).filter((round) => round.id !== id),
       )
     },
+    async rivalsConfig() {
+      return {
+        configured: false,
+        maxBytes: RIVALS_MAX_BYTES,
+        acceptedTypes: [...RIVALS_ACCEPTED_TYPES],
+      }
+    },
+    scanRivals: unsupported,
   }
 }
 
@@ -219,6 +240,29 @@ function remoteStore(): Store {
     },
     async removeRound(id) {
       await request(`/api/rounds/${id}`, { method: 'DELETE' })
+    },
+    async rivalsConfig() {
+      return request<RivalsConfig>('/api/rivals/config')
+    },
+    async scanRivals(file) {
+      // A separate request path from the JSON routes: this one uploads an
+      // image, so it must not share the 64 KB JSON body limit.
+      const form = new FormData()
+      form.append('image', file)
+      const response = await fetch('/api/rivals/scan', {
+        method: 'POST',
+        body: form,
+      })
+      const body = (await response.json().catch(() => null)) as
+        | (RivalsScan & { error?: string })
+        | null
+      if (!response.ok)
+        throw new Error(
+          body?.error || 'That screenshot could not be read. Please try again.',
+        )
+      if (!body)
+        throw new Error('The screenshot service returned nothing. Please try again.')
+      return body
     },
   }
 }

@@ -1,0 +1,7 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["vite/client", "bun", "@cloudflare/workers-types"]
+  },
+  "include": ["tests/rivals-browser.test.tsx"]
+}

@@ -1,5 +1,3 @@
-import { isSameOriginRequest } from '@freebuff/auth'
-import type { FreebuffUser } from '@freebuff/auth'
 import { Hono } from 'hono'
 import { bodyLimit } from 'hono/body-limit'
 import {
@@ -25,9 +23,8 @@ import {
 } from '../shared/elo'
 import { normalizeTags, ROLE_IDS } from '../shared/roles'
 import type { Player, RoundConfig } from '../shared/types'
-import { appOrigin, currentUser, isLocalPreview, type Env } from './auth'
+import { currentUser, isLocalPreview } from './auth'
 import {
-  ensureSchema,
   mapPlayer,
   mapRound,
   type Database,
@@ -35,12 +32,8 @@ import {
   type RoundRow,
   type Statement,
 } from './db'
-
-type AppContext = {
-  Bindings: Env
-  Variables: { user: FreebuffUser; db: Database }
-}
-type Authenticate = (request: Request, env: Env) => Promise<FreebuffUser | null>
+import { sessionGuard, type AppContext, type Authenticate } from './guard'
+import { createRivalsRoutes } from './rivals'
 
 const ROSTER_LIMIT = 200
 const MAX_BATCH = 50
@@ -591,8 +584,11 @@ async function trackedIdsExist(
   return rows.results.length === new Set(ids).size
 }
 
-/** Tests inject identities; production always uses the Freebuff SDK. */
-export function createApp(authenticate: Authenticate = currentUser) {
+/** Tests inject identities and the OCR fetch; production uses the SDK and platform fetch. */
+export function createApp(
+  authenticate: Authenticate = currentUser,
+  options: { fetchOcr?: typeof fetch } = {},
+) {
   const app = new Hono<AppContext>()
   // Reachability probe: one real round trip, no authentication, no rows written.
   // It answers the question the session flag cannot — `session.database` only
@@ -627,6 +623,13 @@ export function createApp(authenticate: Authenticate = currentUser) {
     c.header('Cache-Control', 'private, no-store')
     await next()
   })
+  // Screenshot import has its own route chain — its own session guard and an
+  // 8 MB limit — mounted before the JSON limit below, so the 64 KB cap every
+  // other data route relies on stays exactly as it was.
+  app.route(
+    '/api/rivals',
+    createRivalsRoutes({ authenticate, fetchOcr: options.fetchOcr }),
+  )
   app.use(
     '/api/*',
     bodyLimit({
@@ -647,25 +650,13 @@ export function createApp(authenticate: Authenticate = currentUser) {
   )
 
   // Every data route needs a signed-in user, a same-origin mutation and a database.
+  const guard = sessionGuard(authenticate)
   app.use('/api/*', async (c, next) => {
     if (c.req.path === '/api/health' || c.req.path === '/api/session')
       return next()
-    const user = await authenticate(c.req.raw, c.env)
-    if (!user) return c.json({ error: 'Sign in required.' }, 401)
-    if (!['GET', 'HEAD', 'OPTIONS'].includes(c.req.method)) {
-      const origin = appOrigin(c.req.raw, c.env)
-      if (!origin || !isSameOriginRequest(c.req.raw, origin))
-        return c.json({ error: 'Cross-origin request refused.' }, 403)
-    }
-    if (!c.env.DB)
-      return c.json(
-        { error: 'This app is still being set up. Please try again later.' },
-        503,
-      )
-    await ensureSchema(c.env.DB)
-    c.set('user', user)
-    c.set('db', c.env.DB)
-    await next()
+    // Returning the guard's response is what finalizes a refusal; awaiting and
+    // discarding it would leave the context unfinished.
+    return guard(c, next)
   })
 
   app.get('/api/players', async (c) =>

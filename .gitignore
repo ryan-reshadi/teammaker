@@ -8,3 +8,10 @@ dist-client
 .env.*
 .dev.vars
 !.env.example
+ocr/.venv/
+__pycache__/
+*.pyc
+# Real screenshots stay local; the directory itself and its docs are tracked.
+ocr/tests/captures/*
+!ocr/tests/captures/.gitkeep
+!ocr/tests/captures/README.md

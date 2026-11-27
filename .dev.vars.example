@@ -1,0 +1,5 @@
+# Local development only. Copy to .dev.vars (gitignored) and run the OCR
+# service with the same token:
+#   OCR_SERVICE_TOKEN="<same value>" python ocr/serve.py
+OCR_SERVICE_URL="http://127.0.0.1:8000"
+OCR_SERVICE_TOKEN="replace-with-a-long-random-string"
