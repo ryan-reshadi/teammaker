@@ -9,6 +9,7 @@ import {
 } from '../../shared/roles'
 import type { Player, RoundConfig } from '../../shared/types'
 import { teamColor } from '../colors'
+import { syncPairRules } from '../pairRules'
 import { solveInWorker } from '../solverClient'
 import { describeSolveResult } from '../solvePresentation'
 import { ResultStatus } from './ResultStatus'
@@ -120,24 +121,15 @@ export function Build({
 
   const available = players.filter((player) => !player.sittingOut)
   const hasRoles = available.some((player) => player.tags.length > 0)
-  const availableIds = new Set(available.map((player) => player.id))
-  const availableKey = available
-    .map((player) => player.id)
-    .sort()
-    .join('|')
-  const activePairRules = pairRules.filter(
-    (rule) => availableIds.has(rule.a) && availableIds.has(rule.b),
+  const { rules: activePairRules, notice: pairDrop } = syncPairRules(
+    pairRules,
+    available.map((player) => player.id),
   )
-  // Rules are a promise about the current lineup. If one of the players sits
-  // out or leaves, drop the rule and say so instead of silently ignoring it.
   useEffect(() => {
-    if (pairRules.length === activePairRules.length) return
+    if (!pairDrop) return
     setPairRules(activePairRules)
-    const dropped = pairRules.length - activePairRules.length
-    setPairNotice(
-      `${dropped} pair rule${dropped === 1 ? '' : 's'} removed because a player sat out or left.`,
-    )
-  }, [activePairRules, availableKey, pairRules.length])
+    setPairNotice(pairDrop)
+  }, [activePairRules, pairDrop])
   const playerName = (id: string) =>
     players.find((player) => player.id === id)?.name ?? 'Player'
   const pairSignature = activePairRules

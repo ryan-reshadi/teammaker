@@ -15,6 +15,12 @@ export const MIN_K_FACTOR = 8
 export const MAX_K_FACTOR = 64
 /** New events carry this marker and their own K; unmarked events are v1. */
 export const RATING_FORMULA = 2
+/**
+ * Placement-aware result term: a team is rated on where it finished instead of
+ * on the winner flag alone. Nothing writes this marker yet, so the gate can read
+ * it without changing how any stored event replays.
+ */
+export const PLACEMENT_FORMULA = 3
 export const PROVISIONAL_MATCHES = 5
 export const PROVISIONAL_K_MULTIPLIER = 2
 /** The event log is a bookkeeping aid, not an archive; this bounds a replay. */
@@ -80,6 +86,65 @@ export function expectationsFromStrengths(strengths: number[]): number[] {
   return totals.map((value) => value / total)
 }
 
+/**
+ * The middle value of a list; an even-length list averages its two middles. Used
+ * as the lobby's damage reference, so half the field sits above it and half
+ * below it whatever the spread.
+ */
+function median(values: readonly number[]): number {
+  if (values.length === 0) return 0
+  const sorted = [...values].sort((a, b) => a - b)
+  const middle = Math.floor(sorted.length / 2)
+  return sorted.length % 2 === 0
+    ? (sorted[middle - 1]! + sorted[middle]!) / 2
+    : sorted[middle]!
+}
+
+/**
+ * The share of the finished field each team took, from its place (1 is first;
+ * equal places are a tie). Every pair of teams hands out one point, split when
+ * the two tied, so the shares always sum to one and the result term stays
+ * zero-sum against the expectations whatever the field size. Two teams reduce
+ * to a plain win (1) and loss (0), which is exactly the old outcome.
+ */
+export function placementScores(places: readonly number[]): number[] {
+  const pairs = (places.length * (places.length - 1)) / 2
+  if (pairs === 0) return places.map(() => 0)
+  return places.map((place, index) => {
+    const taken = places.reduce((sum, other, otherIndex) => {
+      if (otherIndex === index) return sum
+      if (place === other) return sum + 0.5
+      return sum + (place < other ? 1 : 0)
+    }, 0)
+    return taken / pairs
+  })
+}
+
+/** One whole place per team, from 1 to the size of the field. */
+export function isPlacement(places: unknown, teams: number): places is number[] {
+  return (
+    Array.isArray(places) &&
+    places.length === teams &&
+    places.every(
+      (place) =>
+        typeof place === 'number' &&
+        Number.isInteger(place) &&
+        place >= 1 &&
+        place <= teams,
+    )
+  )
+}
+
+/**
+ * The formula an event was rated with. Only an explicit v3 marker turns on the
+ * placement term: an event that carries places without it replays exactly as
+ * it always did, which is what keeps every stored rating unchanged.
+ */
+export function eventFormula(payload: MatchInput): 1 | 2 | 3 {
+  if (payload.formula === PLACEMENT_FORMULA) return PLACEMENT_FORMULA
+  return payload.formula === RATING_FORMULA ? RATING_FORMULA : 1
+}
+
 export type MatchPlayerInput = {
   /** A roster id for a tracked player, or a client key for a random. */
   id: string
@@ -99,8 +164,14 @@ export type MatchInput = {
   /**
    * Server-stamped rating formula. Absent on every event written before
    * versioning existed, which is how a replay knows to use the frozen legacy K.
+   * Only the placement formula reads the finishing order below.
    */
-  formula?: 2
+  formula?: 2 | 3
+  /**
+   * Finishing place per team, 1 for first; equal values are a tie. Ignored
+   * unless the event carries the placement formula.
+   */
+  places?: number[]
   /** Server-stamped base K for this event. */
   k?: number
 }
@@ -246,14 +317,21 @@ export function estimateRandomElo(
  * The performance term is centred on zero and compares each player's share of
  * the match's (size-normalized) damage with the share their rating predicts, so
  * a strong player on a losing team nets close to nothing instead of the full
- * loss.
+ * loss. Damage is also measured against the entire lobby: out-damaging more than
+ * half of everyone in the match is a floor on the term, so a bottom fragger on
+ * the winning team who still beat most of the field is never treated as a
+ * below-par performer and does not lose rating for it.
+ *
+ * A placement event rates each team on its place instead of the winner flag: the
+ * result term becomes the share of the field that team finished above, so second
+ * of three against equals is one win and one loss, which is exactly par.
  */
 export function rateMatch(
   input: MatchInput,
   ratings: ReadonlyMap<string, number>,
   kFactor: number,
   options: {
-    formula?: 1 | 2
+    formula?: 1 | 2 | 3
     /** Tracked matches played before this event, for provisional K. */
     priorMatches?: ReadonlyMap<string, number>
   } = {},
@@ -321,6 +399,13 @@ export function rateMatch(
   // them. For two teams the pair already sums to 1, which keeps the ordinary
   // Elo expectation exactly.
   const expected = expectationsFromStrengths(strength)
+  // A placement event replaces the winner flag with the share of the field each
+  // team finished above. Without a usable order it keeps the old term rather
+  // than failing the replay.
+  const placed =
+    formula === PLACEMENT_FORMULA && isPlacement(input.places, teams.length)
+      ? placementScores(input.places)
+      : null
 
   const pool = teams.reduce(
     (sum, team, index) =>
@@ -343,23 +428,45 @@ export function rateMatch(
     0,
   )
 
+  // The middle damage rate of everyone in the match. It is the lobby reference
+  // a player is judged against, not just their own team's damage.
+  const lobbyMedian = median(damagePerEnemy.flat())
+
   const result: MatchResult = { teams: [], winner: input.winner, expected }
   teams.forEach((team, index) => {
     result.teams.push({
       players: team.players.map((player, slot) => {
         const weight = weights[index]![slot]!
         const before = elos[index]![slot]!
-        const actualShare = pool > 0 ? (weight * damagePerEnemy[index]![slot]!) / pool : 0
+        const rate = damagePerEnemy[index]![slot]!
+        const actualShare = pool > 0 ? (weight * rate) / pool : 0
         const equalShare = weightTotal > 0 ? weight / weightTotal : 0
         const ratingShare = ratingTotal > 0 ? (weight * before) / ratingTotal : 0
         const expectedShare = 0.5 * equalShare + 0.5 * ratingShare
-        const performance =
+        // How the player did against what their rating (and an equal share of
+        // the lobby) predicted.
+        const predicted =
           expectedShare > 0 && actualShare > 0
             ? Math.tanh(Math.log(actualShare / expectedShare) / PERFORMANCE_TAU)
             : -1
-        const outcome = index === input.winner ? 1 : 0
+        // How the player's damage stands against the entire lobby: positive for
+        // anyone who out-damaged more than half the field, whichever team that
+        // damage came on.
+        const againstLobby =
+          lobbyMedian > 0
+            ? rate > 0
+              ? Math.tanh(Math.log(rate / lobbyMedian) / PERFORMANCE_TAU)
+              : -1
+            : 0
+        // The lobby comparison is a floor on the performance term: beating more
+        // than half of the field is never scored as a below-par performance, so
+        // a bottom fragger on the winning team whose damage still clears most of
+        // the lobby keeps (and gains) rating instead of paying for the win.
+        // Exactly at the middle is not "above most", so the rating term stands.
+        const performance = againstLobby > 0 ? Math.max(predicted, againstLobby) : predicted
+        const outcome = placed ? placed[index]! : index === input.winner ? 1 : 0
         const playerK =
-          formula === 2 && player.tracked
+          formula !== 1 && player.tracked
             ? provisionalK(kFactor, priorMatches?.get(player.id) ?? 0)
             : kFactor
         const delta = Math.round(
@@ -415,9 +522,9 @@ export function replay(
       })
       continue
     }
-    const formula = event.payload.formula === 2 ? 2 : 1
+    const formula = eventFormula(event.payload)
     const eventK =
-      formula === 2 && isKFactor(event.payload.k) ? event.payload.k : legacyK
+      formula !== 1 && isKFactor(event.payload.k) ? event.payload.k : legacyK
     const { result, updates } = rateMatch(event.payload, elos, eventK, {
       formula,
       priorMatches: matchesPlayed,

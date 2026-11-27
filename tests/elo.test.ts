@@ -3,12 +3,16 @@ import {
   DEFAULT_K_FACTOR,
   ELO_MAX,
   ELO_MIN,
+  PLACEMENT_FORMULA,
   PROVISIONAL_MATCHES,
   clampElo,
   eloFromSkill,
   estimateRandomElo,
+  eventFormula,
   expectationsFromStrengths,
   isKFactor,
+  isPlacement,
+  placementScores,
   provisionalK,
   rateMatch,
   replay,
@@ -111,6 +115,33 @@ describe('a single match', () => {
     for (const player of others) expect(carry.delta).toBeGreaterThan(player.delta)
     // The rest of the losing team still pays for the loss.
     expect(others[0]!.delta).toBeLessThan(-10)
+  })
+
+  test('damage is judged against the whole lobby, so a winning bottom fragger is not punished', () => {
+    // Team 0 are the favourites. Their bottom fragger out-damaged the whole
+    // other team but was the weakest on their own, and their rating alone said
+    // they should have dealt more — enough to turn the win into a loss.
+    const winners = [900, 700, 500, 300, 200]
+    const losers = [150, 120, 100, 80, 60]
+    const { input, ratings } = match([
+      winners.map((damage) => ({ elo: 600, damage })),
+      losers.map((damage) => ({ elo: 500, damage })),
+    ])
+    const { result } = rateMatch(input, ratings, 32)
+    const bottom = result.teams[0]!.players[4]!
+    const top = result.teams[0]!.players[0]!
+    expect(bottom.delta).toBeGreaterThan(0)
+    expect(top.delta).toBeGreaterThan(bottom.delta)
+    for (const player of result.teams[0]!.players)
+      expect(player.delta).toBeGreaterThanOrEqual(0)
+
+    // Doing less than most of the lobby on the same winning team still pays.
+    const behind = match([
+      [900, 700, 500, 300, 50].map((damage) => ({ elo: 600, damage })),
+      losers.map((damage) => ({ elo: 500, damage })),
+    ])
+    const quiet = rateMatch(behind.input, behind.ratings, 32).result.teams[0]!.players[4]!
+    expect(quiet.delta).toBeLessThan(0)
   })
 
   test('the worst performer on the losing team pays the full result swing', () => {
@@ -347,6 +378,189 @@ describe('multi-team matches', () => {
     expect(updates.get('t5')).toBeGreaterThan(500)
     for (let index = 0; index < 8; index++)
       if (index !== 5) expect(updates.get(`t${index}`)).toBeLessThan(500)
+  })
+})
+
+describe('placement matches', () => {
+  /** Five prior matches per id, so provisional K does not inflate the numbers. */
+  const settled = (ids: string[]) => new Map(ids.map((id) => [id, 5]))
+
+  test('every pair hands out one point, so the shares sum to one', () => {
+    const even = placementScores([1, 2, 3])
+    expect(even.reduce((sum, share) => sum + share, 0)).toBeCloseTo(1, 12)
+    expect(even[0]).toBeCloseTo(2 / 3, 12)
+    expect(even[1]).toBeCloseTo(1 / 3, 12)
+    expect(even[2]).toBe(0)
+    // A tied pair splits its point, so sharing second is worth less than
+    // holding it: 1/6 each instead of 1/3.
+    const tied = placementScores([1, 2, 2])
+    expect(tied[1]).toBeCloseTo(1 / 6, 12)
+    expect(tied[1]).toBeCloseTo(tied[2]!, 12)
+    expect(tied.reduce((sum, share) => sum + share, 0)).toBeCloseTo(1, 12)
+    // The shares follow the places, not the slots they arrive in.
+    expect(placementScores([3, 1, 2])[1]).toBeCloseTo(2 / 3, 12)
+    expect(placementScores([3, 1, 2])[2]).toBeCloseTo(1 / 3, 12)
+    expect(placementScores([3, 1, 2])[0]).toBe(0)
+    // Two teams are a plain win or loss, and a tied pair is half each.
+    expect(placementScores([1, 2])).toEqual([1, 0])
+    expect(placementScores([1, 1])).toEqual([0.5, 0.5])
+  })
+
+  test('only an explicit v3 marker reads the places', () => {
+    expect(eventFormula({ label: '', winner: 0, teams: [] })).toBe(1)
+    expect(eventFormula({ label: '', winner: 0, teams: [], formula: 2 })).toBe(2)
+    expect(
+      eventFormula({ label: '', winner: 0, teams: [], formula: PLACEMENT_FORMULA }),
+    ).toBe(3)
+    expect(isPlacement([1, 2], 2)).toBe(true)
+    expect(isPlacement([2, 1], 2)).toBe(true)
+    expect(isPlacement([1, 1], 2)).toBe(true)
+    expect(isPlacement([1, 2, 3], 2)).toBe(false)
+    expect(isPlacement([0, 1], 2)).toBe(false)
+    expect(isPlacement([1, 1.5], 2)).toBe(false)
+    expect(isPlacement([1, 3], 2)).toBe(false)
+    expect(isPlacement(undefined, 2)).toBe(false)
+  })
+
+  test('two teams with a placing rate exactly like the winner flag', () => {
+    const { input, ratings } = match([
+      [{ elo: 500, damage: 100, name: 'a' }],
+      [{ elo: 500, damage: 100, name: 'b' }],
+    ])
+    const priorMatches = settled(['a', 'b'])
+    const winner = rateMatch(input, ratings, 32, { formula: 2, priorMatches })
+    const placed = rateMatch(
+      { ...input, formula: PLACEMENT_FORMULA, places: [1, 2] },
+      ratings,
+      32,
+      { formula: PLACEMENT_FORMULA, priorMatches },
+    )
+    expect([...placed.updates]).toEqual([...winner.updates])
+    expect(placed.result.teams[0]!.players[0]!.delta).toBe(16)
+    expect(placed.result.teams[1]!.players[0]!.delta).toBe(-16)
+  })
+
+  test('a place is the share of the field it finished above', () => {
+    const { input, ratings } = match([
+      [{ elo: 500, damage: 100, name: 'a' }],
+      [{ elo: 500, damage: 100, name: 'b' }],
+      [{ elo: 500, damage: 100, name: 'c' }],
+    ])
+    const priorMatches = settled(['a', 'b', 'c'])
+    const placed = rateMatch(
+      { ...input, formula: PLACEMENT_FORMULA, places: [1, 2, 3] },
+      ratings,
+      32,
+      { formula: PLACEMENT_FORMULA, priorMatches },
+    )
+    // Second of three is one win and one loss against equals, which is par.
+    expect(placed.result.teams[0]!.players[0]!.delta).toBe(11)
+    expect(placed.result.teams[1]!.players[0]!.delta).toBe(0)
+    expect(placed.result.teams[2]!.players[0]!.delta).toBe(-11)
+    // The expectations are the same win shares as before; only the outcome moved.
+    for (const share of placed.result.expected) expect(share).toBeCloseTo(1 / 3, 6)
+
+    const tied = rateMatch(
+      { ...input, formula: PLACEMENT_FORMULA, places: [1, 2, 2] },
+      ratings,
+      32,
+      { formula: PLACEMENT_FORMULA, priorMatches },
+    )
+    expect(tied.result.teams[0]!.players[0]!.delta).toBe(11)
+    expect(tied.result.teams[1]!.players[0]!.delta).toBe(-5)
+    expect(tied.result.teams[2]!.players[0]!.delta).toBe(-5)
+  })
+
+  test('eight teams spread the same K across the whole order', () => {
+    const ids = Array.from({ length: 8 }, (_entry, index) => `t${index}`)
+    const { input, ratings } = match(
+      ids.map((id) => [{ elo: 500, damage: 100, name: id }]),
+    )
+    const { result } = rateMatch(
+      { ...input, formula: PLACEMENT_FORMULA, places: [1, 2, 3, 4, 5, 6, 7, 8] },
+      ratings,
+      32,
+      { formula: PLACEMENT_FORMULA, priorMatches: settled(ids) },
+    )
+    const deltas = result.teams.map((team) => team.players[0]!.delta)
+    expect(deltas).toEqual([4, 3, 2, 1, -1, -2, -3, -4])
+    expect(deltas.reduce((sum, delta) => sum + delta, 0)).toBe(0)
+  })
+
+  const six = ['a', 'b', 'c', 'd', 'e', 'f'].map((id) => ({
+    id,
+    name: id.toUpperCase(),
+    baseElo: 500,
+  }))
+  const fieldEvent = (payload: {
+    formula?: 2 | 3
+    places?: number[]
+    winner?: number
+  }): RatingEvent => ({
+    id: 'field',
+    position: 0,
+    kind: 'match',
+    createdAt: 0,
+    updatedAt: 0,
+    payload: {
+      label: 'field',
+      winner: payload.winner ?? 0,
+      teams: [
+        {
+          players: [
+            { id: 'a', name: 'Ada', damage: 100, tracked: true },
+            { id: 'b', name: 'Bo', damage: 100, tracked: true },
+          ],
+        },
+        {
+          players: [
+            { id: 'c', name: 'Cy', damage: 100, tracked: true },
+            { id: 'd', name: 'Di', damage: 100, tracked: true },
+          ],
+        },
+        {
+          players: [
+            { id: 'e', name: 'Eve', damage: 100, tracked: true },
+            { id: 'f', name: 'Finn', damage: 100, tracked: true },
+          ],
+        },
+      ],
+      ...(payload.formula === undefined ? {} : { formula: payload.formula }),
+      ...(payload.places === undefined ? {} : { places: payload.places }),
+    },
+  })
+
+  test('places on an unmarked event leave every stored rating alone', () => {
+    const plain = replay([fieldEvent({})], six, 32)
+    const withPlaces = replay([fieldEvent({ places: [1, 2, 3] })], six, 32)
+    expect([...withPlaces.elos]).toEqual([...plain.elos])
+    expect(withPlaces.outcomes.get('field')).toEqual(plain.outcomes.get('field'))
+    // The pinned legacy numbers: v1 keeps the passed K and the winner flag.
+    expect([...plain.elos]).toEqual([
+      ['a', 521],
+      ['b', 521],
+      ['c', 489],
+      ['d', 489],
+      ['e', 489],
+      ['f', 489],
+    ])
+  })
+
+  test('a v3 event rates the stored order, not the winner flag', () => {
+    const { elos } = replay(
+      [fieldEvent({ formula: PLACEMENT_FORMULA, places: [2, 1, 3], winner: 0 })],
+      six,
+      32,
+    )
+    // The first five matches still use double K, so a third of the field is 21.
+    expect([...elos]).toEqual([
+      ['a', 500],
+      ['b', 500],
+      ['c', 521],
+      ['d', 521],
+      ['e', 479],
+      ['f', 479],
+    ])
   })
 })
 

@@ -91,6 +91,7 @@ var DEFAULT_K_FACTOR = 32;
 var MIN_K_FACTOR = 8;
 var MAX_K_FACTOR = 64;
 var RATING_FORMULA = 2;
+var PLACEMENT_FORMULA = 3;
 var PROVISIONAL_MATCHES = 5;
 var PROVISIONAL_K_MULTIPLIER = 2;
 var MAX_EVENTS = 1000;
@@ -123,6 +124,36 @@ function expectationsFromStrengths(strengths) {
   if (!(total > 0))
     return strengths.map(() => 1 / strengths.length);
   return totals.map((value) => value / total);
+}
+function median(values) {
+  if (values.length === 0)
+    return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[middle - 1] + sorted[middle]) / 2 : sorted[middle];
+}
+function placementScores(places) {
+  const pairs = places.length * (places.length - 1) / 2;
+  if (pairs === 0)
+    return places.map(() => 0);
+  return places.map((place, index) => {
+    const taken = places.reduce((sum, other, otherIndex) => {
+      if (otherIndex === index)
+        return sum;
+      if (place === other)
+        return sum + 0.5;
+      return sum + (place < other ? 1 : 0);
+    }, 0);
+    return taken / pairs;
+  });
+}
+function isPlacement(places, teams) {
+  return Array.isArray(places) && places.length === teams && places.every((place) => typeof place === "number" && Number.isInteger(place) && place >= 1 && place <= teams);
+}
+function eventFormula(payload) {
+  if (payload.formula === PLACEMENT_FORMULA)
+    return PLACEMENT_FORMULA;
+  return payload.formula === RATING_FORMULA ? RATING_FORMULA : 1;
 }
 function knownAverage(teams, ratings) {
   let total = 0;
@@ -170,22 +201,27 @@ function rateMatch(input, ratings, kFactor, options = {}) {
   }));
   const strength = teams.map((team, index) => team.players.reduce((sum, _player, slot) => sum + weights[index][slot] * elos[index][slot], 0));
   const expected = expectationsFromStrengths(strength);
+  const placed = formula === PLACEMENT_FORMULA && isPlacement(input.places, teams.length) ? placementScores(input.places) : null;
   const pool = teams.reduce((sum, team, index) => sum + team.players.reduce((teamSum, _player, slot) => teamSum + weights[index][slot] * damagePerEnemy[index][slot], 0), 0);
   const weightTotal = weights.flat().reduce((sum, weight) => sum + weight, 0);
   const ratingTotal = teams.reduce((sum, team, index) => sum + team.players.reduce((teamSum, _player, slot) => teamSum + weights[index][slot] * elos[index][slot], 0), 0);
+  const lobbyMedian = median(damagePerEnemy.flat());
   const result = { teams: [], winner: input.winner, expected };
   teams.forEach((team, index) => {
     result.teams.push({
       players: team.players.map((player, slot) => {
         const weight = weights[index][slot];
         const before = elos[index][slot];
-        const actualShare = pool > 0 ? weight * damagePerEnemy[index][slot] / pool : 0;
+        const rate = damagePerEnemy[index][slot];
+        const actualShare = pool > 0 ? weight * rate / pool : 0;
         const equalShare = weightTotal > 0 ? weight / weightTotal : 0;
         const ratingShare = ratingTotal > 0 ? weight * before / ratingTotal : 0;
         const expectedShare = 0.5 * equalShare + 0.5 * ratingShare;
-        const performance = expectedShare > 0 && actualShare > 0 ? Math.tanh(Math.log(actualShare / expectedShare) / PERFORMANCE_TAU) : -1;
-        const outcome = index === input.winner ? 1 : 0;
-        const playerK = formula === 2 && player.tracked ? provisionalK(kFactor, priorMatches?.get(player.id) ?? 0) : kFactor;
+        const predicted = expectedShare > 0 && actualShare > 0 ? Math.tanh(Math.log(actualShare / expectedShare) / PERFORMANCE_TAU) : -1;
+        const againstLobby = lobbyMedian > 0 ? rate > 0 ? Math.tanh(Math.log(rate / lobbyMedian) / PERFORMANCE_TAU) : -1 : 0;
+        const performance = againstLobby > 0 ? Math.max(predicted, againstLobby) : predicted;
+        const outcome = placed ? placed[index] : index === input.winner ? 1 : 0;
+        const playerK = formula !== 1 && player.tracked ? provisionalK(kFactor, priorMatches?.get(player.id) ?? 0) : kFactor;
         const delta = Math.round(playerK * (outcome - expected[index] + PERFORMANCE_WEIGHT * performance));
         const after = player.tracked ? clampElo(before + delta) : before;
         if (player.tracked)
@@ -224,8 +260,8 @@ function replay(events, roster, kFactor, legacyK = kFactor) {
       });
       continue;
     }
-    const formula = event.payload.formula === 2 ? 2 : 1;
-    const eventK = formula === 2 && isKFactor(event.payload.k) ? event.payload.k : legacyK;
+    const formula = eventFormula(event.payload);
+    const eventK = formula !== 1 && isKFactor(event.payload.k) ? event.payload.k : legacyK;
     const { result, updates } = rateMatch(event.payload, elos, eventK, {
       formula,
       priorMatches: matchesPlayed

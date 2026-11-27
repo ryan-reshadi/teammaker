@@ -159,7 +159,11 @@ sums, so a five-stack is favoured over a four-stack. The performance term is
 centred on zero and compares each player's share of the match's size-normalized
 damage with the share their rating predicts. It carries 0.6 of K while the
 result carries the full K, which is what makes a top-damage player on a losing
-team land at roughly zero; the rest of the losing team still pays.
+team land at roughly zero; the rest of the losing team still pays. Damage is also
+compared with the entire lobby: beating more than half of everyone in the match
+is a floor on the performance term, so a winning team's bottom fragger who still
+out-damaged most of the field gains rating rather than losing it, while a
+team-mate whose damage sits under the field's middle still pays.
 - **More than two teams.** Each team is rated against every other team and the
 head-to-head expectations are normalized to share out one win, so a settled
 three-way lobby is zero-sum like a duel. A win over a bigger field pays more than
