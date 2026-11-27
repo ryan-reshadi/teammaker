@@ -1782,18 +1782,6 @@ button.generate {
   gap: 4px;
 }
 
-.provisional-badge {
-  display: inline-grid;
-  place-items: center;
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  background: var(--warn-soft);
-  color: var(--warn);
-  font-size: 10px;
-  font-weight: 700;
-}
-
 .history-button {
   width: 22px;
   height: 22px;

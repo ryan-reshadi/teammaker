@@ -13,3 +13,7 @@ Port 5175 is in use, trying another one...
   [32m➜[39m  [1mLocal[22m:   [36mhttp://127.0.0.1:[1m5176[22m/[39m
   [32m➜[39m  [1mDebug[22m:   [2m[33mhttp://127.0.0.1:[1m5176[22m[2m/__debug[39m[22m
 [2m11:16:02 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [optimizer] scanning dependencies...
+[2m12:13:44 AM[22m [36m[1m[vite][22m[39m [90m[2m(teammaker)[22m[39m [32mhmr update [39m[2mvirtual:cloudflare/worker-entry[22m
+[vite] hot updated: virtual:cloudflare/worker-entry
+[2m12:13:44 AM[22m [36m[1m[vite][22m[39m [90m[2m(teammaker)[22m[39m [32mhmr update [39m[2mvirtual:cloudflare/worker-entry[22m
+[vite] hot updated: virtual:cloudflare/worker-entry

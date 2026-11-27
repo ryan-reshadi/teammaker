@@ -1,8 +1,6 @@
-import { useMemo, useState } from 'react'
+import { useState } from 'react'
 import {
-  PROVISIONAL_MATCHES,
   clampElo,
-  provisionalK,
   skillFromElo,
   type RatingEventView,
 } from '../../shared/elo'
@@ -56,19 +54,6 @@ export function Roster({
     username: string
   } | null>(null)
   const [historyFor, setHistoryFor] = useState<string | null>(null)
-
-  const playedCounts = useMemo(() => {
-    const counts = new Map<string, number>()
-    for (const event of events) {
-      if (event.kind !== 'match') continue
-      const seen = new Set<string>()
-      for (const team of event.teams)
-        for (const player of team.players)
-          if (player.tracked && player.id) seen.add(player.id)
-      for (const id of seen) counts.set(id, (counts.get(id) ?? 0) + 1)
-    }
-    return counts
-  }, [events])
 
   const total = players.reduce((sum, player) => sum + player.elo, 0)
   const benched = players.filter((player) => player.sittingOut).length
@@ -227,8 +212,6 @@ export function Roster({
         <ul className="player-list">
           {players.map((player) => {
             const band = skillFromElo(player.elo)
-            const matchesPlayed = playedCounts.get(player.id) ?? 0
-            const effectiveK = provisionalK(kFactor, matchesPlayed)
             const history = playerHistory(events, player.id)
             const trend =
               history.length > 0
@@ -348,14 +331,6 @@ export function Roster({
                         {player.elo}
                       </button>
                     )}
-                    {matchesPlayed < PROVISIONAL_MATCHES && (
-                      <span
-                        className="provisional-badge"
-                        title={`Provisional: K ${effectiveK} for the first ${PROVISIONAL_MATCHES} rated matches (${PROVISIONAL_MATCHES - matchesPlayed} left)`}
-                      >
-                        P
-                      </span>
-                    )}
                     <button
                       type="button"
                       className="history-button"
@@ -444,11 +419,7 @@ export function Roster({
                   <div className="player-history">
                     <div className="player-history-head">
                       <strong>Rating history</strong>
-                      <span className="muted">
-                        {matchesPlayed < PROVISIONAL_MATCHES
-                          ? `Provisional · ${matchesPlayed}/${PROVISIONAL_MATCHES} rated · K ${effectiveK}`
-                          : `K ${effectiveK}`}
-                      </span>
+                      <span className="muted">K {kFactor}</span>
                       <button
                         type="button"
                         className="quiet"

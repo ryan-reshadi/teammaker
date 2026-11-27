@@ -14,8 +14,9 @@ sys.path.insert(0, TESTS)
 from fixtures import FakeReader, build  # noqa: E402
 from PIL import Image  # noqa: E402
 from rivals_ocr.imaging import ImageError, decode  # noqa: E402
-from rivals_ocr.layout import ScoreboardError  # noqa: E402
+from rivals_ocr.layout import Row, ScoreboardError, refine_rows  # noqa: E402
 from rivals_ocr.pipeline import scan_image  # noqa: E402
+from rivals_ocr.recognize import TextLine  # noqa: E402
 
 ROWS = [
     {"username": "sniperking", "damage": 12345, "team": "gold"},
@@ -93,6 +94,74 @@ class ExtractionTests(unittest.TestCase):
         self.assertIn("damage_unreadable", codes)
 
 
+FOUR_V_FOUR = [
+    {"username": "Alpha", "handle": "alpha_one", "damage": 1665, "team": "gold"},
+    {"username": "Bravo", "handle": "bravo_two", "damage": 1653, "team": "gold"},
+    {"username": "Charlie", "damage": 1595, "team": "purple"},
+    {"username": "Delta", "damage": 1524, "team": "gold"},
+    {"username": "Echo", "damage": 1097, "team": "purple"},
+    {"username": "Foxtrot", "damage": 1078, "team": "purple"},
+]
+
+
+class MultiPlayerTests(unittest.TestCase):
+    """A 4v4 board, where team-mates share one continuous colour stripe."""
+
+    def test_every_player_on_a_shared_stripe_is_its_own_row(self):
+        result = run(FOUR_V_FOUR, gap=0)
+        self.assertEqual(len(result["rows"]), len(FOUR_V_FOUR))
+        self.assertEqual(
+            [row["damage"] for row in result["rows"]],
+            [1665, 1653, 1595, 1524, 1097, 1078],
+        )
+        self.assertEqual(
+            [row["color"] for row in result["rows"]],
+            ["gold", "gold", "purple", "gold", "purple", "purple"],
+        )
+
+    def test_the_roblox_handle_is_the_username(self):
+        # The roster is indexed by the @handle, not by the display name above it.
+        result = run(FOUR_V_FOUR, gap=0)
+        self.assertEqual(
+            [row["username"] for row in result["rows"]],
+            ["alpha_one", "bravo_two", "Charlie", "Delta", "Echo", "Foxtrot"],
+        )
+
+    def test_an_obscured_player_in_a_shared_stripe_is_still_reported(self):
+        result = run(FOUR_V_FOUR, gap=0, blank=("row:1",))
+        self.assertEqual(len(result["rows"]), len(FOUR_V_FOUR))
+        obscured = result["rows"][1]
+        self.assertIsNone(obscured["username"])
+        self.assertIn("row_obscured", [issue["code"] for issue in obscured["issues"]])
+
+
+class RowRefinementTests(unittest.TestCase):
+    def test_two_players_on_one_stripe_are_split_by_their_text(self):
+        rows = [Row(0, 100, 220, 0, 100, "gold", 1.0)]
+        lines = [
+            TextLine("a", 0.9, (0, 106, 40, 126)),
+            TextLine("1", 0.9, (60, 106, 90, 126)),
+            TextLine("b", 0.9, (0, 166, 40, 186)),
+            TextLine("2", 0.9, (60, 166, 90, 186)),
+        ]
+        refined = refine_rows(rows, lines)
+        self.assertEqual([(row.y0, row.y1) for row in refined], [(100, 146), (146, 220)])
+        self.assertTrue(all(row.color == "gold" for row in refined))
+
+    def test_a_row_cut_by_the_bottom_edge_is_ignored(self):
+        rows = [
+            Row(0, 0, 60, 0, 100, "gold", 1.0),
+            Row(1, 60, 120, 0, 100, "gold", 1.0),
+            Row(2, 120, 143, 0, 100, "purple", 1.0),
+        ]
+        refined = refine_rows(rows, [])
+        self.assertEqual([(row.y0, row.y1) for row in refined], [(0, 60), (60, 120)])
+
+    def test_a_row_without_text_keeps_its_band(self):
+        rows = [Row(0, 0, 60, 0, 100, "gold", 1.0), Row(1, 60, 120, 0, 100, "purple", 1.0)]
+        self.assertEqual(len(refine_rows(rows, [])), 2)
+
+
 class ScoreTests(unittest.TestCase):
     def test_winner_from_scores(self):
         result = run()
@@ -111,7 +180,7 @@ class ScoreTests(unittest.TestCase):
     def test_noise_around_a_score_is_tolerated(self):
         # A colour block merged into the detection ("\u25a15") is still a score.
         png, spec = build(ROWS)
-        spec["regions"]["score"][0]["text"] = "\u25a15"
+        spec["regions"]["score:gold"][0]["text"] = "\u25a15"
         result = scan_image(png, FakeReader(spec))
         self.assertEqual([team["score"] for team in result["teams"]], [5, 3])
         self.assertEqual(result["winnerSlot"], 0)

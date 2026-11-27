@@ -91,6 +91,7 @@ var MIN_K_FACTOR = 8;
 var MAX_K_FACTOR = 64;
 var RATING_FORMULA = 2;
 var PLACEMENT_FORMULA = 3;
+var FLAT_K_FORMULA = 4;
 var PROVISIONAL_MATCHES = 5;
 var PROVISIONAL_K_MULTIPLIER = 2;
 var MAX_EVENTS = 1000;
@@ -150,6 +151,8 @@ function isPlacement(places, teams) {
   return Array.isArray(places) && places.length === teams && places.every((place) => typeof place === "number" && Number.isInteger(place) && place >= 1 && place <= teams);
 }
 function eventFormula(payload) {
+  if (payload.formula === FLAT_K_FORMULA)
+    return FLAT_K_FORMULA;
   if (payload.formula === PLACEMENT_FORMULA)
     return PLACEMENT_FORMULA;
   return payload.formula === RATING_FORMULA ? RATING_FORMULA : 1;
@@ -220,7 +223,7 @@ function rateMatch(input, ratings, kFactor, options = {}) {
         const againstLobby = lobbyMedian > 0 ? rate > 0 ? Math.tanh(Math.log(rate / lobbyMedian) / PERFORMANCE_TAU) : -1 : 0;
         const performance = againstLobby > 0 ? Math.max(predicted, againstLobby) : predicted;
         const outcome = placed ? placed[index] : index === input.winner ? 1 : 0;
-        const playerK = formula !== 1 && player.tracked ? provisionalK(kFactor, priorMatches?.get(player.id) ?? 0) : kFactor;
+        const playerK = formula !== 1 && formula !== FLAT_K_FORMULA && player.tracked ? provisionalK(kFactor, priorMatches?.get(player.id) ?? 0) : kFactor;
         const delta = Math.round(playerK * (outcome - expected[index] + PERFORMANCE_WEIGHT * performance));
         const after = player.tracked ? clampElo(before + delta) : before;
         if (player.tracked)
@@ -1393,7 +1396,7 @@ function createApp(authenticate = currentUser, options = {}) {
     await pinLegacyK(db, owner, kFactor);
     const payload = {
       ...input,
-      formula: RATING_FORMULA,
+      formula: FLAT_K_FORMULA,
       k: kFactor
     };
     await db.prepare("INSERT INTO rating_events (id, owner_sub, position, kind, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(id, owner, position, "match", JSON.stringify(payload), now, now).run();
@@ -1426,8 +1429,9 @@ function createApp(authenticate = currentUser, options = {}) {
       let marker = {};
       try {
         const existing = JSON.parse(row.payload);
-        if (existing.formula === 2) {
-          marker = { formula: 2 };
+        const version = eventFormula(existing);
+        if (version !== 1) {
+          marker = { formula: version };
           if (isKFactor(existing.k))
             marker.k = existing.k;
         }

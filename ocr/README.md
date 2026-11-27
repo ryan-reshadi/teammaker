@@ -115,17 +115,25 @@ text parsing, `recognize.py` wraps the engine, `imaging.py` validates uploads.
 1. **Validation** — magic bytes, byte cap, decode with OpenCV, dimension caps.
 2. **Scoreboard detection** — team-colour masks (gold HSV hue ≈ 21, purple ≈ 130);
    no wide horizontal stripe means `scoreboard_not_found`.
-3. **Row segmentation** — one band per colour stripe, split by the small gaps
-   between rows (a tall band is split by the typical row height). Rows are found
-   wherever they are, so the screenshot can be cropped or scaled.
+3. **Row segmentation** — one band per colour stripe. Team-mates share one
+   continuous stripe, so a band is cut where the text in it starts and stops (a
+   band with no text at all is split by the typical row height instead), and a
+   trailing band shorter than 70% of a row is dropped: that is the next player
+   scrolled off the bottom edge, not a row. Rows are found wherever they are, so
+   the screenshot can be cropped or scaled.
 4. **Username extraction** — OCR of the row crop; tokens left of the DMG column,
-   rank digits dropped, the cluster nearest the DMG column joined.
+   rank digits dropped, and the `@handle` line is preferred over the display
+   name above it (the `@` is stripped). A row with no handle line falls back to
+   its display name. Roster matching is therefore by Roblox handle.
 5. **Damage extraction** — numeric tokens whose centre falls inside the DMG
    column; commas stripped; unreadable stays `null`.
 6. **Team-colour classification** — the dominant mask inside the row's stripe;
    a mixed stripe is ambiguous rather than a coin flip.
-7. **Team-score extraction** — two integers in the band above the header,
-   associated to teams by the nearest colour accent.
+7. **Team-score extraction** — the strip is found by its large white numerals
+   (the HUD background colour changes with the map), each team's box by its own
+   colour, and the score is read from the end of the box that faces the timer,
+   where it is drawn — the rest of a box holds avatars and coin badges. Scores
+   too small to be a score are refused, so a badge is never reported as one.
 8. **Winner determination** — higher score; a tie or missing score leaves it
    unset.
 9. **Structured JSON** — the document above, with per-row issues.
@@ -205,5 +213,9 @@ OCR call leaves it.
 - The DMG column needs a readable header; without it damage is left blank.
 - Rows without a visible colour gap may merge; a very tall band is split by the
   typical row height and anything still merged is flagged, not invented.
-- Roblox display names differ from usernames; matching uses `players.username`,
-  so a screenshot showing display names relies on the suggestion/review path.
+- Roblox display names differ from usernames; the row's `@handle` is read and
+  matching uses `players.username`. A row without a handle line, or a handle the
+  engine misreads (`I`/`l`/`i`, `0`/`O`, `__`/`_` at 12–14 px), relies on the
+  suggestion/review path.
+- Rows scrolled off the bottom edge are ignored by design; a capture that is cut
+  mid-row loses that player instead of importing a partial row.

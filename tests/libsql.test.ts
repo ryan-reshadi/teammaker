@@ -259,19 +259,19 @@ describe('libSQL adapter', () => {
       }).players
       return list.find((player) => player.name === name)!.elo
     }
-    // Both players are provisional, so the first match uses K 64.
-    expect(await eloOf('Ada')).toBe(532)
-    expect(await eloOf('Bo')).toBe(468)
+    // K is the account setting from the first match: no provisional window.
+    expect(await eloOf('Ada')).toBe(516)
+    expect(await eloOf('Bo')).toBe(484)
 
     const log = (await (await call(env, '/api/matches', 'zoe')).json()) as {
       events: { id: string; teams: { players: { delta: number }[] }[] }[]
     }
-    expect(log.events[0]!.teams[0]!.players[0]!.delta).toBe(32)
+    expect(log.events[0]!.teams[0]!.players[0]!.delta).toBe(16)
 
     // Changing K affects future matches only; the stored duel does not move.
     await call(env, '/api/settings', 'zoe', 'PUT', { kFactor: 64 })
-    expect(await eloOf('Ada')).toBe(532)
-    expect(await eloOf('Bo')).toBe(468)
+    expect(await eloOf('Ada')).toBe(516)
+    expect(await eloOf('Bo')).toBe(484)
 
     const removed = await call(env, `/api/matches/${log.events[0]!.id}`, 'zoe', 'DELETE')
     expect(removed.status).toBe(200)
@@ -403,7 +403,7 @@ describe('libSQL adapter', () => {
         .first(),
     ).toEqual({ legacy_k: 32 })
 
-    // A new match is stamped v2 with the new K; the legacy event still reads
+    // A new match is stamped v4 with the new K; the legacy event still reads
     // with its frozen K and its stored results are untouched.
     expect(
       (await call(env, '/api/matches', 'legacy', 'POST', { ...payload, label: 'New' }))
@@ -415,7 +415,7 @@ describe('libSQL adapter', () => {
       )
       .bind('legacy')
       .first<{ payload: string }>()
-    expect(JSON.parse(newRow!.payload)).toMatchObject({ formula: 2, k: 64 })
+    expect(JSON.parse(newRow!.payload)).toMatchObject({ formula: 4, k: 64 })
     expect(await results()).toEqual(startResults)
   })
 })

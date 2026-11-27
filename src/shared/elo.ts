@@ -21,6 +21,12 @@ export const RATING_FORMULA = 2
  * it without changing how any stored event replays.
  */
 export const PLACEMENT_FORMULA = 3
+/**
+ * Flat-K formula: the account K applies to every rated match, with no
+ * provisional window. Events written before it carry 2 (or 3) and keep the
+ * doubled K they were rated with, so their stored ratings replay unchanged.
+ */
+export const FLAT_K_FORMULA = 4
 export const PROVISIONAL_MATCHES = 5
 export const PROVISIONAL_K_MULTIPLIER = 2
 /** The event log is a bookkeeping aid, not an archive; this bounds a replay. */
@@ -57,8 +63,10 @@ export const isKFactor = (value: unknown): value is number =>
   value <= MAX_K_FACTOR
 
 /**
- * A new player moves faster: the first few rated matches use double K, capped
- * at the same maximum as the account setting. Adjustments never count.
+ * The pre-v4 provisional window: the first few rated matches used double K,
+ * capped at the same maximum as the account setting. Only events written before
+ * `FLAT_K_FORMULA` read this, so history replays exactly as it was rated; every
+ * new match uses the account K as set. Adjustments never count.
  */
 export function provisionalK(baseK: number, matchesPlayed: number): number {
   const k = isKFactor(baseK) ? baseK : DEFAULT_K_FACTOR
@@ -140,7 +148,8 @@ export function isPlacement(places: unknown, teams: number): places is number[] 
  * placement term: an event that carries places without it replays exactly as
  * it always did, which is what keeps every stored rating unchanged.
  */
-export function eventFormula(payload: MatchInput): 1 | 2 | 3 {
+export function eventFormula(payload: MatchInput): 1 | 2 | 3 | 4 {
+  if (payload.formula === FLAT_K_FORMULA) return FLAT_K_FORMULA
   if (payload.formula === PLACEMENT_FORMULA) return PLACEMENT_FORMULA
   return payload.formula === RATING_FORMULA ? RATING_FORMULA : 1
 }
@@ -164,9 +173,10 @@ export type MatchInput = {
   /**
    * Server-stamped rating formula. Absent on every event written before
    * versioning existed, which is how a replay knows to use the frozen legacy K.
-   * Only the placement formula reads the finishing order below.
+   * Only the placement formula reads the finishing order below, and only the
+   * pre-v4 formulas read the provisional window.
    */
-  formula?: 2 | 3
+  formula?: 2 | 3 | 4
   /**
    * Finishing place per team, 1 for first; equal values are a tie. Ignored
    * unless the event carries the placement formula.
@@ -331,8 +341,8 @@ export function rateMatch(
   ratings: ReadonlyMap<string, number>,
   kFactor: number,
   options: {
-    formula?: 1 | 2 | 3
-    /** Tracked matches played before this event, for provisional K. */
+    formula?: 1 | 2 | 3 | 4
+    /** Tracked matches played before this event, for the pre-v4 provisional K. */
     priorMatches?: ReadonlyMap<string, number>
   } = {},
 ): { result: MatchResult; updates: Map<string, number> } {
@@ -466,7 +476,7 @@ export function rateMatch(
         const performance = againstLobby > 0 ? Math.max(predicted, againstLobby) : predicted
         const outcome = placed ? placed[index]! : index === input.winner ? 1 : 0
         const playerK =
-          formula !== 1 && player.tracked
+          formula !== 1 && formula !== FLAT_K_FORMULA && player.tracked
             ? provisionalK(kFactor, priorMatches?.get(player.id) ?? 0)
             : kFactor
         const delta = Math.round(

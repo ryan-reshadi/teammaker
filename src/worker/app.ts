@@ -2,12 +2,13 @@ import { Hono } from 'hono'
 import { bodyLimit } from 'hono/body-limit'
 import {
   DEFAULT_K_FACTOR,
+  FLAT_K_FORMULA,
   MAX_DAMAGE,
   MAX_EVENTS,
   MAX_MATCH_PLAYERS,
   MAX_MATCH_TEAMS,
-  RATING_FORMULA,
   clampElo,
+  eventFormula,
   isKFactor,
   replay,
   skillFromElo,
@@ -996,7 +997,7 @@ export function createApp(
     await pinLegacyK(db, owner, kFactor)
     const payload: MatchInput = {
       ...input,
-      formula: RATING_FORMULA,
+      formula: FLAT_K_FORMULA,
       k: kFactor,
     }
     await db
@@ -1045,12 +1046,14 @@ export function createApp(
       if (!(await trackedIdsExist(db, owner, tracked)))
         return c.json({ error: 'Those players are no longer on your roster.' }, 400)
       // Editing never upgrades or re-rates an event: a legacy match stays
-      // legacy (and keeps its frozen K), and a v2 match keeps its recorded K.
-      let marker: { formula?: 2; k?: number } = {}
+      // legacy (and keeps its frozen K), and a marked match keeps the formula
+      // and K it was rated with.
+      let marker: { formula?: 2 | 3 | 4; k?: number } = {}
       try {
         const existing = JSON.parse(row.payload) as MatchInput
-        if (existing.formula === 2) {
-          marker = { formula: 2 }
+        const version = eventFormula(existing)
+        if (version !== 1) {
+          marker = { formula: version }
           if (isKFactor(existing.k)) marker.k = existing.k
         }
       } catch {

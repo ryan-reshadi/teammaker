@@ -426,11 +426,11 @@ test('matches tune elo, replay edits, log manual ratings and stay private', asyn
 
   const logged = await call('/api/matches', 'frank', 'POST', body)
   expect(logged.status).toBe(201)
-  // New players are provisional: the first five rated matches use double K.
-  expect(await eloOf('Ada')).toBe(532)
-  expect(await eloOf('Bo')).toBe(532)
-  expect(await eloOf('Cy')).toBe(468)
-  expect(await eloOf('Di')).toBe(468)
+  // K is the account setting from a player's first match: no provisional window.
+  expect(await eloOf('Ada')).toBe(516)
+  expect(await eloOf('Bo')).toBe(516)
+  expect(await eloOf('Cy')).toBe(484)
+  expect(await eloOf('Di')).toBe(484)
 
   let log = (await (await call('/api/matches', 'frank')).json()) as Logged
   expect(log.kFactor).toBe(32)
@@ -439,14 +439,14 @@ test('matches tune elo, replay edits, log manual ratings and stay private', asyn
   expect(log.events[0]!.kind).toBe('match')
   expect(log.events[0]!.teams![0]!.players[0]).toMatchObject({
     name: 'Ada',
-    delta: 32,
+    delta: 16,
     eloBefore: 500,
-    eloAfter: 532,
+    eloAfter: 516,
   })
 
   // Formula and K are server-stamped; a client cannot supply them.
   expect(
-    (await call('/api/matches', 'frank', 'POST', { ...body, formula: 2, k: 64 }))
+    (await call('/api/matches', 'frank', 'POST', { ...body, formula: 4, k: 64 }))
       .status,
   ).toBe(400)
 
@@ -519,8 +519,8 @@ test('matches tune elo, replay edits, log manual ratings and stay private', asyn
     input: { ...body, winner: 1 },
   })
   expect(edited.status).toBe(200)
-  expect(await eloOf('Ada')).toBe(468)
-  expect(await eloOf('Cy')).toBe(532)
+  expect(await eloOf('Ada')).toBe(484)
+  expect(await eloOf('Cy')).toBe(516)
 
   // K is forward-only: changing it never replays old matches.
   expect((await call('/api/settings', 'frank', 'PUT', { kFactor: 7 })).status).toBe(400)
@@ -529,8 +529,8 @@ test('matches tune elo, replay edits, log manual ratings and stay private', asyn
   expect((await (await call('/api/settings', 'frank')).json()) as { kFactor: number }).toEqual(
     { kFactor: 8 },
   )
-  expect(await eloOf('Ada')).toBe(468)
-  expect(await eloOf('Cy')).toBe(532)
+  expect(await eloOf('Ada')).toBe(484)
+  expect(await eloOf('Cy')).toBe(516)
 
   // Editing keeps the K the match was rated with, not the new setting.
   expect(
@@ -540,8 +540,8 @@ test('matches tune elo, replay edits, log manual ratings and stay private', asyn
       })
     ).status,
   ).toBe(200)
-  expect(await eloOf('Ada')).toBe(532)
-  expect(await eloOf('Cy')).toBe(468)
+  expect(await eloOf('Ada')).toBe(516)
+  expect(await eloOf('Cy')).toBe(484)
   expect(
     (
       await call(`/api/matches/${matchId}`, 'frank', 'PATCH', {
@@ -549,8 +549,8 @@ test('matches tune elo, replay edits, log manual ratings and stay private', asyn
       })
     ).status,
   ).toBe(200)
-  expect(await eloOf('Ada')).toBe(468)
-  expect(await eloOf('Cy')).toBe(532)
+  expect(await eloOf('Ada')).toBe(484)
+  expect(await eloOf('Cy')).toBe(516)
 
   // A manual rating lands in the same log and survives the match's deletion.
   const adjusted = await call(`/api/players/${ada.id}/elo`, 'frank', 'POST', {
@@ -625,10 +625,10 @@ test('a match can have more than two teams', async () => {
   expect(log.events).toHaveLength(1)
   expect(log.events[0]!.winner).toBe(2)
   expect(log.events[0]!.teams).toHaveLength(3)
-  expect(log.events[0]!.teams![0]!.players[0]!.delta).toBe(-21)
-  expect(log.events[0]!.teams![2]!.players[0]!.delta).toBe(43)
-  expect(await eloOf('Ana')).toBe(479)
-  expect(await eloOf('Cal')).toBe(543)
+  expect(log.events[0]!.teams![0]!.players[0]!.delta).toBe(-11)
+  expect(log.events[0]!.teams![2]!.players[0]!.delta).toBe(21)
+  expect(await eloOf('Ana')).toBe(489)
+  expect(await eloOf('Cal')).toBe(521)
 
   // Editing the winner of a three-team match replays the whole field.
   const matchId = log.events[0]!.id
@@ -636,8 +636,8 @@ test('a match can have more than two teams', async () => {
     input: { ...body, winner: 0 },
   })
   expect(edited.status).toBe(200)
-  expect(await eloOf('Ana')).toBe(543)
-  expect(await eloOf('Cal')).toBe(479)
+  expect(await eloOf('Ana')).toBe(521)
+  expect(await eloOf('Cal')).toBe(489)
 
   // A winner past the last team, and more teams than the app supports, are invalid.
   expect((await call('/api/matches', 'iris', 'POST', { ...body, winner: 3 })).status).toBe(

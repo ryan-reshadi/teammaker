@@ -55,9 +55,9 @@ sign-in configuration.
 - **Matches** — log a played match with two to eight teams: pick roster players
   or add unnamed randoms, enter each player's damage, add or remove teams, and
   pick the winning team. Every match is kept in an editable, reorderable log;
-  editing or deleting one replays the ratings that follow it.   New players are
-  provisional for their first five rated matches (double K, capped at 64). A K
-  control tunes future matches only. **Rematch** refills the form with the same
+  editing or deleting one replays the ratings that follow it.   The account K
+  applies to every match, a player's first one included. A K control tunes
+  future matches only. **Rematch** refills the form with the same
   line-ups and blank damage, and the elo badge opens a per-player sparkline and
   before/after history. **Import from RIVALS Screenshot** reads a Tab scoreboard
   into the same form for review — see below.
@@ -141,8 +141,8 @@ server.
 - Win odds are elo-only and pre-match. A data-driven calibration study is
   deferred until the log has enough matches; recalibrating later is a new formula
   version, never a silent rewrite of old events.
-- Rolling back is clean only until the first v2 match is logged. Older builds
-  ignore the `formula`/`k` marker, so after that keep this build or delete the v2
+- Rolling back is clean only until the first v4 match is logged. Older builds
+  ignore the `formula`/`k` marker, so after that keep this build or delete the v4
   events before rolling back; the v1 history itself is unaffected.
 - Saved rounds are capped at the newest 100 per account; new saves prune older
   ones.
@@ -167,9 +167,8 @@ out-damaged most of the field gains rating rather than losing it, while a
 team-mate whose damage sits under the field's middle still pays.
 - **More than two teams.** Each team is rated against every other team and the
 head-to-head expectations are normalized to share out one win, so a settled
-three-way lobby is zero-sum like a duel. A win over a bigger field pays more than
-a duel at the same ratings. Provisional matches are the exception: each player
-has their own K, so the deltas need not sum to zero.
+  three-way lobby is zero-sum like a duel. A win over a bigger field pays more than
+  a duel at the same ratings.
 - **Uneven teams.** Damage is divided by the number of enemies the player faced
 (everyone outside their own team) before shares are compared, so a smaller
 team's extra targets do not inflate their rating.
@@ -177,11 +176,11 @@ team's extra targets do not inflate their rating.
 rating is inferred from the lobby's known elo, shifted by their relative damage,
 clamped to the scale, and counted at half a player's weight in both the
 expectation and the damage pool. They are never updated.
-- **Provisional K.** The first five rated matches a player appears in use double
-  the account K, capped at 64. Adjustments never count, and a player's prior
-  match count is derived deterministically during the replay, so old history
-  never moves. Provisional matches are not strictly zero-sum: each player's K is
-  their own.
+- **No provisional window.** Every rated match uses the account K, including a
+  player's first one. Matches logged under the older formulas (2 and 3) doubled K
+  for a player's first five rated matches; they keep the deltas they were rated
+  with, so no stored rating moves when the window was retired. New events are
+  stamped formula 4, which reads no prior-match count at all.
 - **K.** An account setting from 8 to 64, default 32. It applies to new matches
   only. Changing it freezes the K that produced existing ratings and never
   replays the log.
@@ -261,6 +260,14 @@ each player's DMG value, which team their row belongs to (gold or purple) and th
 two team scores at the top — then asks you to review everything before submitting
 an ordinary match.
 
+- **Handles, not display names.** Each row's username is the Roblox handle
+  printed under the display name (the `@name` line), so a roster player is
+  matched by `destruction_lord9` rather than by `PVPDreadlord`. A row that shows
+  no handle line falls back to its display name and is left for review.
+- **Only what is on screen.** Rows are read where they are; a player whose row
+  is scrolled off the bottom edge is not counted rather than imported with
+  missing damage. All four team members in a 4v4 are read even though several
+  share one continuous colour stripe.
 - **Review first.** Nothing is submitted until every row has a username, a
   whole-number damage value and a team, at least one row is matched to a roster
   player, and the winner is chosen. A genuine `0` damage stays valid; damage that
@@ -335,8 +342,10 @@ while the directory is empty.
 
 Known limits: the layout is verified against synthetic fixtures and any captures
 you add, not against the live game; only two teams and the vertical Tab
-scoreboard are supported; the DMG column needs a readable header; and a row
-without a visible colour stripe is reported rather than guessed.
+scoreboard are supported; the DMG column needs a readable header; a row without
+a visible colour stripe is reported rather than guessed; and a handle is only as
+reliable as 12–14 px text allows — `I`/`l`/`i`, `0`/`O` and double underscores
+can be misread, and the review step is where you fix them.
 
 ## Data model
 
@@ -366,7 +375,7 @@ work. Workspaces created before roles or elo existed are migrated in place:
 sets `elo = base_elo = skill × 100` for existing players. No history is invented.
 
 `rating_events.payload` is either a match (label, two to eight teams of players
-with damage, the index of the winner, and — on new events only — `formula: 2`
+with damage, the index of the winner, and — on new events only — `formula: 4`
 and the base `k`) or a manual adjustment (player id, elo, reason). `rating_meta`
 pins the K that produced pre-versioning ratings; it is written lazily, never
 rewrites an event, and has no row until a K change or the first v2 match.
@@ -448,7 +457,8 @@ are `Cache-Control: private, no-store` and every query binds parameters.
 - `tests/elo.test.ts` — the 100-point scale, even and uneven matches, loss
   protection, random inference and half weight, clamping, manual adjustments,
   deterministic replay, edit/delete/reorder, K changes, win-odds calibration,
-  provisional K and v1/v2 replay compatibility.
+  flat K, the retired provisional K for older events, and v1/v2/v4 replay
+  compatibility.
 - `tests/balance.test.ts` — team sizes, a known perfect split, all 15 partitions
   of six equal players, **brute-force cross-checks** for equal and unequal team
   sizes, the strong-player-singleton case that a per-index size vector would

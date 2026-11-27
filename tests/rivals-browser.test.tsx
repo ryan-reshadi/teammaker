@@ -401,7 +401,7 @@ test('upload → scan → review → submit creates a replayed match and refresh
   ).all<{ payload: string }>()
   const payload = JSON.parse(events.results[0]!.payload) as Record<string, unknown>
   expect(Object.keys(payload).sort()).toEqual(['formula', 'k', 'label', 'teams', 'winner'])
-  expect(payload.formula).toBe(2)
+  expect(payload.formula).toBe(4)
 
   const results = await env.DB!.prepare(
     'SELECT COUNT(*) AS total FROM rating_results',

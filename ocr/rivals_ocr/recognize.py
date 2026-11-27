@@ -28,7 +28,15 @@ class TextLine:
 class TextReader(Protocol):
     name: str
 
-    def read(self, image: np.ndarray, region: str = "row") -> list[TextLine]:
+    def read(
+        self,
+        image: np.ndarray,
+        region: str = "row",
+        box: tuple[int, int, int, int] | None = None,
+    ) -> list[TextLine]:
+        """Recognises the text in a crop; `region` names the crop and `box` is
+        where it sits in the screenshot. Neither changes recognition: the engine
+        only sees pixels. They let a test reader place its fixture text."""
         ...
 
 
@@ -126,8 +134,14 @@ class PaddleTextReader:
             raise EngineUnavailable("The OCR engine could not start.") from error
         return self._engine
 
-    def read(self, image: np.ndarray, region: str = "row") -> list[TextLine]:
-        # `region` names the crop for test readers; Paddle does not need it.
+    def read(
+        self,
+        image: np.ndarray,
+        region: str = "row",
+        box: tuple[int, int, int, int] | None = None,
+    ) -> list[TextLine]:
+        # `region` and `box` describe the crop for test readers; Paddle sees only
+        # the pixels and does not need either.
         engine = self._load()
         if image.size == 0:
             return []

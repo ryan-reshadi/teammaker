@@ -38,8 +38,8 @@ the true value is genuinely unreadable (a blank damage cell, a hidden row).
 
 | Key | Meaning |
 |---|---|
-| `rows` | One entry per on-screen row, **in the order they appear**. Required. |
-| `rows[].username` | Exact displayed handle. Compared case-sensitively. |
+| `rows` | One entry per **on-screen** row, in the order they appear. Required. A player scrolled off the bottom edge is left out entirely — do not add a row with blank fields for them. |
+| `rows[].username` | The Roblox handle as displayed, without the leading `@` (the line under the display name), compared case-sensitively. Omit the key for a row whose handle you cannot read with certainty — `I`/`l`/`i`, `0`/`O` and `__`/`_` are ambiguous at this text size — and say why in a `note`. |
 | `rows[].damage` | Integer as displayed, without separators. `0` is a real value; `null` means the truth is unreadable, and the pipeline must also leave it blank. |
 | `rows[].team` | `"gold"` or `"purple"`. |
 | `teams` | Team scores by colour. |
@@ -72,6 +72,11 @@ when this directory has no images.
 - **Wrong team** — the row stripe's gold/purple mask is cut by a HUD element;
   check `layout.GOLD_LOW/HIGH` and `PURPLE_LOW/HIGH` against that screenshot.
 - **Missing rows** — the band detector did not see a stripe (a transparent or
-  very dark row background), or two rows merged into one tall band.
+  very dark row background), or two rows merged into one tall band. Rows are
+  split by the text in them, so several players sharing one continuous stripe
+  (every 4v4 capture here) still come out as separate rows.
+- **Wrong or missing username** — check that the row's `@handle` line was
+  recognised; a row with no handle in the image legitimately falls back to the
+  display name.
 - **No scoreboard found** — the screenshot is not the Tab scoreboard, or the
   colour masks miss that UI skin entirely.

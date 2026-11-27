@@ -3,6 +3,7 @@ import {
   DEFAULT_K_FACTOR,
   ELO_MAX,
   ELO_MIN,
+  FLAT_K_FORMULA,
   PLACEMENT_FORMULA,
   PROVISIONAL_MATCHES,
   clampElo,
@@ -735,6 +736,42 @@ describe('provisional K and formula versions', () => {
     expect(provisionalK(32, 5)).toBe(32)
     expect(provisionalK(8, 0)).toBe(16)
     expect(provisionalK(64, 0)).toBe(64)
+  })
+
+  test('v4 keeps the account K for every match, however new the player', () => {
+    const { input, ratings } = match([
+      [{ elo: 500, damage: 100 }],
+      [{ elo: 500, damage: 100 }],
+    ])
+    expect(FLAT_K_FORMULA).toBe(4)
+    expect(eventFormula({ label: '', winner: 0, teams: [], formula: 4 })).toBe(4)
+    const first = rateMatch(input, ratings, 32, {
+      formula: FLAT_K_FORMULA,
+      priorMatches: new Map([['p0', 0], ['p1', 0]]),
+    })
+    expect(first.result.teams[0]!.players[0]!.delta).toBe(16)
+    expect(first.result.teams[1]!.players[0]!.delta).toBe(-16)
+    // A v2 event stored before this change keeps the doubled K it was rated
+    // with, so switching new matches to flat K moves no existing rating.
+    const stamped = (formula: 2 | 4): RatingEvent => ({
+      id: 'duel',
+      position: 0,
+      kind: 'match',
+      createdAt: 0,
+      updatedAt: 0,
+      payload: {
+        label: 'duel',
+        winner: 0,
+        formula,
+        k: 32,
+        teams: [
+          { players: [{ id: 'a', name: 'Ada', damage: 100, tracked: true }] },
+          { players: [{ id: 'b', name: 'Bo', damage: 100, tracked: true }] },
+        ],
+      },
+    })
+    expect(replay([stamped(2)], roster, 32).elos.get('a')).toBe(732)
+    expect(replay([stamped(4)], roster, 32).elos.get('a')).toBe(716)
   })
 
   test('v2 applies the per-player K, while v1 keeps the passed K', () => {
