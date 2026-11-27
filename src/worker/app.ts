@@ -56,6 +56,17 @@ const readName = (value: unknown): string | null => {
   return name.length >= 1 && name.length <= 40 ? name : null
 }
 
+const MAX_USERNAME = 32
+
+/** An optional handle: empty clears it, absent leaves it as it is. */
+const readUsername = (value: unknown): string | null => {
+  if (typeof value !== 'string') return null
+  const username = value.trim()
+  return username.length <= MAX_USERNAME && !/[\u0000-\u001f\u007f]/.test(username)
+    ? username
+    : null
+}
+
 const readSkill = (value: unknown): number | null =>
   typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 10
     ? value
@@ -75,7 +86,7 @@ const readTags = (value: unknown): string[] | null => {
   return normalizeTags(value)
 }
 
-type Draft = { name: string; skill: number; tags: string[] }
+type Draft = { name: string; username: string; skill: number; tags: string[] }
 
 function readDrafts(body: unknown): Draft[] | null {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return null
@@ -89,15 +100,18 @@ function readDrafts(body: unknown): Draft[] | null {
     const entry = item as Record<string, unknown>
     if (
       Object.keys(entry).some(
-        (key) => key !== 'name' && key !== 'skill' && key !== 'tags',
+        (key) =>
+          key !== 'name' && key !== 'username' && key !== 'skill' && key !== 'tags',
       )
     )
       return null
     const name = readName(entry.name)
+    const username =
+      entry.username === undefined ? '' : readUsername(entry.username)
     const skill = readSkill(entry.skill)
     const tags = readTags(entry.tags)
-    if (!name || skill === null || !tags) return null
-    drafts.push({ name, skill, tags })
+    if (!name || username === null || skill === null || !tags) return null
+    drafts.push({ name, username, skill, tags })
   }
   return drafts
 }
@@ -368,7 +382,7 @@ async function pinLegacyK(
 async function loadPlayers(db: Database, owner: string): Promise<Player[]> {
   const result = await db
     .prepare(
-      'SELECT id, name, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE owner_sub = ? ORDER BY created_at ASC, id ASC',
+      'SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE owner_sub = ? ORDER BY created_at ASC, id ASC',
     )
     .bind(owner)
     .all<PlayerRow>()
@@ -414,7 +428,7 @@ async function recompute(
 ): Promise<Player[]> {
   const players = await db
     .prepare(
-      'SELECT id, name, skill, elo, tags, sitting_out, created_at, updated_at, base_elo FROM players WHERE owner_sub = ? ORDER BY created_at ASC, id ASC',
+      'SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at, base_elo FROM players WHERE owner_sub = ? ORDER BY created_at ASC, id ASC',
     )
     .bind(owner)
     .all<BaseRow>()
@@ -678,6 +692,7 @@ export function createApp(authenticate: Authenticate = currentUser) {
     const players: Player[] = drafts.map((draft, index) => ({
       id: crypto.randomUUID(),
       name: draft.name,
+      username: draft.username,
       skill: draft.skill,
       elo: clampElo(draft.skill * 100),
       tags: draft.tags,
@@ -689,12 +704,13 @@ export function createApp(authenticate: Authenticate = currentUser) {
       players.map((player) =>
         db
           .prepare(
-            'INSERT INTO players (id, owner_sub, name, skill, elo, base_elo, tags, sitting_out, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)',
+            'INSERT INTO players (id, owner_sub, name, username, skill, elo, base_elo, tags, sitting_out, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)',
           )
           .bind(
             player.id,
             owner,
             player.name,
+            player.username ?? '',
             player.skill,
             player.elo,
             player.elo,
@@ -714,7 +730,8 @@ export function createApp(authenticate: Authenticate = currentUser) {
     const patch = body as Record<string, unknown>
     if (
       Object.keys(patch).some(
-        (key) => !['name', 'skill', 'elo', 'tags', 'sittingOut'].includes(key),
+        (key) =>
+          !['name', 'username', 'skill', 'elo', 'tags', 'sittingOut'].includes(key),
       )
     )
       return c.json({ error: 'Nothing to update.' }, 400)
@@ -736,6 +753,13 @@ export function createApp(authenticate: Authenticate = currentUser) {
       if (!name) return c.json({ error: 'Names are 1 to 40 characters.' }, 400)
       sets.push('name = ?')
       values.push(name)
+    }
+    if ('username' in patch) {
+      const username = readUsername(patch.username)
+      if (username === null)
+        return c.json({ error: 'Usernames are up to 32 characters.' }, 400)
+      sets.push('username = ?')
+      values.push(username)
     }
     if ('skill' in patch && 'elo' in patch)
       return c.json({ error: 'Set either the 1-10 rating or elo, not both.' }, 400)
@@ -817,7 +841,7 @@ export function createApp(authenticate: Authenticate = currentUser) {
 
     const row = await db
       .prepare(
-        'SELECT id, name, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE id = ? AND owner_sub = ?',
+        'SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE id = ? AND owner_sub = ?',
       )
       .bind(id, owner)
       .first<PlayerRow>()

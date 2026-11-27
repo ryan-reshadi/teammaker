@@ -117,16 +117,45 @@ test('unauthenticated data routes refuse access and public assets remain public'
 test('players can be added in bulk, renamed, rated, benched and removed by their owner only', async () => {
   const created = await call('/api/players', 'alice', 'POST', {
     players: [
-      { name: '  Ada  ', skill: 9 },
+      { name: '  Ada  ', username: ' ada#1 ', skill: 9 },
       { name: 'Bo', skill: 4 },
     ],
   })
   expect(created.status).toBe(201)
   const { players } = (await created.json()) as {
-    players: { id: string; name: string; skill: number; sittingOut: boolean }[]
+    players: {
+      id: string
+      name: string
+      username: string
+      skill: number
+      sittingOut: boolean
+    }[]
   }
   expect(players).toHaveLength(2)
-  expect(players[0]).toMatchObject({ name: 'Ada', skill: 9, elo: 900, sittingOut: false })
+  expect(players[0]).toMatchObject({
+    name: 'Ada',
+    username: 'ada#1',
+    skill: 9,
+    elo: 900,
+    sittingOut: false,
+  })
+  expect(players[1]!.username).toBe('')
+
+  // Detail edits carry no rating, so elo, skill and the log stay untouched.
+  const details = await call(`/api/players/${players[0]!.id}`, 'alice', 'PATCH', {
+    name: 'Ada L',
+    username: 'ada-l',
+  })
+  expect(details.status).toBe(200)
+  expect(await details.json()).toMatchObject({
+    player: { name: 'Ada L', username: 'ada-l', skill: 9, elo: 900 },
+  })
+  const cleared = await call(`/api/players/${players[0]!.id}`, 'alice', 'PATCH', {
+    username: '',
+  })
+  expect(await cleared.json()).toMatchObject({
+    player: { name: 'Ada L', username: '', skill: 9, elo: 900 },
+  })
 
   expect(
     ((await (await call('/api/players', 'alice')).json()) as { players: unknown[] })
@@ -145,7 +174,7 @@ test('players can be added in bulk, renamed, rated, benched and removed by their
   })
   expect(patched.status).toBe(200)
   expect(await patched.json()).toMatchObject({
-    player: { name: 'Bea', skill: 6, elo: 600, sittingOut: true },
+    player: { name: 'Bea', username: '', skill: 6, elo: 600, sittingOut: true },
   })
 
   expect(
@@ -271,6 +300,8 @@ test('rejects foreign and absent origins, spoofing, malformed input and oversize
     { name: 'Eleven', skill: 11 },
     { name: 'Half', skill: 5.5 },
     { name: 'Sneaky', skill: 5, ownerSub: 'bob' },
+    { name: 'Long handle', skill: 5, username: 'x'.repeat(33) },
+    { name: 'Bad handle', skill: 5, username: 7 },
     { players: [] },
     { players: [{ name: 'Ok', skill: 5 }, { name: '', skill: 5 }] },
     [],
@@ -412,6 +443,12 @@ test('matches tune elo, replay edits, log manual ratings and stay private', asyn
     eloBefore: 500,
     eloAfter: 532,
   })
+
+  // Formula and K are server-stamped; a client cannot supply them.
+  expect(
+    (await call('/api/matches', 'frank', 'POST', { ...body, formula: 2, k: 64 }))
+      .status,
+  ).toBe(400)
 
   // The first three teams, a winner outside 0/1 and all-random teams are invalid.
   expect(

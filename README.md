@@ -140,6 +140,9 @@ server.
 - Win odds are elo-only and pre-match. A data-driven calibration study is
   deferred until the log has enough matches; recalibrating later is a new formula
   version, never a silent rewrite of old events.
+- Rolling back is clean only until the first v2 match is logged. Older builds
+  ignore the `formula`/`k` marker, so after that keep this build or delete the v2
+  events before rolling back; the v1 history itself is unaffected.
 - Saved rounds are capped at the newest 100 per account; new saves prune older
   ones.
 
@@ -241,7 +244,9 @@ Pair rules are hard, not preferences: every returned arrangement keeps a
 "together" pair on one team and an "apart" pair on different teams. If no split
 within the tolerance satisfies them, the result says so and offers to clear the
 rules or widen the tolerance — a violating best-effort split is never shown.
-Pair rules are also session-only and join the "roster changed" signature.
+Pair rules are also session-only and join the "roster changed" signature. If a
+player sits out or leaves the roster, rules that mention them are dropped and a
+notice says how many were removed.
 
 ## Data model
 
@@ -324,8 +329,8 @@ device.
 | GET | `/api/session` | current user, auth mode, database availability |
 | GET | `/api/health` | liveness |
 | GET | `/api/players` | oldest first |
-| POST | `/api/players` | `{ name, skill, tags? }` or `{ players: [...] }` (max 50) |
-| PATCH | `/api/players/:id` | any of `name`, `skill`, `elo`, `tags`, `sittingOut` |
+| POST | `/api/players` | `{ name, username?, skill, tags? }` or `{ players: [...] }` (max 50) |
+| PATCH | `/api/players/:id` | any of `name`, `username`, `skill`, `elo`, `tags`, `sittingOut` |
 | POST | `/api/players/:id/elo` | `{ elo, reason? }`, logs a manual adjustment |
 | DELETE | `/api/players/:id` | 409 while the player has match history |
 | GET | `/api/matches` | the ordered rating log, with before/after elo |

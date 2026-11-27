@@ -1,6 +1,8 @@
 export type Player = {
   id: string
   name: string
+  /** Optional handle, empty when the player has none. */
+  username?: string
   /** 1 - 10, derived from elo. Kept for readers that predate the elo scale. */
   skill: number
   /** 100 - 1000. 100 points is one point on the 1-10 scale. */

@@ -42,6 +42,7 @@ export function Roster({
   onRemove,
 }: Props) {
   const [draftName, setDraftName] = useState('')
+  const [draftUsername, setDraftUsername] = useState('')
   const [draftSkill, setDraftSkill] = useState(5)
   const [draftTags, setDraftTags] = useState<string[]>([])
   const [roleEditor, setRoleEditor] = useState<string | null>(null)
@@ -49,8 +50,11 @@ export function Roster({
   const [eloDraft, setEloDraft] = useState('')
   const [bulk, setBulk] = useState(false)
   const [bulkText, setBulkText] = useState('')
-  const [editingId, setEditingId] = useState<string | null>(null)
-  const [editingName, setEditingName] = useState('')
+  const [editing, setEditing] = useState<{
+    id: string
+    name: string
+    username: string
+  } | null>(null)
   const [historyFor, setHistoryFor] = useState<string | null>(null)
 
   const playedCounts = useMemo(() => {
@@ -74,10 +78,12 @@ export function Roster({
     event.preventDefault()
     const name = draftName.trim()
     if (!name) return
+    const username = draftUsername.trim()
     setDraftName('')
+    setDraftUsername('')
     const tags = draftTags
     setDraftTags([])
-    await onAdd([{ name, skill: draftSkill, tags }])
+    await onAdd([{ name, username, skill: draftSkill, tags }])
   }
 
   const addBulk = async (event: React.FormEvent) => {
@@ -89,10 +95,25 @@ export function Roster({
     await onAdd(names.map((name) => ({ name, skill: 5 })))
   }
 
-  const commitName = (player: Player) => {
-    const name = editingName.trim()
-    setEditingId(null)
-    if (name && name !== player.name) void onUpdate(player.id, { name })
+  /** Details only: the patch carries no rating, so elo and the log stay put. */
+  const commitDetails = (player: Player) => {
+    if (editing?.id !== player.id) return
+    const name = editing.name.trim()
+    const username = editing.username.trim()
+    setEditing(null)
+    if (!name) return
+    const patch: PlayerPatch = {}
+    if (name !== player.name) patch.name = name
+    if (username !== (player.username ?? '')) patch.username = username
+    if (Object.keys(patch).length > 0) void onUpdate(player.id, patch)
+  }
+
+  const editorKeyDown = (player: Player) => (event: React.KeyboardEvent) => {
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      commitDetails(player)
+    }
+    if (event.key === 'Escape') setEditing(null)
   }
 
   const openElo = (player: Player) => {
@@ -130,6 +151,15 @@ export function Roster({
           aria-label="New player name"
           disabled={disabled}
           onChange={(event) => setDraftName(event.target.value)}
+        />
+        <input
+          className="input"
+          value={draftUsername}
+          maxLength={32}
+          placeholder="Username (optional)…"
+          aria-label="New player username"
+          disabled={disabled}
+          onChange={(event) => setDraftUsername(event.target.value)}
         />
         <div className="add-row">
           <SkillPicker
@@ -209,34 +239,66 @@ export function Roster({
                 key={player.id}
                 className={`player-row${player.sittingOut ? ' benched' : ''}`}
               >
-                {editingId === player.id ? (
-                  <input
-                    className="player-name-input"
-                    autoFocus
-                    maxLength={40}
-                    value={editingName}
-                    aria-label={`Name for ${player.name}`}
-                    onChange={(event) => setEditingName(event.target.value)}
-                    onBlur={() => commitName(player)}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter') {
-                        event.preventDefault()
-                        commitName(player)
+                {editing?.id === player.id ? (
+                  <div className="player-details-editor">
+                    <input
+                      className="player-name-input"
+                      autoFocus
+                      maxLength={40}
+                      value={editing.name}
+                      placeholder="Name"
+                      aria-label={`Name for ${player.name}`}
+                      onChange={(event) =>
+                        setEditing({ ...editing, name: event.target.value })
                       }
-                      if (event.key === 'Escape') setEditingId(null)
-                    }}
-                  />
+                      onKeyDown={editorKeyDown(player)}
+                    />
+                    <input
+                      className="player-name-input"
+                      maxLength={32}
+                      value={editing.username}
+                      placeholder="Username (optional)"
+                      aria-label={`Username for ${player.name}`}
+                      onChange={(event) =>
+                        setEditing({ ...editing, username: event.target.value })
+                      }
+                      onKeyDown={editorKeyDown(player)}
+                    />
+                    <div className="player-details-actions">
+                      <button
+                        type="button"
+                        className="primary"
+                        disabled={!editing.name.trim()}
+                        onClick={() => commitDetails(player)}
+                      >
+                        Save
+                      </button>
+                      <button
+                        type="button"
+                        className="quiet"
+                        onClick={() => setEditing(null)}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
                 ) : (
                   <button
                     type="button"
                     className="player-name"
-                    title="Rename"
-                    onClick={() => {
-                      setEditingId(player.id)
-                      setEditingName(player.name)
-                    }}
+                    title="Edit name and username"
+                    onClick={() =>
+                      setEditing({
+                        id: player.id,
+                        name: player.name,
+                        username: player.username ?? '',
+                      })
+                    }
                   >
                     <span className="player-name-text">{player.name}</span>
+                    {player.username && (
+                      <span className="player-username">{player.username}</span>
+                    )}
                     {suggestions.includes(player.id) && (
                       <span className="suggest-badge">bench?</span>
                     )}

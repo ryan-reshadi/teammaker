@@ -24,6 +24,7 @@ const schema = [
     id TEXT PRIMARY KEY,
     owner_sub TEXT NOT NULL,
     name TEXT NOT NULL,
+    username TEXT NOT NULL DEFAULT '',
     skill INTEGER NOT NULL,
     elo INTEGER NOT NULL DEFAULT 0,
     base_elo INTEGER NOT NULL DEFAULT 0,
@@ -78,6 +79,7 @@ const schema = [
 ]
 
 const TAG_COLUMN = `ALTER TABLE players ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'`
+const USERNAME_COLUMN = `ALTER TABLE players ADD COLUMN username TEXT NOT NULL DEFAULT ''`
 const ELO_COLUMN = `ALTER TABLE players ADD COLUMN elo INTEGER NOT NULL DEFAULT 0`
 const BASE_ELO_COLUMN = `ALTER TABLE players ADD COLUMN base_elo INTEGER NOT NULL DEFAULT 0`
 
@@ -96,6 +98,7 @@ const ensureColumns = async (db: Database): Promise<void> => {
   const names = new Set(columns.results.map((column) => column.name))
   const missing: string[] = []
   if (!names.has('tags')) missing.push(TAG_COLUMN)
+  if (!names.has('username')) missing.push(USERNAME_COLUMN)
   if (!names.has('elo')) missing.push(ELO_COLUMN)
   if (!names.has('base_elo')) missing.push(BASE_ELO_COLUMN)
   if (missing.length > 0) await db.batch(missing.map((sql) => db.prepare(sql)))
@@ -156,6 +159,7 @@ const parseTags = (value: string | null | undefined): string[] => {
 export type PlayerRow = {
   id: string
   name: string
+  username: string | null
   skill: number
   elo: number
   tags: string | null
@@ -167,6 +171,7 @@ export type PlayerRow = {
 export const mapPlayer = (row: PlayerRow): Player => ({
   id: row.id,
   name: row.name,
+  username: row.username ?? '',
   skill: skillFromElo(row.elo),
   elo: row.elo,
   tags: parseTags(row.tags),

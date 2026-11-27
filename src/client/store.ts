@@ -9,9 +9,14 @@ import {
 import { normalizeTags } from '../shared/roles'
 import type { Player, Round, RoundConfig } from '../shared/types'
 
-export type PlayerDraft = { name: string; skill: number; tags?: string[] }
+export type PlayerDraft = {
+  name: string
+  username?: string
+  skill: number
+  tags?: string[]
+}
 export type PlayerPatch = Partial<
-  Pick<Player, 'name' | 'skill' | 'elo' | 'tags' | 'sittingOut'>
+  Pick<Player, 'name' | 'username' | 'skill' | 'elo' | 'tags' | 'sittingOut'>
 >
 
 export type Store = {
@@ -72,6 +77,8 @@ export function readLocalPlayers(): Player[] {
     )
     .map((player) => ({
       ...withElo(player),
+      username:
+        typeof player.username === 'string' ? player.username.slice(0, 32) : '',
       tags: normalizeTags(player.tags),
     }))
 }
@@ -92,6 +99,7 @@ function localStore(): Store {
         return {
           id: crypto.randomUUID(),
           name: draft.name.trim().slice(0, 40),
+          username: (draft.username ?? '').trim().slice(0, 32),
           skill: skillFromElo(elo),
           elo,
           tags: normalizeTags(draft.tags),

@@ -260,6 +260,32 @@ test('an impossible pair rule returns no split instead of a violating fallback',
   expect(result.arrangements).toHaveLength(0)
 })
 
+test('pair rules hold across three uneven teams', () => {
+  const players = roster([9, 8, 7, 6, 5, 4, 3])
+  const result = solve(players, {
+    teamCount: 3,
+    tolerance: T(20),
+    pairRules: [
+      { a: 'p0', b: 'p1', kind: 'together' },
+      { a: 'p2', b: 'p3', kind: 'apart' },
+    ],
+  })
+  expect(result.constraintFailure).toBe(false)
+  expect(result.arrangements.length).toBeGreaterThan(0)
+  for (const arrangement of result.arrangements) {
+    expect(arrangement.teams.map((team) => team.players.length).sort()).toEqual([
+      2, 2, 3,
+    ])
+    const teamOf = new Map(
+      arrangement.teams.flatMap((team, index) =>
+        team.players.map((player) => [player.id, index] as const),
+      ),
+    )
+    expect(teamOf.get('p0')).toBe(teamOf.get('p1'))
+    expect(teamOf.get('p2')).not.toBe(teamOf.get('p3'))
+  }
+})
+
 test('unknown and self pair rules are ignored, and apart wins a conflict', () => {
   const players = roster([9, 8, 7, 6])
   const result = solve(players, {
@@ -294,6 +320,9 @@ test('role allowance can trade a little spread for fuller coverage', () => {
   const tight = solve(players, { teamCount: 2, tolerance: T(4) })
   expect(tight.arrangements[0]!.spread).toBe(0)
   expect(tight.roleAllowance).toBe(0)
+  expect(
+    solve(players, { teamCount: 2, tolerance: T(4), roleAllowance: 0 }).arrangements,
+  ).toEqual(tight.arrangements)
 
   const slightly = solve(players, {
     teamCount: 2,

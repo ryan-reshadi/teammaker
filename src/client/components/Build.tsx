@@ -1,4 +1,4 @@
-import { useState, type CSSProperties } from 'react'
+import { useEffect, useState, type CSSProperties } from 'react'
 import type { PairRule, SolveResult, SolverTeam } from '../../shared/balance'
 import { expectationsFromStrengths } from '../../shared/elo'
 import {
@@ -116,14 +116,28 @@ export function Build({
   const [pairA, setPairA] = useState('')
   const [pairB, setPairB] = useState('')
   const [pairKind, setPairKind] = useState<PairRule['kind']>('together')
+  const [pairNotice, setPairNotice] = useState('')
 
   const available = players.filter((player) => !player.sittingOut)
   const hasRoles = available.some((player) => player.tags.length > 0)
   const availableIds = new Set(available.map((player) => player.id))
+  const availableKey = available
+    .map((player) => player.id)
+    .sort()
+    .join('|')
   const activePairRules = pairRules.filter(
     (rule) => availableIds.has(rule.a) && availableIds.has(rule.b),
   )
-  const pausedPairRules = pairRules.length - activePairRules.length
+  // Rules are a promise about the current lineup. If one of the players sits
+  // out or leaves, drop the rule and say so instead of silently ignoring it.
+  useEffect(() => {
+    if (pairRules.length === activePairRules.length) return
+    setPairRules(activePairRules)
+    const dropped = pairRules.length - activePairRules.length
+    setPairNotice(
+      `${dropped} pair rule${dropped === 1 ? '' : 's'} removed because a player sat out or left.`,
+    )
+  }, [activePairRules, availableKey, pairRules.length])
   const playerName = (id: string) =>
     players.find((player) => player.id === id)?.name ?? 'Player'
   const pairSignature = activePairRules
@@ -204,15 +218,26 @@ export function Build({
     setPairRules((previous) => [...previous, { a: pairA, b: pairB, kind: pairKind }])
     setPairA('')
     setPairB('')
+    setPairNotice('')
     setError('')
   }
 
-  const removePairRule = (index: number) =>
+  const removePairRule = (index: number) => {
     setPairRules((previous) => previous.filter((_rule, position) => position !== index))
+    setPairNotice('')
+  }
 
   const clearPairRules = () => {
     setPairRules([])
+    setPairNotice('')
     setError('')
+    // A failed search is only about those rules; clear it with them so the
+    // warning does not outlive the rules that caused it.
+    if (result?.constraintFailure) {
+      setResult(null)
+      setSignature('')
+      setIndex(0)
+    }
   }
 
   return (
@@ -385,18 +410,17 @@ export function Build({
             ))}
           </ul>
         )}
-        {pausedPairRules > 0 && (
-          <p className="hint">
-            {pausedPairRules} rule{pausedPairRules === 1 ? '' : 's'} paused because
-            a player is sitting out or gone.
-          </p>
-        )}
         {pairRules.length > 0 && (
           <button type="button" className="quiet" onClick={clearPairRules}>
             Clear pair rules
           </button>
         )}
       </details>
+      {pairNotice && (
+        <p className="hint pair-notice" role="status">
+          {pairNotice}
+        </p>
+      )}
 
       <div className="build-actions">
         <button

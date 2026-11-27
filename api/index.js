@@ -356,6 +356,7 @@ var schema = [
     id TEXT PRIMARY KEY,
     owner_sub TEXT NOT NULL,
     name TEXT NOT NULL,
+    username TEXT NOT NULL DEFAULT '',
     skill INTEGER NOT NULL,
     elo INTEGER NOT NULL DEFAULT 0,
     base_elo INTEGER NOT NULL DEFAULT 0,
@@ -406,6 +407,7 @@ var schema = [
   )`
 ];
 var TAG_COLUMN = `ALTER TABLE players ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'`;
+var USERNAME_COLUMN = `ALTER TABLE players ADD COLUMN username TEXT NOT NULL DEFAULT ''`;
 var ELO_COLUMN = `ALTER TABLE players ADD COLUMN elo INTEGER NOT NULL DEFAULT 0`;
 var BASE_ELO_COLUMN = `ALTER TABLE players ADD COLUMN base_elo INTEGER NOT NULL DEFAULT 0`;
 var TABLES = `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('players', 'rounds', 'rating_events', 'rating_results', 'settings', 'rating_meta')`;
@@ -416,6 +418,8 @@ var ensureColumns = async (db) => {
   const missing = [];
   if (!names.has("tags"))
     missing.push(TAG_COLUMN);
+  if (!names.has("username"))
+    missing.push(USERNAME_COLUMN);
   if (!names.has("elo"))
     missing.push(ELO_COLUMN);
   if (!names.has("base_elo"))
@@ -463,6 +467,7 @@ var parseTags = (value) => {
 var mapPlayer = (row) => ({
   id: row.id,
   name: row.name,
+  username: row.username ?? "",
   skill: skillFromElo(row.elo),
   elo: row.elo,
   tags: parseTags(row.tags),
@@ -524,6 +529,13 @@ var readName = (value) => {
   const name = value.trim();
   return name.length >= 1 && name.length <= 40 ? name : null;
 };
+var MAX_USERNAME = 32;
+var readUsername = (value) => {
+  if (typeof value !== "string")
+    return null;
+  const username = value.trim();
+  return username.length <= MAX_USERNAME && !/[\u0000-\u001f\u007f]/.test(username) ? username : null;
+};
 var readSkill = (value) => typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 10 ? value : null;
 var readElo = (value) => typeof value === "number" && Number.isInteger(value) && value >= 100 && value <= 1000 ? value : null;
 var readTags = (value) => {
@@ -548,14 +560,15 @@ function readDrafts(body) {
     if (!item || typeof item !== "object" || Array.isArray(item))
       return null;
     const entry = item;
-    if (Object.keys(entry).some((key) => key !== "name" && key !== "skill" && key !== "tags"))
+    if (Object.keys(entry).some((key) => key !== "name" && key !== "username" && key !== "skill" && key !== "tags"))
       return null;
     const name = readName(entry.name);
+    const username = entry.username === undefined ? "" : readUsername(entry.username);
     const skill = readSkill(entry.skill);
     const tags = readTags(entry.tags);
-    if (!name || skill === null || !tags)
+    if (!name || username === null || skill === null || !tags)
       return null;
-    drafts.push({ name, skill, tags });
+    drafts.push({ name, username, skill, tags });
   }
   return drafts;
 }
@@ -715,7 +728,7 @@ async function pinLegacyK(db, owner, legacyK) {
   await db.prepare("INSERT INTO rating_meta (owner_sub, legacy_k, created_at) VALUES (?, ?, ?) ON CONFLICT(owner_sub) DO NOTHING").bind(owner, legacyK, Date.now()).run();
 }
 async function loadPlayers(db, owner) {
-  const result = await db.prepare("SELECT id, name, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE owner_sub = ? ORDER BY created_at ASC, id ASC").bind(owner).all();
+  const result = await db.prepare("SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE owner_sub = ? ORDER BY created_at ASC, id ASC").bind(owner).all();
   return result.results.map(mapPlayer);
 }
 async function nextPosition(db, owner) {
@@ -727,7 +740,7 @@ async function findEvent(db, owner, id) {
 }
 var insertResultSql = "INSERT INTO rating_results (event_id, owner_sub, slot, player_id, name, elo_before, elo_after, delta) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
 async function recompute(db, owner, from) {
-  const players = await db.prepare("SELECT id, name, skill, elo, tags, sitting_out, created_at, updated_at, base_elo FROM players WHERE owner_sub = ? ORDER BY created_at ASC, id ASC").bind(owner).all();
+  const players = await db.prepare("SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at, base_elo FROM players WHERE owner_sub = ? ORDER BY created_at ASC, id ASC").bind(owner).all();
   const events = await loadEvents(db, owner);
   const kFactor = await getKFactor(db, owner);
   const legacyK = await getLegacyK(db, owner, kFactor);
@@ -891,6 +904,7 @@ function createApp(authenticate = currentUser) {
     const players = drafts.map((draft, index) => ({
       id: crypto.randomUUID(),
       name: draft.name,
+      username: draft.username,
       skill: draft.skill,
       elo: clampElo(draft.skill * 100),
       tags: draft.tags,
@@ -898,7 +912,7 @@ function createApp(authenticate = currentUser) {
       createdAt: createdAt + index,
       updatedAt: createdAt + index
     }));
-    await db.batch(players.map((player) => db.prepare("INSERT INTO players (id, owner_sub, name, skill, elo, base_elo, tags, sitting_out, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)").bind(player.id, owner, player.name, player.skill, player.elo, player.elo, JSON.stringify(player.tags), player.createdAt, player.updatedAt)));
+    await db.batch(players.map((player) => db.prepare("INSERT INTO players (id, owner_sub, name, username, skill, elo, base_elo, tags, sitting_out, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)").bind(player.id, owner, player.name, player.username ?? "", player.skill, player.elo, player.elo, JSON.stringify(player.tags), player.createdAt, player.updatedAt)));
     return c.json({ players }, 201);
   });
   app.patch("/api/players/:id", async (c) => {
@@ -906,7 +920,7 @@ function createApp(authenticate = currentUser) {
     if (!body || typeof body !== "object" || Array.isArray(body))
       return c.json({ error: "Nothing to update." }, 400);
     const patch = body;
-    if (Object.keys(patch).some((key) => !["name", "skill", "elo", "tags", "sittingOut"].includes(key)))
+    if (Object.keys(patch).some((key) => !["name", "username", "skill", "elo", "tags", "sittingOut"].includes(key)))
       return c.json({ error: "Nothing to update." }, 400);
     const id = c.req.param("id");
     const db = c.get("db");
@@ -924,6 +938,13 @@ function createApp(authenticate = currentUser) {
         return c.json({ error: "Names are 1 to 40 characters." }, 400);
       sets.push("name = ?");
       values.push(name);
+    }
+    if ("username" in patch) {
+      const username = readUsername(patch.username);
+      if (username === null)
+        return c.json({ error: "Usernames are up to 32 characters." }, 400);
+      sets.push("username = ?");
+      values.push(username);
     }
     if ("skill" in patch && "elo" in patch)
       return c.json({ error: "Set either the 1-10 rating or elo, not both." }, 400);
@@ -977,7 +998,7 @@ function createApp(authenticate = currentUser) {
       const players = await recompute(db, owner, position);
       return c.json({ player: players.find((entry) => entry.id === id) ?? null });
     }
-    const row = await db.prepare("SELECT id, name, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE id = ? AND owner_sub = ?").bind(id, owner).first();
+    const row = await db.prepare("SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE id = ? AND owner_sub = ?").bind(id, owner).first();
     return row ? c.json({ player: mapPlayer(row) }) : c.json({ error: "Player not found." }, 404);
   });
   app.delete("/api/players/:id", async (c) => {

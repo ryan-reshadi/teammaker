@@ -266,6 +266,7 @@ function App() {
   const importRoster = useCallback(async () => {
     const drafts = importable.map((player) => ({
       name: player.name,
+      username: player.username,
       skill: player.skill,
       tags: player.tags,
     }))
