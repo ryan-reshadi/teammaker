@@ -3,9 +3,11 @@
 Balanced teams from an elo-rated roster. Rate everyone once from 1 to 10 to seed
 their elo (100 points a point, 100–1000), log the damage from real matches, and
 the ratings tune themselves from there. Choose how many teams you need and how
-close their elo totals must be, and Teammaker returns every split that fits —
-ranked by tightness and deliberately different from each other. Players can sit
-out a round, and the app suggests who should sit next so the bench stays fair.
+close their elo totals must be, and Teammaker searches for splits that fit —
+ranked by tightness and deliberately different from each other. Each result
+shows the teams' pre-match win odds, and pair rules can keep players together or
+apart. Players can sit out a round, and the app suggests who should sit next so
+the bench stays fair.
 
 A single-page React app served by a Hono Worker on Freebuff Sites, with a D1
 database for signed-in rosters and a device-local fallback that works without an
@@ -40,18 +42,27 @@ sign-in configuration.
   are used to give each team a working composition, not just equal totals.
 - **Build** — pick 2–8 teams and an elo tolerance from 0 to 2000, then generate.
   Each result is a set of colour-coded team columns with per-team elo sums, a
-  proportional balance bar and a spread chip, paged with next/previous through up
-  to 12 arrangements.
+  proportional balance bar, that team's elo-only win odds and a spread chip,
+  paged with next/previous through up to 12 arrangements. A collapsed **Pair
+  rules** editor keeps chosen players together or apart as hard constraints, and
+  **Role preference** can trade up to 50 or 100 extra spread for fuller role
+  coverage.
 - **Sit out** — a per-player toggle removes someone from generation and dims their
   row. When the available players do not divide evenly, the helper names who
-  should sit (fewest saved rounds sat, then lowest skill) and can apply it in one
-  click.
-- **Matches** — log a played match: pick roster players or add unnamed randoms,
-  enter each player's damage, and pick the winner. Every match is kept in an
-  editable, reorderable log; editing or deleting one replays the ratings that
-  follow it. A K control tunes how hard ratings move.
+  should sit (fewest logged matches sat, then lowest skill) and can apply it in
+  one click. Logged matches are the source; saved rounds are the fallback until
+  the first match exists.
+- **Matches** — log a played match with two to eight teams: pick roster players
+  or add unnamed randoms, enter each player's damage, add or remove teams, and
+  pick the winning team. Every match is kept in an editable, reorderable log;
+  editing or deleting one replays the ratings that follow it. New players are
+  provisional for their first five rated matches (double K, capped at 64). A K
+  control tunes future matches only. **Rematch** refills the form with the same
+  line-ups and blank damage, and the elo badge opens a per-player sparkline and
+  before/after history.
 - **Saved rounds** — save a result to keep a snapshot of the teams, tolerance,
-  spread and bench. Sit-out counts are derived from these saved rounds.
+  spread and bench. The snapshot is a memory aid; bench fairness prefers logged
+  matches and falls back to these rounds before the first match exists.
 - **Accounts** — works immediately on this device; signing in with Freebuff syncs
   the roster and saved rounds to D1.
 
@@ -79,34 +90,56 @@ server.
    of the roster into labelled teams appears exactly once and team-permutation
    duplicates never occur. A final canonical key guards against twins.
 4. **Caps.** The search stops after 300 ms, 500,000 nodes or 200 valid results.
-   `exhaustive: true` means the whole tree was visited, so nothing was missed.
-5. **Variety.** Candidates are sorted by spread, then by squared deviation from
-   the mean, then greedily thinned: each new arrangement is the one furthest (in
-   players moved) from everything already chosen. The page shows up to 12.
-6. **Fallback.** If nothing fits the tolerance, a greedy assignment refined by
-   best-swap hill climbing returns the closest reachable split, labelled as over
-   tolerance. If that split happens to fit the tolerance it is reported as
-   within it.
+   `exhaustive: true` means the whole tree was visited: `validCount` is exact
+   and nothing was missed. When it is false, the count is a **lower bound** and
+   the interface says so.
+5. **Variety.** Candidates are sorted by spread, then role gaps, then squared
+   deviation from the mean, then greedily thinned: each new arrangement is the
+   one furthest (in players moved) from everything already chosen. The page
+   shows up to 12.
+6. **Fallback.** When the search finds no valid split, a greedy assignment
+   refined by best-swap hill climbing returns a **best-effort** split. It is not
+   guaranteed to be the true closest, so it is never presented as one. The
+   presentation distinguishes three cases:
+   - **Fits, complete:** a split found by an exhaustive search is a normal
+     result with no best-effort label.
+   - **Fits, early-stopped:** a fallback that happens to fit is labelled
+     **Best effort** and explained as an incomplete search, never shown like a
+     normal complete arrangement.
+   - **Over tolerance:** a fallback outside the tolerance is labelled
+     **Best effort** with a warning giving its spread; "no split fits" is only
+     claimed when the search was exhaustive.
 
 ### Guarantees
 
 - Every returned arrangement uses each available player exactly once, with team
   sizes as even as possible.
-- With `exhaustive: true`, the arrangements cover every valid split of that
-  roster at that tolerance, up to the 12 shown.
+- With `exhaustive: true`, the count covers every valid split of that roster
+  at that tolerance (and pair rules, when set); up to 12 of them are shown. When
+  it is false, the count is a lower bound.
+- Win odds come from the same `expectationsFromStrengths` helper as the rating
+  engine, so the builder and the match result cannot disagree. They are
+  elo-only: roles and damage are not part of the estimate.
 - Elos are integers 100–1000, so sums and spreads are exact — no floating point
   drift.
 
 ### Limits
 
 - The search is bounded, not exhaustive by construction. Large rosters with a
-  loose tolerance can hit the result or time cap; the caption then says the
-  search wrapped up early rather than claiming completeness.
-- Only team sums are balanced. There is no notion of positions, roles or
-  individual matchups (a 10 and a 1 can be paired with two 5s and look identical
-  in total).
+  loose tolerance can hit the result or time cap; the caption then reports a
+  lower bound rather than claiming completeness, and "no split fits" is only
+  said after an exhaustive search. The fallback split is best effort, not a
+  proven optimum.
+- Team sums are the primary balance. Roles only break ties or trade within the
+  chosen role allowance, and there is still no notion of individual matchups (a
+  10 and a 1 can be paired with two 5s and look identical in total).
 - At most 12 arrangements are returned and at most 200 are collected, so a very
   permissive tolerance shows a varied sample rather than every combination.
+- Pair rules and role preference are session-only. A saved round records the
+  teams and bench it produced, not the builder controls that found them.
+- Win odds are elo-only and pre-match. A data-driven calibration study is
+  deferred until the log has enough matches; recalibrating later is a new formula
+  version, never a silent rewrite of old events.
 - Saved rounds are capped at the newest 100 per account; new saves prune older
   ones.
 
@@ -124,19 +157,44 @@ centred on zero and compares each player's share of the match's size-normalized
 damage with the share their rating predicts. It carries 0.6 of K while the
 result carries the full K, which is what makes a top-damage player on a losing
 team land at roughly zero; the rest of the losing team still pays.
+- **More than two teams.** Each team is rated against every other team and the
+head-to-head expectations are normalized to share out one win, so a settled
+three-way lobby is zero-sum like a duel. A win over a bigger field pays more than
+a duel at the same ratings. Provisional matches are the exception: each player
+has their own K, so the deltas need not sum to zero.
 - **Uneven teams.** Damage is divided by the number of enemies the player faced
-before shares are compared, so the smaller team's extra targets do not inflate
-their rating.
+(everyone outside their own team) before shares are compared, so a smaller
+team's extra targets do not inflate their rating.
 - **Randoms.** An unnamed player records damage but has no rating row. Their
 rating is inferred from the lobby's known elo, shifted by their relative damage,
 clamped to the scale, and counted at half a player's weight in both the
 expectation and the damage pool. They are never updated.
-- **K.** An account setting from 8 to 64, default 32. Changing it replays the
-whole log, because tuning is the point.
+- **Provisional K.** The first five rated matches a player appears in use double
+  the account K, capped at 64. Adjustments never count, and a player's prior
+  match count is derived deterministically during the replay, so old history
+  never moves. Provisional matches are not strictly zero-sum: each player's K is
+  their own.
+- **K.** An account setting from 8 to 64, default 32. It applies to new matches
+  only. Changing it freezes the K that produced existing ratings and never
+  replays the log.
+- **Win odds.** Each arrangement shows a pre-match win share from the weighted
+  team elo sums. Two teams reduce to ordinary Elo; with more teams every pair is
+  measured and the shares still add to 100%. The 400-point divisor calibrates a
+  300-point gap to about 85/15 and a 500-point gap to about 95/5; those anchors
+  are pinned in `tests/elo.test.ts`. A data-driven recalibration waits until
+  enough matches exist and would be a new formula version, not a rewrite.
 - **Replay.** Ratings start at each player's creation elo and are recomputed from
-the ordered event log. Every match and every manual elo edit stores each
-player's before/after elo, so editing, reordering or deleting an event restores
-exactly the ratings history would have produced. The log holds up to 1000 events.
+  the ordered event log. Every match and every manual elo edit stores each
+  player's before/after elo, so editing, reordering or deleting an event restores
+  exactly the ratings history would have produced. The log holds up to 1000 events.
+- **Formula versions.** New events are stamped with formula 2 and the K used for
+  them. Events written before this existed have no marker and are formula 1: they
+  replay with the frozen legacy K stored in `rating_meta`, so replaying old
+  history is byte-identical. Editing never upgrades an event; a v1 match stays v1
+  and a v2 match keeps its recorded K. To inspect a proposed K without changing
+  anything, run `bun run preview:replay [dbPath] [owner] [proposedK]`: it opens
+  the local D1 file read-only and prints per-player current and proposed elo.
+  There is no apply path.
 - **Deleting players.** A player named in a match cannot be removed until those
 matches are edited or deleted. Manual rating entries are removed with the player.
 
@@ -175,7 +233,15 @@ column shows its roles as compact chips, and the arrangement reports
 
 Turn the behaviour off with the **Spread roles** switch; the results are then
 ranked purely on skill balance, and the toggle is part of the "roster changed"
-signature like any other input.
+signature like any other input. With roles on, **Role preference** can allow a
+split up to 50 or 100 elo looser than the tightest if it closes role gaps; the
+spread chip always shows the real spread, and the ranking is session-only.
+
+Pair rules are hard, not preferences: every returned arrangement keeps a
+"together" pair on one team and an "apart" pair on different teams. If no split
+within the tolerance satisfies them, the result says so and offers to clear the
+rules or widen the tolerance — a violating best-effort split is never shown.
+Pair rules are also session-only and join the "roster changed" signature.
 
 ## Data model
 
@@ -193,6 +259,8 @@ rating_results(event_id TEXT, owner_sub TEXT, slot TEXT, player_id TEXT,
                name TEXT, elo_before INTEGER, elo_after INTEGER, delta INTEGER)
 
 settings(owner_sub TEXT PRIMARY KEY, k_factor INTEGER, updated_at INTEGER)
+
+rating_meta(owner_sub TEXT PRIMARY KEY, legacy_k INTEGER, created_at INTEGER)
 ```
 
 `players.tags` is a JSON array of role ids (`'["sniper","igl"]'`). `elo` is the
@@ -202,8 +270,11 @@ work. Workspaces created before roles or elo existed are migrated in place:
 `ensureSchema` reads `PRAGMA table_info(players)`, adds the missing columns and
 sets `elo = base_elo = skill × 100` for existing players. No history is invented.
 
-`rating_events.payload` is either a match (label, two teams of players with
-damage, winner) or a manual adjustment (player id, elo, reason).
+`rating_events.payload` is either a match (label, two to eight teams of players
+with damage, the index of the winner, and — on new events only — `formula: 2`
+and the base `k`) or a manual adjustment (player id, elo, reason). `rating_meta`
+pins the K that produced pre-versioning ratings; it is written lazily, never
+rewrites an event, and has no row until a K change or the first v2 match.
 `rating_results` holds the per-player before/after bookkeeping for each event,
 rewritten whenever the affected part of the log is replayed. Rows are scoped by
 `owner_sub = user.sub`.
@@ -258,11 +329,11 @@ device.
 | POST | `/api/players/:id/elo` | `{ elo, reason? }`, logs a manual adjustment |
 | DELETE | `/api/players/:id` | 409 while the player has match history |
 | GET | `/api/matches` | the ordered rating log, with before/after elo |
-| POST | `/api/matches` | `{ label?, teams: [team, team], winner }` |
+| POST | `/api/matches` | `{ label?, teams: [team, …], winner }`, 2–8 teams |
 | PATCH | `/api/matches/:id` | `{ input }` and/or `{ position }`, then replays |
 | DELETE | `/api/matches/:id` | removes the event and replays the rest |
 | GET | `/api/settings` | `{ kFactor }` |
-| PUT | `/api/settings` | `{ kFactor }` 8–64, replays the whole log |
+| PUT | `/api/settings` | `{ kFactor }` 8–64; applies to new matches, never replays |
 | GET | `/api/rounds` | newest 60 snapshots |
 | POST | `/api/rounds` | `{ config }`, validated and pruned to 100 |
 | DELETE | `/api/rounds/:id` | |
@@ -273,16 +344,24 @@ invalid input, 413 above 64 KB and 503 when no database is bound. Responses are
 
 ## Tests
 
-`bun test` runs five suites:
+`bun test` runs nine suites:
 
 - `tests/elo.test.ts` — the 100-point scale, even and uneven matches, loss
   protection, random inference and half weight, clamping, manual adjustments,
-  deterministic replay, edit/delete/reorder and K changes.
+  deterministic replay, edit/delete/reorder, K changes, win-odds calibration,
+  provisional K and v1/v2 replay compatibility.
 - `tests/balance.test.ts` — team sizes, a known perfect split, all 15 partitions
   of six equal players, **brute-force cross-checks** for equal and unequal team
   sizes, the strong-player-singleton case that a per-index size vector would
   miss, the over-tolerance fallback (including a fallback that fits), capped
-  searches, uneven rosters and sit-out suggestions.
+  searches, uneven rosters, pair rules, role-allowance ranking and sit-out
+  suggestions.
+- `tests/presentation.test.ts` — component-level rendering of the result header
+  and warning: a complete in-tolerance split has no best-effort marker, an
+  early-stopped fallback that happens to fit still renders **Best effort** and
+  the incomplete-search explanation, an over-tolerance fallback keeps its
+  warning and widening action, and an impossible pair rule reports the failure
+  instead of rendering a violating split.
 - `tests/app.test.ts` — the real API against a Miniflare D1 database: CRUD, bulk
   add, two-user isolation, round snapshots, role tags round-tripping through
   create and patch (with unknown ids rejected), signed-out refusals, foreign and
@@ -293,8 +372,15 @@ invalid input, 413 above 64 KB and 503 when no database is bound. Responses are
 - `tests/libsql.test.ts` — the production libSQL adapter running against Bun's
   built-in SQLite: schema creation, the roles migration on a pre-roles table,
   CRUD with tags, round snapshots, two-account isolation, 401s, foreign-origin
-  403s and the no-database path. This is the suite that covers the Vercel
-  deployment; `tests/app.test.ts` keeps covering D1.
+  403s, the no-database path, and a legacy event that stays byte-identical through
+  a K change, an edit and a new v2 match. This is the suite that covers the
+  Vercel deployment; `tests/app.test.ts` keeps covering D1.
+- `tests/history.test.ts` — per-player match/adjustment history and sparkline
+  geometry.
+- `tests/bench.test.ts` — sit-out counts from real matches, late joiners,
+  adjustments and the saved-round fallback.
+- `tests/rematch.test.ts` — line-up copying, fresh random keys, blank damage and
+  missing-player refusal.
 
 ## Deploying to Vercel
 

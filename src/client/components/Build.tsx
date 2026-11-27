@@ -1,5 +1,6 @@
 import { useState, type CSSProperties } from 'react'
-import type { SolveResult, SolverTeam } from '../../shared/balance'
+import type { PairRule, SolveResult, SolverTeam } from '../../shared/balance'
+import { expectationsFromStrengths } from '../../shared/elo'
 import {
   normalizeTags,
   roleCoverage,
@@ -9,6 +10,8 @@ import {
 import type { Player, RoundConfig } from '../../shared/types'
 import { teamColor } from '../colors'
 import { solveInWorker } from '../solverClient'
+import { describeSolveResult } from '../solvePresentation'
+import { ResultStatus } from './ResultStatus'
 
 function countRoles(players: SolverTeam['players']): Record<string, number> {
   const counts: Record<string, number> = {}
@@ -25,12 +28,23 @@ type Props = {
   onTeamCount: (value: number) => void
   onTolerance: (value: number) => void
   suggestions: string[]
+  benchNote: string
   onSitOut: (ids: string[]) => void
   onSaveRound: (config: RoundConfig) => Promise<void>
   saved: string
 }
 
-function TeamColumn({ team, index, max }: { team: SolverTeam; index: number; max: number }) {
+function TeamColumn({
+  team,
+  index,
+  max,
+  odds,
+}: {
+  team: SolverTeam
+  index: number
+  max: number
+  odds: number
+}) {
   const roles = countRoles(team.players)
   return (
     <div
@@ -43,6 +57,10 @@ function TeamColumn({ team, index, max }: { team: SolverTeam; index: number; max
       </div>
       <div className="team-bar" aria-hidden="true">
         <span style={{ width: `${Math.max(6, (team.sum / max) * 100)}%` }} />
+      </div>
+      <div className="team-odds-row">
+        <span className="team-odds">{Math.round(odds * 100)}%</span>
+        <span className="team-odds-label">win odds</span>
       </div>
       {Object.keys(roles).length > 0 && (
         <div className="team-roles">
@@ -75,15 +93,6 @@ const toleranceHint = (tolerance: number) =>
         ? 'Balanced, with room to move.'
         : 'Loose — more combinations, more lopsided teams.'
 
-function coverage(result: SolveResult, shown: number): string {
-  if (result.validCount === 0) return ''
-  const splits = `${result.validCount} valid ${result.validCount === 1 ? 'split' : 'splits'}`
-  if (!result.exhaustive)
-    return `Found ${splits} — showing the ${shown} most different before the search wrapped up.`
-  if (result.validCount > shown) return `${splits} fit — showing ${shown} of the most different.`
-  return `All ${splits} shown.`
-}
-
 export function Build({
   players,
   teamCount,
@@ -91,6 +100,7 @@ export function Build({
   onTeamCount,
   onTolerance,
   suggestions,
+  benchNote,
   onSitOut,
   onSaveRound,
   saved,
@@ -101,18 +111,39 @@ export function Build({
   const [solving, setSolving] = useState(false)
   const [error, setError] = useState('')
   const [spreadRoles, setSpreadRoles] = useState(true)
+  const [roleAllowance, setRoleAllowance] = useState(0)
+  const [pairRules, setPairRules] = useState<PairRule[]>([])
+  const [pairA, setPairA] = useState('')
+  const [pairB, setPairB] = useState('')
+  const [pairKind, setPairKind] = useState<PairRule['kind']>('together')
 
   const available = players.filter((player) => !player.sittingOut)
   const hasRoles = available.some((player) => player.tags.length > 0)
-  const currentSignature = `${teamCount}:${tolerance}:${spreadRoles}:${players
+  const availableIds = new Set(available.map((player) => player.id))
+  const activePairRules = pairRules.filter(
+    (rule) => availableIds.has(rule.a) && availableIds.has(rule.b),
+  )
+  const pausedPairRules = pairRules.length - activePairRules.length
+  const playerName = (id: string) =>
+    players.find((player) => player.id === id)?.name ?? 'Player'
+  const pairSignature = activePairRules
+    .map((rule) => `${rule.kind}:${[rule.a, rule.b].sort().join('+')}`)
+    .sort()
+    .join(',')
+  const currentSignature = `${teamCount}:${tolerance}:${spreadRoles}:${roleAllowance}:${pairSignature}:${players
     .map(
       (player) =>
         `${player.id}${player.elo}${player.sittingOut ? 'x' : ''}${player.tags.join('+')}`,
     )
     .join('|')}`
   const stale = Boolean(result) && signature !== currentSignature
-  const shown = result?.arrangements[index] ?? null
+  const arrangements = result?.arrangements ?? []
+  const shown = arrangements[index] ?? null
   const max = shown ? Math.max(...shown.teams.map((team) => team.sum), 1) : 1
+  const description = result ? describeSolveResult(result, index) : null
+  const odds = shown
+    ? expectationsFromStrengths(shown.teams.map((team) => team.sum))
+    : []
 
   async function generate() {
     if (solving) return
@@ -130,7 +161,13 @@ export function Build({
           elo: player.elo,
           tags: player.tags,
         })),
-        { teamCount, tolerance, spreadRoles: hasRoles ? spreadRoles : false },
+        {
+          teamCount,
+          tolerance,
+          spreadRoles: hasRoles ? spreadRoles : false,
+          roleAllowance: hasRoles && spreadRoles ? roleAllowance : 0,
+          pairRules: activePairRules,
+        },
       )
       setResult(next)
       setSignature(currentSignature)
@@ -149,6 +186,34 @@ export function Build({
   const suggestedNames = players
     .filter((player) => suggestions.includes(player.id))
     .map((player) => player.name)
+
+  const addPairRule = () => {
+    if (!pairA || !pairB || pairA === pairB) {
+      setError('Pick two different players for a pair rule.')
+      return
+    }
+    const duplicate = pairRules.some(
+      (rule) =>
+        (rule.a === pairA && rule.b === pairB) ||
+        (rule.a === pairB && rule.b === pairA),
+    )
+    if (duplicate) {
+      setError('That pair already has a rule.')
+      return
+    }
+    setPairRules((previous) => [...previous, { a: pairA, b: pairB, kind: pairKind }])
+    setPairA('')
+    setPairB('')
+    setError('')
+  }
+
+  const removePairRule = (index: number) =>
+    setPairRules((previous) => previous.filter((_rule, position) => position !== index))
+
+  const clearPairRules = () => {
+    setPairRules([])
+    setError('')
+  }
 
   return (
     <section className="panel build" aria-labelledby="build-title">
@@ -208,7 +273,7 @@ export function Build({
         <div className="suggestion">
           <p>
             {available.length} available across {teamCount} teams leaves{' '}
-            {suggestions.length} on the bench. Fewest rounds sat:{' '}
+            {suggestions.length} on the bench. Fewest sits {benchNote}:{' '}
             <strong>{suggestedNames.join(', ')}</strong>.
           </p>
           <button type="button" className="quiet" onClick={() => onSitOut(suggestions)}>
@@ -230,6 +295,108 @@ export function Build({
           </span>
         </label>
       )}
+
+      {hasRoles && spreadRoles && (
+        <label className="role-allowance">
+          <span className="control-label">Role preference</span>
+          <select
+            className="input"
+            value={roleAllowance}
+            onChange={(event) => setRoleAllowance(Number(event.target.value))}
+          >
+            <option value={0}>Tightest first</option>
+            <option value={50}>Prefer roles within 50 elo</option>
+            <option value={100}>Prefer roles within 100 elo</option>
+          </select>
+          <span className="hint">
+            How much extra spread to accept for better role coverage.
+          </span>
+        </label>
+      )}
+
+      <details className="pair-rules">
+        <summary>
+          Pair rules
+          {activePairRules.length > 0 && ` · ${activePairRules.length}`}
+        </summary>
+        <p className="hint">
+          Hard rules: every shown split keeps these players together or apart.
+        </p>
+        <div className="pair-rule-form">
+          <select
+            className="input"
+            value={pairA}
+            aria-label="First player for the pair rule"
+            onChange={(event) => setPairA(event.target.value)}
+          >
+            <option value="">Player…</option>
+            {available.map((player) => (
+              <option key={player.id} value={player.id}>
+                {player.name}
+              </option>
+            ))}
+          </select>
+          <select
+            className="input"
+            value={pairKind}
+            aria-label="Pair rule relationship"
+            onChange={(event) =>
+              setPairKind(event.target.value === 'apart' ? 'apart' : 'together')
+            }
+          >
+            <option value="together">with</option>
+            <option value="apart">apart from</option>
+          </select>
+          <select
+            className="input"
+            value={pairB}
+            aria-label="Second player for the pair rule"
+            onChange={(event) => setPairB(event.target.value)}
+          >
+            <option value="">Player…</option>
+            {available.map((player) => (
+              <option key={player.id} value={player.id}>
+                {player.name}
+              </option>
+            ))}
+          </select>
+          <button type="button" className="quiet" onClick={addPairRule}>
+            Add
+          </button>
+        </div>
+        {activePairRules.length > 0 && (
+          <ul className="pair-rule-list">
+            {activePairRules.map((rule) => (
+              <li key={`${rule.a}:${rule.b}:${rule.kind}`}>
+                <span>
+                  {playerName(rule.a)}{' '}
+                  {rule.kind === 'together' ? 'with' : 'apart from'}{' '}
+                  {playerName(rule.b)}
+                </span>
+                <button
+                  type="button"
+                  className="icon-button"
+                  aria-label={`Remove pair rule for ${playerName(rule.a)} and ${playerName(rule.b)}`}
+                  onClick={() => removePairRule(pairRules.indexOf(rule))}
+                >
+                  ×
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+        {pausedPairRules > 0 && (
+          <p className="hint">
+            {pausedPairRules} rule{pausedPairRules === 1 ? '' : 's'} paused because
+            a player is sitting out or gone.
+          </p>
+        )}
+        {pairRules.length > 0 && (
+          <button type="button" className="quiet" onClick={clearPairRules}>
+            Clear pair rules
+          </button>
+        )}
+      </details>
 
       <div className="build-actions">
         <button
@@ -258,24 +425,45 @@ export function Build({
             <span />
             <span />
           </div>
-        ) : !shown ? (
+        ) : !result || !description ? (
           <p className="empty-state">
             Rate your players, choose how many teams you need, then generate.
-            Every split that fits your tolerance shows up here.
+            We count the splits that fit your tolerance and show the most
+            different ones.
           </p>
+        ) : !shown ? (
+          <div className="warning constraint-failure">
+            <p>{description.notice ?? 'No split matches your pair rules.'}</p>
+            <div className="warning-actions">
+              {description.offerTolerance && (
+                <button
+                  type="button"
+                  className="quiet"
+                  onClick={() => onTolerance(Math.min(2000, tolerance + 100))}
+                >
+                  Widen tolerance by 100
+                </button>
+              )}
+              {description.offerClearPairs && (
+                <button type="button" className="quiet" onClick={clearPairRules}>
+                  Clear pair rules
+                </button>
+              )}
+            </div>
+          </div>
         ) : (
           <>
             <div className="result-head">
               <span className="arrangement-count">
-                Arrangement {index + 1} of {result!.arrangements.length}
+                Arrangement {index + 1} of {arrangements.length}
               </span>
-              {result!.arrangements.length > 1 && (
+              {arrangements.length > 1 && (
                 <div className="pager">
                   <button
                     type="button"
                     aria-label="Previous arrangement"
                     onClick={() =>
-                      setIndex((index - 1 + result!.arrangements.length) % result!.arrangements.length)
+                      setIndex((index - 1 + arrangements.length) % arrangements.length)
                     }
                   >
                     ‹
@@ -283,7 +471,7 @@ export function Build({
                   <button
                     type="button"
                     aria-label="Next arrangement"
-                    onClick={() => setIndex((index + 1) % result!.arrangements.length)}
+                    onClick={() => setIndex((index + 1) % arrangements.length)}
                   >
                     ›
                   </button>
@@ -291,30 +479,13 @@ export function Build({
               )}
             </div>
 
-            <div className="result-meta">
-              <span className={`chip${shown.withinTolerance ? ' good' : ' warn'}`}>
-                Spread {shown.spread}
-              </span>
-                              <span className="muted">
-                Total elo {shown.teams.reduce((sum, team) => sum + team.sum, 0)}
-              </span>
-            </div>
-
-            {!shown.withinTolerance && (
-              <div className="warning">
-                <p>
-                  No split fits a spread of {tolerance}. The closest achievable is{' '}
-                  <strong>{shown.spread}</strong>.
-                </p>
-                <button
-                  type="button"
-                  className="quiet"
-                  onClick={() => onTolerance(Math.ceil(shown.spread))}
-                >
-                  Allow a spread of {Math.ceil(shown.spread)}
-                </button>
-              </div>
-            )}
+            <ResultStatus
+              view={description}
+              spread={shown.spread}
+              withinTolerance={shown.withinTolerance}
+              totalElo={shown.teams.reduce((sum, team) => sum + team.sum, 0)}
+              onWiden={() => onTolerance(shown.spread)}
+            />
 
             <div className="teams" key={`${signature}-${index}`}>
               {shown.teams.map((team, position) => (
@@ -323,11 +494,25 @@ export function Build({
                   team={team}
                   index={position}
                   max={max}
+                  odds={odds[position] ?? 0}
                 />
               ))}
             </div>
+            <p className="caption odds-caption">
+              Win odds are elo-only pre-match estimates; roles and damage can
+              change the outcome.
+            </p>
+            {result.roleAllowance > 0 && (
+              <p className="caption role-first-caption">
+                Role-first ranking: splits up to {result.roleAllowance} elo looser
+                than the tightest stay eligible, then the fullest role coverage
+                wins.
+              </p>
+            )}
 
-            <p className="caption">{coverage(result!, result!.arrangements.length)}</p>
+            {description.coverage && (
+              <p className="caption">{description.coverage}</p>
+            )}
             {hasRoles &&
               (() => {
                 const { missing } = roleCoverage(shown.teams)

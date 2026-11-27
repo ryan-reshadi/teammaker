@@ -23,10 +23,23 @@ export type Arrangement = {
   withinTolerance: boolean
 }
 
+export type PairRule = {
+  a: string
+  b: string
+  kind: 'together' | 'apart'
+}
+
 export type SolverOptions = {
   teamCount: number
   /** Maximum elo spread between the strongest and weakest team. */
   tolerance: number
+  /** Hard rules: two players together, or never on the same team. */
+  pairRules?: PairRule[]
+  /**
+   * When > 0 and roles are spread, splits up to this much looser than the
+   * tightest are ranked by role coverage first. 0 keeps today's tie-break.
+   */
+  roleAllowance?: number
   /** How many valid splits the search keeps before it stops. */
   maxResults?: number
   /** How many splits are returned to the interface. */
@@ -42,14 +55,26 @@ export type SolverOptions = {
 
 export type SolveResult = {
   arrangements: Arrangement[]
-  /** Valid splits found, before the variety filter. */
+  /**
+   * Distinct valid splits found, before the variety filter. A lower bound when
+   * `exhaustive` is false.
+   */
   validCount: number
-  /** True when the search visited every branch, so no split was missed. */
+  /**
+   * True when the search visited every branch, so `validCount` is exact and no
+   * split was missed.
+   */
   exhaustive: boolean
   playerCount: number
   teamCount: number
   tolerance: number
   totalElo: number
+  /** Normalized pair rules applied to the search. */
+  pairRules: number
+  /** True when rules exist and no split could satisfy them. */
+  constraintFailure: boolean
+  /** The active role-first allowance; 0 means tightest-first. */
+  roleAllowance: number
 }
 
 export type SolverRequest = {
@@ -105,6 +130,12 @@ const byTightness = (a: Candidate, b: Candidate) =>
   a.deviation - b.deviation ||
   (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
 
+const byRoleFirst = (a: Candidate, b: Candidate) =>
+  a.roleGap - b.roleGap ||
+  a.spread - b.spread ||
+  a.deviation - b.deviation ||
+  (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
+
 function movedPlayers(a: Int8Array, b: Int8Array): number {
   let moved = 0
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) moved++
@@ -116,7 +147,11 @@ function movedPlayers(a: Int8Array, b: Int8Array): number {
  * from everything already chosen, so a page full of results never shows the
  * same teams twice.
  */
-function selectDiverse(sorted: Candidate[], limit: number): Candidate[] {
+function selectDiverse(
+  sorted: Candidate[],
+  limit: number,
+  compare: (a: Candidate, b: Candidate) => number = byTightness,
+): Candidate[] {
   if (sorted.length <= limit) return sorted
   const chosen = [sorted[0]]
   const rest = sorted.slice(1)
@@ -136,13 +171,15 @@ function selectDiverse(sorted: Candidate[], limit: number): Candidate[] {
     }
     chosen.push(rest.splice(bestIndex, 1)[0])
   }
-  return chosen.sort(byTightness)
+  return chosen.sort(compare)
 }
 
 /**
- * Repeatedly swap two players between the strongest and weakest team to shrink
- * the spread. Used when nothing fits the tolerance, so the interface can still
- * show the closest achievable split instead of an empty result.
+ * Best-effort closest split: start greedily, then repeatedly swap two players
+ * between teams to shrink the spread. Used when the search found no valid
+ * split, so the interface can show something instead of an empty result. The
+ * greedy start and local swaps are not guaranteed to reach the true minimum
+ * spread.
  */
 function tightestReachable(
   players: SolverPlayer[],
@@ -219,6 +256,30 @@ function tightestReachable(
   return { teams, spread, withinTolerance: false }
 }
 
+type IndexedPair = { a: number; b: number; together: boolean }
+
+/** Unknown ids, self-pairs and malformed rules are ignored; apart wins a conflict. */
+function indexPairRules(
+  rules: PairRule[] | undefined,
+  players: SolverPlayer[],
+): IndexedPair[] {
+  const index = new Map(players.map((player, position) => [player.id, position]))
+  const found = new Map<string, IndexedPair>()
+  for (const rule of rules ?? []) {
+    const a = index.get(rule.a)
+    const b = index.get(rule.b)
+    if (a === undefined || b === undefined || a === b) continue
+    const first = Math.min(a, b)
+    const second = Math.max(a, b)
+    const key = `${first}:${second}`
+    const together = rule.kind === 'together'
+    const existing = found.get(key)
+    if (!existing) found.set(key, { a: first, b: second, together })
+    else if (!together) existing.together = false
+  }
+  return [...found.values()]
+}
+
 export function solve(
   playersIn: SolverPlayer[],
   options: SolverOptions,
@@ -236,6 +297,12 @@ export function solve(
   const maxArrangements = options.maxArrangements ?? 12
   const timeBudgetMs = options.timeBudgetMs ?? 300
   const maxNodes = options.maxNodes ?? 500_000
+  const pairRules = indexPairRules(options.pairRules, players)
+  const requestedAllowance = options.roleAllowance ?? 0
+  const roleAllowance = Math.max(
+    0,
+    Math.round(Number.isFinite(requestedAllowance) ? requestedAllowance : 0),
+  )
 
   const playerCount = players.length
   const totalElo = players.reduce((sum, player) => sum + player.elo, 0)
@@ -247,6 +314,9 @@ export function solve(
     teamCount,
     tolerance,
     totalElo,
+    pairRules: pairRules.length,
+    constraintFailure: false,
+    roleAllowance: 0,
   }
   if (playerCount < teamCount) return empty
 
@@ -271,6 +341,25 @@ export function solve(
   const sums = new Array<number>(teamCount).fill(0)
   const tagMasks = players.map((player) => roleMask(player.tags))
   const anyTags = spreadRoles && tagMasks.some((mask) => mask !== 0)
+  const togetherWith: number[][] = Array.from({ length: playerCount }, () => [])
+  const apartFrom: number[][] = Array.from({ length: playerCount }, () => [])
+  for (const rule of pairRules) {
+    if (rule.together) {
+      togetherWith[rule.a]!.push(rule.b)
+      togetherWith[rule.b]!.push(rule.a)
+    } else {
+      apartFrom[rule.a]!.push(rule.b)
+      apartFrom[rule.b]!.push(rule.a)
+    }
+  }
+  const assigned = new Uint8Array(playerCount)
+  const compatible = (playerIndex: number, team: number) => {
+    for (const other of togetherWith[playerIndex]!)
+      if (assigned[other] && assign[other] !== team) return false
+    for (const other of apartFrom[playerIndex]!)
+      if (assigned[other] && assign[other] === team) return false
+    return true
+  }
   const keys = new Set<string>()
   const found: Candidate[] = []
   let opened = 0
@@ -367,10 +456,12 @@ export function solve(
     candidates.sort((a, b) => sums[a] - sums[b] || a - b)
 
     for (const team of candidates) {
+      if (!compatible(playerIndex, team)) continue
       const opening = team === opened
       members[team].push(playerIndex)
       sums[team] += elo
       assign[playerIndex] = team
+      assigned[playerIndex] = 1
       if (opening) opened++
       const full = members[team].length === hi
       if (full) extras++
@@ -383,13 +474,30 @@ export function solve(
       if (opening) opened--
       sums[team] -= elo
       members[team].pop()
+      assigned[playerIndex] = 0
       if (cut) return
     }
   }
 
   walk(0)
 
-  const arrangements = selectDiverse([...found].sort(byTightness), maxArrangements).map(
+  const sorted = [...found].sort(byTightness)
+  const roleFirst = anyTags && roleAllowance > 0
+  const ranked =
+    roleFirst && sorted.length > 0
+      ? (() => {
+          const tightest = sorted[0]!.spread
+          return sorted
+            .filter((candidate) => candidate.spread <= tightest + roleAllowance)
+            .sort(byRoleFirst)
+        })()
+      : sorted
+
+  const arrangements = selectDiverse(
+    ranked,
+    maxArrangements,
+    roleFirst ? byRoleFirst : byTightness,
+  ).map(
     (candidate): Arrangement => {
       const teams = Array.from({ length: teamCount }, (_, team) => {
         const list = players
@@ -403,9 +511,10 @@ export function solve(
   )
 
   // `exhaustive` describes the search only: the fallback below is a best-effort
-  // split and never makes an incomplete search look complete.
+  // split and never makes an incomplete search look complete. Pair rules are
+  // hard, so a fallback that violates them is never shown.
   const exhaustive = !cut
-  if (arrangements.length === 0) {
+  if (arrangements.length === 0 && pairRules.length === 0) {
     const fallback = tightestReachable(players, sizes, teamCount)
     if (fallback)
       arrangements.push({
@@ -413,6 +522,7 @@ export function solve(
         withinTolerance: fallback.spread <= tolerance,
       })
   }
+  const constraintFailure = pairRules.length > 0 && arrangements.length === 0
 
   return {
     arrangements,
@@ -422,6 +532,9 @@ export function solve(
     teamCount,
     tolerance,
     totalElo,
+    pairRules: pairRules.length,
+    constraintFailure,
+    roleAllowance: roleFirst ? roleAllowance : 0,
   }
 }
 

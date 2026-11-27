@@ -90,8 +90,12 @@ var ELO_PER_SKILL = 100;
 var DEFAULT_K_FACTOR = 32;
 var MIN_K_FACTOR = 8;
 var MAX_K_FACTOR = 64;
+var RATING_FORMULA = 2;
+var PROVISIONAL_MATCHES = 5;
+var PROVISIONAL_K_MULTIPLIER = 2;
 var MAX_EVENTS = 1000;
 var MAX_MATCH_PLAYERS = 10;
+var MAX_MATCH_TEAMS = 8;
 var MAX_DAMAGE = 1e5;
 var PERFORMANCE_WEIGHT = 0.6;
 var PERFORMANCE_TAU = 0.7;
@@ -104,6 +108,22 @@ var clampElo = (value) => {
 };
 var skillFromElo = (elo) => Math.min(10, Math.max(1, Math.round(clampElo(elo) / ELO_PER_SKILL)));
 var isKFactor = (value) => typeof value === "number" && Number.isInteger(value) && value >= MIN_K_FACTOR && value <= MAX_K_FACTOR;
+function provisionalK(baseK, matchesPlayed) {
+  const k = isKFactor(baseK) ? baseK : DEFAULT_K_FACTOR;
+  return matchesPlayed < PROVISIONAL_MATCHES ? Math.min(MAX_K_FACTOR, k * PROVISIONAL_K_MULTIPLIER) : k;
+}
+function expectationsFromStrengths(strengths) {
+  if (strengths.length === 0)
+    return [];
+  if (strengths.length === 1)
+    return [1];
+  const versus = strengths.map((value, index) => strengths.map((other, otherIndex) => otherIndex === index ? 0 : 1 / (1 + 10 ** ((other - value) / 400))));
+  const totals = versus.map((row) => row.reduce((sum, value) => sum + value, 0));
+  const total = totals.reduce((sum, value) => sum + value, 0);
+  if (!(total > 0))
+    return strengths.map(() => 1 / strengths.length);
+  return totals.map((value) => value / total);
+}
 function knownAverage(teams, ratings) {
   let total = 0;
   let count = 0;
@@ -127,13 +147,15 @@ function estimateRandomElo(averageKnown, damagePerEnemy, trackedDamagePerEnemy) 
   const shift = RANDOM_SWING * Math.tanh(Math.log(Math.max(factor, 0.000001)) / PERFORMANCE_TAU);
   return clampElo(averageKnown + shift);
 }
-function rateMatch(input, ratings, kFactor) {
+function rateMatch(input, ratings, kFactor, options = {}) {
   const teams = input.teams;
   const updates = new Map;
-  if (teams.length !== 2 || teams.some((team) => team.players.length === 0))
+  const formula = options.formula ?? 1;
+  const priorMatches = options.priorMatches;
+  if (teams.length < 2 || teams.length > MAX_MATCH_TEAMS || teams.some((team) => team.players.length === 0) || !Number.isInteger(input.winner) || input.winner < 0 || input.winner >= teams.length)
     return { result: { teams: [], winner: input.winner, expected: [] }, updates };
   const sizes = teams.map((team) => team.players.length);
-  const enemiesFaced = [sizes[1], sizes[0]];
+  const enemiesFaced = sizes.map((_size, index) => sizes.reduce((sum, size, other) => other === index ? sum : sum + size, 0));
   const averageKnown = knownAverage(teams, ratings);
   const damagePerEnemy = teams.map((team, index) => team.players.map((player) => player.damage / Math.max(1, enemiesFaced[index])));
   const trackedDamage = teams.flatMap((team, index) => team.players.map((player, slot) => player.tracked ? damagePerEnemy[index][slot] : null).filter((value) => value !== null));
@@ -147,10 +169,7 @@ function rateMatch(input, ratings, kFactor) {
     return rating === undefined ? clampElo(averageKnown) : clampElo(rating);
   }));
   const strength = teams.map((team, index) => team.players.reduce((sum, _player, slot) => sum + weights[index][slot] * elos[index][slot], 0));
-  const expected = [
-    1 / (1 + 10 ** ((strength[1] - strength[0]) / 400)),
-    1 / (1 + 10 ** ((strength[0] - strength[1]) / 400))
-  ];
+  const expected = expectationsFromStrengths(strength);
   const pool = teams.reduce((sum, team, index) => sum + team.players.reduce((teamSum, _player, slot) => teamSum + weights[index][slot] * damagePerEnemy[index][slot], 0), 0);
   const weightTotal = weights.flat().reduce((sum, weight) => sum + weight, 0);
   const ratingTotal = teams.reduce((sum, team, index) => sum + team.players.reduce((teamSum, _player, slot) => teamSum + weights[index][slot] * elos[index][slot], 0), 0);
@@ -166,7 +185,8 @@ function rateMatch(input, ratings, kFactor) {
         const expectedShare = 0.5 * equalShare + 0.5 * ratingShare;
         const performance = expectedShare > 0 && actualShare > 0 ? Math.tanh(Math.log(actualShare / expectedShare) / PERFORMANCE_TAU) : -1;
         const outcome = index === input.winner ? 1 : 0;
-        const delta = Math.round(kFactor * (outcome - expected[index] + PERFORMANCE_WEIGHT * performance));
+        const playerK = formula === 2 && player.tracked ? provisionalK(kFactor, priorMatches?.get(player.id) ?? 0) : kFactor;
+        const delta = Math.round(playerK * (outcome - expected[index] + PERFORMANCE_WEIGHT * performance));
         const after = player.tracked ? clampElo(before + delta) : before;
         if (player.tracked)
           updates.set(player.id, after);
@@ -185,11 +205,12 @@ function rateMatch(input, ratings, kFactor) {
   });
   return { result, updates };
 }
-function replay(events, roster, kFactor) {
+function replay(events, roster, kFactor, legacyK = kFactor) {
   const elos = new Map;
   for (const player of roster)
     elos.set(player.id, clampElo(player.baseElo));
   const outcomes = new Map;
+  const matchesPlayed = new Map;
   const ordered = [...events].sort((a, b) => a.position - b.position || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   for (const event of ordered) {
     if (event.kind === "adjust") {
@@ -203,9 +224,23 @@ function replay(events, roster, kFactor) {
       });
       continue;
     }
-    const { result, updates } = rateMatch(event.payload, elos, kFactor);
+    const formula = event.payload.formula === 2 ? 2 : 1;
+    const eventK = formula === 2 && isKFactor(event.payload.k) ? event.payload.k : legacyK;
+    const { result, updates } = rateMatch(event.payload, elos, eventK, {
+      formula,
+      priorMatches: matchesPlayed
+    });
     for (const [id, elo] of updates)
       elos.set(id, elo);
+    if (result.teams.length > 0) {
+      const seen = new Set;
+      for (const team of event.payload.teams)
+        for (const player of team.players)
+          if (player.tracked)
+            seen.add(player.id);
+      for (const id of seen)
+        matchesPlayed.set(id, (matchesPlayed.get(id) ?? 0) + 1);
+    }
     outcomes.set(event.id, { eventId: event.id, kind: "match", result });
   }
   return { elos, outcomes };
@@ -363,12 +398,17 @@ var schema = [
     owner_sub TEXT PRIMARY KEY,
     k_factor INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS rating_meta (
+    owner_sub TEXT PRIMARY KEY,
+    legacy_k INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
   )`
 ];
 var TAG_COLUMN = `ALTER TABLE players ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'`;
 var ELO_COLUMN = `ALTER TABLE players ADD COLUMN elo INTEGER NOT NULL DEFAULT 0`;
 var BASE_ELO_COLUMN = `ALTER TABLE players ADD COLUMN base_elo INTEGER NOT NULL DEFAULT 0`;
-var TABLES = `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('players', 'rounds', 'rating_events', 'rating_results', 'settings')`;
+var TABLES = `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('players', 'rounds', 'rating_events', 'rating_results', 'settings', 'rating_meta')`;
 var COLUMNS = "SELECT name FROM pragma_table_info('players')";
 var ensureColumns = async (db) => {
   const columns = await db.prepare(COLUMNS).all();
@@ -388,7 +428,7 @@ var ensureColumns = async (db) => {
 };
 var bootstrap = async (db) => {
   const tables = await db.prepare(TABLES).all();
-  if (tables.results.length < 5) {
+  if (tables.results.length < 6) {
     await db.batch(schema.map((sql) => db.prepare(sql)));
   }
   await ensureColumns(db);
@@ -477,6 +517,7 @@ var MAX_BATCH = 50;
 var MAX_ROUNDS = 100;
 var MAX_LABEL = 60;
 var MAX_REASON = 80;
+var MATCH_ERROR = "A match needs two to eight teams, damage for every player, a winner and at least one player from your roster.";
 var readName = (value) => {
   if (typeof value !== "string")
     return null;
@@ -527,9 +568,7 @@ function readMatchInput(value) {
   const label = record.label === undefined ? "" : typeof record.label === "string" && record.label.trim().length <= MAX_LABEL ? record.label.trim() : null;
   if (label === null)
     return null;
-  if (!Array.isArray(record.teams) || record.teams.length !== 2)
-    return null;
-  if (record.winner !== 0 && record.winner !== 1)
+  if (!Array.isArray(record.teams) || record.teams.length < 2 || record.teams.length > MAX_MATCH_TEAMS)
     return null;
   const seen = new Set;
   const teams = [];
@@ -573,6 +612,8 @@ function readMatchInput(value) {
     teams.push({ players });
   }
   if (tracked === 0 || totalDamage === 0)
+    return null;
+  if (typeof record.winner !== "number" || !Number.isInteger(record.winner) || record.winner < 0 || record.winner >= teams.length)
     return null;
   return { label, teams, winner: record.winner };
 }
@@ -666,6 +707,17 @@ async function getKFactor(db, owner) {
   const row = await db.prepare("SELECT k_factor FROM settings WHERE owner_sub = ?").bind(owner).first();
   return row && isKFactor(row.k_factor) ? row.k_factor : DEFAULT_K_FACTOR;
 }
+async function getLegacyK(db, owner, currentK) {
+  const row = await db.prepare("SELECT legacy_k FROM rating_meta WHERE owner_sub = ?").bind(owner).first();
+  return row && isKFactor(row.legacy_k) ? row.legacy_k : currentK;
+}
+async function pinLegacyK(db, owner, legacyK) {
+  await db.prepare("INSERT INTO rating_meta (owner_sub, legacy_k, created_at) VALUES (?, ?, ?) ON CONFLICT(owner_sub) DO NOTHING").bind(owner, legacyK, Date.now()).run();
+}
+async function loadPlayers(db, owner) {
+  const result = await db.prepare("SELECT id, name, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE owner_sub = ? ORDER BY created_at ASC, id ASC").bind(owner).all();
+  return result.results.map(mapPlayer);
+}
 async function nextPosition(db, owner) {
   const row = await db.prepare("SELECT COALESCE(MAX(position), -1) + 1 AS next FROM rating_events WHERE owner_sub = ?").bind(owner).first();
   return row?.next ?? 0;
@@ -678,12 +730,13 @@ async function recompute(db, owner, from) {
   const players = await db.prepare("SELECT id, name, skill, elo, tags, sitting_out, created_at, updated_at, base_elo FROM players WHERE owner_sub = ? ORDER BY created_at ASC, id ASC").bind(owner).all();
   const events = await loadEvents(db, owner);
   const kFactor = await getKFactor(db, owner);
+  const legacyK = await getLegacyK(db, owner, kFactor);
   const roster = players.results.map((player) => ({
     id: player.id,
     name: player.name,
     baseElo: player.base_elo
   }));
-  const { elos, outcomes } = replay(events, roster, kFactor);
+  const { elos, outcomes } = replay(events, roster, kFactor, legacyK);
   const statements = [];
   for (const player of players.results) {
     const elo = elos.get(player.id) ?? player.elo;
@@ -781,11 +834,11 @@ function createApp(authenticate = currentUser) {
       return c.json({ ok: true, database: "unconfigured" });
     try {
       await db.prepare("SELECT 1 AS ok").first();
-      const tables = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('players', 'rounds', 'rating_events', 'rating_results', 'settings')").all();
+      const tables = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('players', 'rounds', 'rating_events', 'rating_results', 'settings', 'rating_meta')").all();
       return c.json({
         ok: true,
         database: "ok",
-        schema: tables.results.length === 5 ? "ready" : "missing"
+        schema: tables.results.length === 6 ? "ready" : "missing"
       });
     } catch (error) {
       console.error("Teammaker: database health check failed", error instanceof Error ? error.message : error);
@@ -823,10 +876,7 @@ function createApp(authenticate = currentUser) {
     c.set("db", c.env.DB);
     await next();
   });
-  app.get("/api/players", async (c) => {
-    const result = await c.get("db").prepare("SELECT id, name, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE owner_sub = ? ORDER BY created_at ASC, id ASC").bind(c.get("user").sub).all();
-    return c.json({ players: result.results.map(mapPlayer) });
-  });
+  app.get("/api/players", async (c) => c.json({ players: await loadPlayers(c.get("db"), c.get("user").sub) }));
   app.post("/api/players", async (c) => {
     const body = await c.req.json().catch(() => null);
     const drafts = readDrafts(body);
@@ -996,7 +1046,7 @@ function createApp(authenticate = currentUser) {
     const input = readMatchInput(body);
     if (!input)
       return c.json({
-        error: "A match needs two teams, damage for every player, a winner and at least one player from your roster."
+        error: MATCH_ERROR
       }, 400);
     const db = c.get("db");
     const owner = c.get("user").sub;
@@ -1009,7 +1059,14 @@ function createApp(authenticate = currentUser) {
     const position = await nextPosition(db, owner);
     const id = crypto.randomUUID();
     const now = Date.now();
-    await db.prepare("INSERT INTO rating_events (id, owner_sub, position, kind, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(id, owner, position, "match", JSON.stringify(input), now, now).run();
+    const kFactor = await getKFactor(db, owner);
+    await pinLegacyK(db, owner, kFactor);
+    const payload = {
+      ...input,
+      formula: RATING_FORMULA,
+      k: kFactor
+    };
+    await db.prepare("INSERT INTO rating_events (id, owner_sub, position, kind, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(id, owner, position, "match", JSON.stringify(payload), now, now).run();
     const players = await recompute(db, owner, position);
     return c.json({ match: { id, position }, players }, 201);
   });
@@ -1032,13 +1089,21 @@ function createApp(authenticate = currentUser) {
     if ("input" in patch) {
       const input = readMatchInput(patch.input);
       if (!input)
-        return c.json({
-          error: "A match needs two teams, damage for every player, a winner and at least one player from your roster."
-        }, 400);
+        return c.json({ error: MATCH_ERROR }, 400);
       const tracked = input.teams.flatMap((team) => team.players.filter((player) => player.tracked).map((player) => player.id));
       if (!await trackedIdsExist(db, owner, tracked))
         return c.json({ error: "Those players are no longer on your roster." }, 400);
-      await db.prepare("UPDATE rating_events SET payload = ?, updated_at = ? WHERE id = ? AND owner_sub = ?").bind(JSON.stringify(input), Date.now(), id, owner).run();
+      let marker = {};
+      try {
+        const existing = JSON.parse(row.payload);
+        if (existing.formula === 2) {
+          marker = { formula: 2 };
+          if (isKFactor(existing.k))
+            marker.k = existing.k;
+        }
+      } catch {}
+      const nextInput = { ...input, ...marker };
+      await db.prepare("UPDATE rating_events SET payload = ?, updated_at = ? WHERE id = ? AND owner_sub = ?").bind(JSON.stringify(nextInput), Date.now(), id, owner).run();
     }
     if ("position" in patch) {
       const all = await db.prepare("SELECT id FROM rating_events WHERE owner_sub = ? ORDER BY position ASC, created_at ASC, id ASC").bind(owner).all();
@@ -1079,8 +1144,9 @@ function createApp(authenticate = currentUser) {
       return c.json({ error: "K must be a whole number from 8 to 64." }, 400);
     const db = c.get("db");
     const owner = c.get("user").sub;
+    await pinLegacyK(db, owner, await getKFactor(db, owner));
     await db.prepare("INSERT INTO settings (owner_sub, k_factor, updated_at) VALUES (?, ?, ?) ON CONFLICT(owner_sub) DO UPDATE SET k_factor = excluded.k_factor, updated_at = excluded.updated_at").bind(owner, kFactor, Date.now()).run();
-    const players = await recompute(db, owner, 0);
+    const players = await loadPlayers(db, owner);
     return c.json({ kFactor, players });
   });
   app.get("/api/rounds", async (c) => {

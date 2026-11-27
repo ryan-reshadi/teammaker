@@ -1,5 +1,12 @@
-import { useState } from 'react'
-import { clampElo, skillFromElo } from '../../shared/elo'
+import { useMemo, useState } from 'react'
+import {
+  PROVISIONAL_MATCHES,
+  clampElo,
+  provisionalK,
+  skillFromElo,
+  type RatingEventView,
+} from '../../shared/elo'
+import { playerHistory, sparklinePoints } from '../../shared/history'
 import { roleLabel } from '../../shared/roles'
 import type { Player } from '../../shared/types'
 import type { PlayerDraft, PlayerPatch } from '../store'
@@ -8,6 +15,8 @@ import { SkillPicker } from './SkillPicker'
 
 type Props = {
   players: Player[]
+  events: RatingEventView[]
+  kFactor: number
   suggestions: string[]
   disabled?: boolean
   onAdd: (drafts: PlayerDraft[]) => Promise<void>
@@ -24,6 +33,8 @@ const parseNames = (text: string) =>
 
 export function Roster({
   players,
+  events,
+  kFactor,
   suggestions,
   disabled,
   onAdd,
@@ -40,6 +51,20 @@ export function Roster({
   const [bulkText, setBulkText] = useState('')
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editingName, setEditingName] = useState('')
+  const [historyFor, setHistoryFor] = useState<string | null>(null)
+
+  const playedCounts = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const event of events) {
+      if (event.kind !== 'match') continue
+      const seen = new Set<string>()
+      for (const team of event.teams)
+        for (const player of team.players)
+          if (player.tracked && player.id) seen.add(player.id)
+      for (const id of seen) counts.set(id, (counts.get(id) ?? 0) + 1)
+    }
+    return counts
+  }, [events])
 
   const total = players.reduce((sum, player) => sum + player.elo, 0)
   const benched = players.filter((player) => player.sittingOut).length
@@ -172,6 +197,13 @@ export function Roster({
         <ul className="player-list">
           {players.map((player) => {
             const band = skillFromElo(player.elo)
+            const matchesPlayed = playedCounts.get(player.id) ?? 0
+            const effectiveK = provisionalK(kFactor, matchesPlayed)
+            const history = playerHistory(events, player.id)
+            const trend =
+              history.length > 0
+                ? [history[0]!.eloBefore, ...history.map((entry) => entry.eloAfter)]
+                : [player.elo]
             return (
               <li
                 key={player.id}
@@ -210,37 +242,59 @@ export function Roster({
                     )}
                   </button>
                 )}
-                {eloEditor === player.id ? (
-                  <input
-                    className="elo-input"
-                    type="number"
-                    min={100}
-                    max={1000}
-                    step={1}
-                    autoFocus
-                    value={eloDraft}
-                    aria-label={`Elo for ${player.name}`}
-                    onChange={(event) => setEloDraft(event.target.value)}
-                    onBlur={() => commitElo(player)}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter') {
-                        event.preventDefault()
-                        event.currentTarget.blur()
-                      }
-                      if (event.key === 'Escape') setEloEditor(null)
-                    }}
-                  />
-                ) : (
+                <div className="elo-actions">
+                  {eloEditor === player.id ? (
+                    <input
+                      className="elo-input"
+                      type="number"
+                      min={100}
+                      max={1000}
+                      step={1}
+                      autoFocus
+                      value={eloDraft}
+                      aria-label={`Elo for ${player.name}`}
+                      onChange={(event) => setEloDraft(event.target.value)}
+                      onBlur={() => commitElo(player)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter') {
+                          event.preventDefault()
+                          event.currentTarget.blur()
+                        }
+                        if (event.key === 'Escape') setEloEditor(null)
+                      }}
+                    />
+                  ) : (
+                    <button
+                      type="button"
+                      className="elo-badge"
+                      aria-label={`Advanced elo for ${player.name}: ${player.elo}`}
+                      title={`Advanced · edit ${player.elo} elo directly`}
+                      onClick={() => openElo(player)}
+                    >
+                      {player.elo}
+                    </button>
+                  )}
+                  {matchesPlayed < PROVISIONAL_MATCHES && (
+                    <span
+                      className="provisional-badge"
+                      title={`Provisional: K ${effectiveK} for the first ${PROVISIONAL_MATCHES} rated matches (${PROVISIONAL_MATCHES - matchesPlayed} left)`}
+                    >
+                      P
+                    </span>
+                  )}
                   <button
                     type="button"
-                    className="elo-badge"
-                    aria-label={`Advanced elo for ${player.name}: ${player.elo}`}
-                    title={`Advanced · edit ${player.elo} elo directly`}
-                    onClick={() => openElo(player)}
+                    className="history-button"
+                    aria-label={`Rating history for ${player.name}`}
+                    aria-expanded={historyFor === player.id}
+                    title="Rating history"
+                    onClick={() =>
+                      setHistoryFor(historyFor === player.id ? null : player.id)
+                    }
                   >
-                    {player.elo}
+                    ↗
                   </button>
-                )}
+                </div>
                 <SkillPicker
                   value={band}
                   onChange={(skill) => {
@@ -273,6 +327,71 @@ export function Roster({
                 >
                   ×
                 </button>
+                {historyFor === player.id && (
+                  <div className="player-history">
+                    <div className="player-history-head">
+                      <strong>Rating history</strong>
+                      <span className="muted">
+                        {matchesPlayed < PROVISIONAL_MATCHES
+                          ? `Provisional · ${matchesPlayed}/${PROVISIONAL_MATCHES} rated · K ${effectiveK}`
+                          : `K ${effectiveK}`}
+                      </span>
+                      <button
+                        type="button"
+                        className="quiet"
+                        onClick={() => setHistoryFor(null)}
+                      >
+                        Close
+                      </button>
+                    </div>
+                    {history.length > 0 && (
+                      <svg
+                        className="elo-spark"
+                        viewBox="0 0 180 40"
+                        role="img"
+                        aria-label={`Elo trend for ${player.name}`}
+                      >
+                        <polyline points={sparklinePoints(trend, 180, 40)} />
+                      </svg>
+                    )}
+                    {history.length === 0 ? (
+                      <p className="history-empty">
+                        No rated matches yet. Log a match and this player's
+                        before/after elo lands here.
+                      </p>
+                    ) : (
+                      <ul className="history-list">
+                        {[...history].reverse().map((entry) => (
+                          <li key={`${entry.id}:${entry.position}`}>
+                            <span className="history-when">
+                              {new Date(entry.createdAt).toLocaleDateString(
+                                undefined,
+                                { month: 'short', day: 'numeric' },
+                              )}
+                            </span>
+                            <span className="history-label">
+                              {entry.label}
+                              {entry.kind === 'match'
+                                ? entry.won
+                                  ? ' · won'
+                                  : ' · lost'
+                                : ''}
+                            </span>
+                            <span className="history-elo">
+                              {entry.eloBefore} → {entry.eloAfter}
+                            </span>
+                            <span
+                              className={entry.delta >= 0 ? 'good' : 'bad'}
+                            >
+                              {entry.delta > 0 ? '+' : ''}
+                              {entry.delta}
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
                 <div className="player-roles">
                   {roleEditor === player.id ? (
                     <div className="role-editor">

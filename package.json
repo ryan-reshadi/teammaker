@@ -10,6 +10,7 @@
     "build:api": "bun build server/vercel.ts --target node --format esm --packages external --outfile api/index.js",
     "serve:api": "node scripts/serve-api.mjs",
     "serve:node": "bun run scripts/serve-node.ts",
+    "preview:replay": "bun run scripts/preview-replay.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.worker.json",
     "test": "bun test"
   },

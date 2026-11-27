@@ -223,3 +223,101 @@ test('sitting-out players are only ever excluded by the caller', () => {
   expect(result.arrangements[0]!.spread).toBe(0)
   expect(coverage(result.arrangements[0]!).sort()).toEqual(['p0', 'p1'])
 })
+
+test('pair rules are hard and every returned split keeps them', () => {
+  const players = roster([9, 8, 7, 6, 5, 4])
+  const result = solve(players, {
+    teamCount: 2,
+    tolerance: T(20),
+    pairRules: [
+      { a: 'p0', b: 'p1', kind: 'together' },
+      { a: 'p2', b: 'p3', kind: 'apart' },
+    ],
+  })
+  expect(result.pairRules).toBe(2)
+  expect(result.constraintFailure).toBe(false)
+  expect(result.arrangements.length).toBeGreaterThan(0)
+  for (const arrangement of result.arrangements) {
+    const teamOf = new Map(
+      arrangement.teams.flatMap((team, index) =>
+        team.players.map((player) => [player.id, index] as const),
+      ),
+    )
+    expect(teamOf.get('p0')).toBe(teamOf.get('p1'))
+    expect(teamOf.get('p2')).not.toBe(teamOf.get('p3'))
+  }
+})
+
+test('an impossible pair rule returns no split instead of a violating fallback', () => {
+  const result = solve(roster([5, 5]), {
+    teamCount: 2,
+    tolerance: 0,
+    pairRules: [{ a: 'p0', b: 'p1', kind: 'together' }],
+  })
+  expect(result.validCount).toBe(0)
+  expect(result.exhaustive).toBe(true)
+  expect(result.constraintFailure).toBe(true)
+  expect(result.arrangements).toHaveLength(0)
+})
+
+test('unknown and self pair rules are ignored, and apart wins a conflict', () => {
+  const players = roster([9, 8, 7, 6])
+  const result = solve(players, {
+    teamCount: 2,
+    tolerance: 0,
+    pairRules: [
+      { a: 'missing', b: 'p0', kind: 'together' },
+      { a: 'p0', b: 'p0', kind: 'apart' },
+      { a: 'p0', b: 'p1', kind: 'together' },
+      { a: 'p0', b: 'p1', kind: 'apart' },
+    ],
+  })
+  expect(result.pairRules).toBe(1)
+  expect(result.constraintFailure).toBe(false)
+  for (const arrangement of result.arrangements) {
+    const teamOf = new Map(
+      arrangement.teams.flatMap((team, index) =>
+        team.players.map((player) => [player.id, index] as const),
+      ),
+    )
+    expect(teamOf.get('p0')).not.toBe(teamOf.get('p1'))
+  }
+})
+
+test('role allowance can trade a little spread for fuller coverage', () => {
+  const players = [
+    { id: 'a', name: 'A', elo: 600, tags: ['igl'] },
+    { id: 'b', name: 'B', elo: 600, tags: ['igl'] },
+    { id: 'c', name: 'C', elo: 800, tags: [] },
+    { id: 'd', name: 'D', elo: 400, tags: [] },
+  ]
+  const tight = solve(players, { teamCount: 2, tolerance: T(4) })
+  expect(tight.arrangements[0]!.spread).toBe(0)
+  expect(tight.roleAllowance).toBe(0)
+
+  const slightly = solve(players, {
+    teamCount: 2,
+    tolerance: T(4),
+    roleAllowance: T(0.5),
+  })
+  expect(slightly.arrangements[0]!.spread).toBe(0)
+
+  const allowed = solve(players, {
+    teamCount: 2,
+    tolerance: T(4),
+    roleAllowance: T(4),
+  })
+  expect(allowed.roleAllowance).toBe(400)
+  expect(allowed.arrangements[0]!.spread).toBe(400)
+  for (const team of allowed.arrangements[0]!.teams)
+    expect(team.players.some((player) => player.tags?.includes('igl'))).toBe(true)
+
+  const rolesOff = solve(players, {
+    teamCount: 2,
+    tolerance: T(4),
+    roleAllowance: T(4),
+    spreadRoles: false,
+  })
+  expect(rolesOff.roleAllowance).toBe(0)
+  expect(rolesOff.arrangements[0]!.spread).toBe(0)
+})

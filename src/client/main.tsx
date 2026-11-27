@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { suggestSitOuts } from '../shared/balance'
+import { sitOutCounts } from '../shared/bench'
 import {
   DEFAULT_K_FACTOR,
   clampElo,
@@ -272,17 +273,19 @@ function App() {
     await addPlayers(drafts)
   }, [importable, addPlayers])
 
-  const sitCounts = useMemo(() => {
-    const counts: Record<string, number> = {}
-    for (const round of rounds)
-      for (const id of round.config.benchedIds)
-        counts[id] = (counts[id] ?? 0) + 1
-    return counts
-  }, [rounds])
-
+  const bench = useMemo(
+    () => sitOutCounts(events, rounds, players),
+    [events, rounds, players],
+  )
+  const benchNote =
+    bench.source === 'matches'
+      ? `from ${bench.matchCount} logged ${bench.matchCount === 1 ? 'match' : 'matches'}`
+      : bench.source === 'rounds'
+        ? 'from saved rounds'
+        : 'so far'
   const suggestions = useMemo(
-    () => suggestSitOuts(players, teamCount, sitCounts),
-    [players, teamCount, sitCounts],
+    () => suggestSitOuts(players, teamCount, bench.counts),
+    [players, teamCount, bench.counts],
   )
 
   const accountName =
@@ -327,8 +330,8 @@ function App() {
           <h1>Balanced teams, every round.</h1>
           <p>
             Rate everyone once, then let match damage tune their elo. Pick how
-            many teams you need and how close they have to be — we find every
-            split that fits.
+            many teams you need and how close they have to be — we search for
+            the splits that fit and show the most different ones.
           </p>
         </div>
 
@@ -380,6 +383,8 @@ function App() {
           <div className="column">
             <Roster
               players={players}
+              events={events}
+              kFactor={kFactor}
               suggestions={suggestions}
               onAdd={addPlayers}
               onUpdate={updatePlayer}
@@ -394,6 +399,7 @@ function App() {
               onTeamCount={setTeamCount}
               onTolerance={setTolerance}
               suggestions={suggestions}
+              benchNote={benchNote}
               onSitOut={applySitOuts}
               onSaveRound={saveRound}
               saved={saved}

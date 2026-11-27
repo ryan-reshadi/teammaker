@@ -67,13 +67,21 @@ const schema = [
     k_factor INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
   )`,
+  // The K that produced ratings written before formula versioning. It is
+  // pinned lazily, so existing history is never replayed or rewritten by a
+  // schema step.
+  `CREATE TABLE IF NOT EXISTS rating_meta (
+    owner_sub TEXT PRIMARY KEY,
+    legacy_k INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+  )`,
 ]
 
 const TAG_COLUMN = `ALTER TABLE players ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'`
 const ELO_COLUMN = `ALTER TABLE players ADD COLUMN elo INTEGER NOT NULL DEFAULT 0`
 const BASE_ELO_COLUMN = `ALTER TABLE players ADD COLUMN base_elo INTEGER NOT NULL DEFAULT 0`
 
-const TABLES = `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('players', 'rounds', 'rating_events', 'rating_results', 'settings')`
+const TABLES = `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('players', 'rounds', 'rating_events', 'rating_results', 'settings', 'rating_meta')`
 // A table-valued function rather than `PRAGMA table_info`: it is an ordinary
 // SELECT, so it stays valid on hosts that only proxy plain queries.
 const COLUMNS = "SELECT name FROM pragma_table_info('players')"
@@ -105,7 +113,7 @@ const bootstrap = async (db: Database): Promise<void> => {
   // lock on the primary) for every CREATE TABLE IF NOT EXISTS, while a local
   // file makes that free. A cold start on a healthy database should only read.
   const tables = await db.prepare(TABLES).all<{ name: string }>()
-  if (tables.results.length < 5) {
+  if (tables.results.length < 6) {
     await db.batch(schema.map((sql) => db.prepare(sql)))
   }
   await ensureColumns(db)

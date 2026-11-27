@@ -395,10 +395,11 @@ test('matches tune elo, replay edits, log manual ratings and stay private', asyn
 
   const logged = await call('/api/matches', 'frank', 'POST', body)
   expect(logged.status).toBe(201)
-  expect(await eloOf('Ada')).toBe(516)
-  expect(await eloOf('Bo')).toBe(516)
-  expect(await eloOf('Cy')).toBe(484)
-  expect(await eloOf('Di')).toBe(484)
+  // New players are provisional: the first five rated matches use double K.
+  expect(await eloOf('Ada')).toBe(532)
+  expect(await eloOf('Bo')).toBe(532)
+  expect(await eloOf('Cy')).toBe(468)
+  expect(await eloOf('Di')).toBe(468)
 
   let log = (await (await call('/api/matches', 'frank')).json()) as Logged
   expect(log.kFactor).toBe(32)
@@ -407,9 +408,9 @@ test('matches tune elo, replay edits, log manual ratings and stay private', asyn
   expect(log.events[0]!.kind).toBe('match')
   expect(log.events[0]!.teams![0]!.players[0]).toMatchObject({
     name: 'Ada',
-    delta: 16,
+    delta: 32,
     eloBefore: 500,
-    eloAfter: 516,
+    eloAfter: 532,
   })
 
   // The first three teams, a winner outside 0/1 and all-random teams are invalid.
@@ -481,18 +482,38 @@ test('matches tune elo, replay edits, log manual ratings and stay private', asyn
     input: { ...body, winner: 1 },
   })
   expect(edited.status).toBe(200)
-  expect(await eloOf('Ada')).toBe(484)
-  expect(await eloOf('Cy')).toBe(516)
+  expect(await eloOf('Ada')).toBe(468)
+  expect(await eloOf('Cy')).toBe(532)
 
-  // K applies to the whole history.
+  // K is forward-only: changing it never replays old matches.
   expect((await call('/api/settings', 'frank', 'PUT', { kFactor: 7 })).status).toBe(400)
   const tuned = await call('/api/settings', 'frank', 'PUT', { kFactor: 8 })
   expect(tuned.status).toBe(200)
   expect((await (await call('/api/settings', 'frank')).json()) as { kFactor: number }).toEqual(
     { kFactor: 8 },
   )
-  expect(await eloOf('Ada')).toBe(496)
-  expect(await eloOf('Cy')).toBe(504)
+  expect(await eloOf('Ada')).toBe(468)
+  expect(await eloOf('Cy')).toBe(532)
+
+  // Editing keeps the K the match was rated with, not the new setting.
+  expect(
+    (
+      await call(`/api/matches/${matchId}`, 'frank', 'PATCH', {
+        input: { ...body, winner: 0 },
+      })
+    ).status,
+  ).toBe(200)
+  expect(await eloOf('Ada')).toBe(532)
+  expect(await eloOf('Cy')).toBe(468)
+  expect(
+    (
+      await call(`/api/matches/${matchId}`, 'frank', 'PATCH', {
+        input: { ...body, winner: 1 },
+      })
+    ).status,
+  ).toBe(200)
+  expect(await eloOf('Ada')).toBe(468)
+  expect(await eloOf('Cy')).toBe(532)
 
   // A manual rating lands in the same log and survives the match's deletion.
   const adjusted = await call(`/api/players/${ada.id}/elo`, 'frank', 'POST', {
@@ -526,6 +547,79 @@ test('matches tune elo, replay edits, log manual ratings and stay private', asyn
   const strangers = (await (await call('/api/matches', 'gina')).json()) as Logged
   expect(strangers.events).toHaveLength(0)
   expect((await call(`/api/matches/${matchId}`, 'gina', 'DELETE')).status).toBe(404)
+})
+
+test('a match can have more than two teams', async () => {
+  type RosterPlayer = { id: string; name: string; elo: number }
+  type Logged = {
+    events: {
+      id: string
+      winner?: number
+      teams?: { players: { name: string; delta: number }[] }[]
+    }[]
+  }
+  const created = await call('/api/players', 'iris', 'POST', {
+    players: [
+      { name: 'Ana', skill: 5 },
+      { name: 'Ben', skill: 5 },
+      { name: 'Cal', skill: 5 },
+    ],
+  })
+  const roster = ((await created.json()) as { players: RosterPlayer[] }).players
+  const byName = new Map(roster.map((player) => [player.name, player]))
+  const team = (name: string) => ({
+    players: [{ id: byName.get(name)!.id, name, damage: 100, tracked: true }],
+  })
+  const body = {
+    label: 'Three way',
+    winner: 2,
+    teams: [team('Ana'), team('Ben'), team('Cal')],
+  }
+  expect((await call('/api/matches', 'iris', 'POST', body)).status).toBe(201)
+
+  const listed = async () =>
+    (await (await call('/api/matches', 'iris')).json()) as Logged
+  const eloOf = async (name: string) =>
+    ((await (await call('/api/players', 'iris')).json()) as {
+      players: RosterPlayer[]
+    }).players.find((player) => player.name === name)!.elo
+
+  let log = await listed()
+  expect(log.events).toHaveLength(1)
+  expect(log.events[0]!.winner).toBe(2)
+  expect(log.events[0]!.teams).toHaveLength(3)
+  expect(log.events[0]!.teams![0]!.players[0]!.delta).toBe(-21)
+  expect(log.events[0]!.teams![2]!.players[0]!.delta).toBe(43)
+  expect(await eloOf('Ana')).toBe(479)
+  expect(await eloOf('Cal')).toBe(543)
+
+  // Editing the winner of a three-team match replays the whole field.
+  const matchId = log.events[0]!.id
+  const edited = await call(`/api/matches/${matchId}`, 'iris', 'PATCH', {
+    input: { ...body, winner: 0 },
+  })
+  expect(edited.status).toBe(200)
+  expect(await eloOf('Ana')).toBe(543)
+  expect(await eloOf('Cal')).toBe(479)
+
+  // A winner past the last team, and more teams than the app supports, are invalid.
+  expect((await call('/api/matches', 'iris', 'POST', { ...body, winner: 3 })).status).toBe(
+    400,
+  )
+  const nineTeams = [
+    team('Ana'),
+    ...Array.from({ length: 8 }, (_entry, index) => ({
+      players: [
+        { id: `r${index}`, name: `Random ${index + 1}`, damage: 100, tracked: false },
+      ],
+    })),
+  ]
+  expect(
+    (await call('/api/matches', 'iris', 'POST', { ...body, teams: nineTeams })).status,
+  ).toBe(400)
+
+  log = await listed()
+  expect(log.events).toHaveLength(1)
 })
 
 test('a match can be reordered within the log', async () => {

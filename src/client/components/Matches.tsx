@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   MAX_DAMAGE,
   MAX_MATCH_PLAYERS,
+  MAX_MATCH_TEAMS,
   MIN_K_FACTOR,
   MAX_K_FACTOR,
   type MatchEventView,
@@ -9,6 +10,11 @@ import {
   type RatingEventView,
 } from '../../shared/elo'
 import type { Player } from '../../shared/types'
+import {
+  rematchDraft,
+  type RematchPlayer as DraftPlayer,
+  type RematchTeam as DraftTeam,
+} from '../rematch'
 
 type Props = {
   players: Player[]
@@ -21,17 +27,11 @@ type Props = {
   onKFactor: (kFactor: number) => Promise<void>
 }
 
-type DraftPlayer = {
-  key: string
-  id: string
-  name: string
-  tracked: boolean
-  damage: string
-}
+const emptyTeams = (): DraftTeam[] => [[], []]
 
-type DraftTeam = DraftPlayer[]
-
-const emptyTeams = (): [DraftTeam, DraftTeam] => [[], []]
+/** Copies the outer array too, so adding or removing a team is a new value. */
+const cloneTeams = (teams: DraftTeam[]): DraftTeam[] =>
+  teams.map((team) => [...team])
 
 const formatWhen = (timestamp: number) =>
   new Date(timestamp).toLocaleString(undefined, {
@@ -54,12 +54,13 @@ export function Matches({
   onKFactor,
 }: Props) {
   const [label, setLabel] = useState('')
-  const [teams, setTeams] = useState<[DraftTeam, DraftTeam]>(emptyTeams)
+  const [teams, setTeams] = useState<DraftTeam[]>(emptyTeams)
   const [winner, setWinner] = useState(0)
   const [editing, setEditing] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [kDraft, setKDraft] = useState(String(kFactor))
+  const formRef = useRef<HTMLFormElement>(null)
 
   useEffect(() => setKDraft(String(kFactor)), [kFactor])
 
@@ -78,6 +79,25 @@ export function Matches({
     setError('')
   }
 
+  const startRematch = (event: MatchEventView) => {
+    const result = rematchDraft(event, players)
+    if ('error' in result) {
+      setError(result.error)
+      return
+    }
+    setEditing(null)
+    setLabel(result.draft.label)
+    setTeams(result.draft.teams)
+    setWinner(result.draft.winner)
+    setError('')
+    window.requestAnimationFrame(() => {
+      formRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      formRef.current
+        ?.querySelector<HTMLInputElement>('.damage-input')
+        ?.focus()
+    })
+  }
+
   const startEdit = (event: MatchEventView) => {
     setEditing(event.id)
     setLabel(event.label)
@@ -91,7 +111,7 @@ export function Matches({
           tracked: player.tracked,
           damage: String(player.damage),
         })),
-      ) as [DraftTeam, DraftTeam],
+      ),
     )
     setError('')
   }
@@ -100,9 +120,9 @@ export function Matches({
     const player = players.find((entry) => entry.id === id)
     if (!player) return
     setTeams((previous) => {
-      const next: [DraftTeam, DraftTeam] = [[...previous[0]], [...previous[1]]]
-      if (next[team].length >= MAX_MATCH_PLAYERS) return previous
-      next[team].push({
+      const next = cloneTeams(previous)
+      if (next[team]!.length >= MAX_MATCH_PLAYERS) return previous
+      next[team]!.push({
         key: crypto.randomUUID(),
         id: player.id,
         name: player.name,
@@ -115,11 +135,11 @@ export function Matches({
 
   const addRandom = (team: number) => {
     setTeams((previous) => {
-      const next: [DraftTeam, DraftTeam] = [[...previous[0]], [...previous[1]]]
-      if (next[team].length >= MAX_MATCH_PLAYERS) return previous
-      const taken = next[team].filter((entry) => !entry.tracked).length + 1
+      const next = cloneTeams(previous)
+      if (next[team]!.length >= MAX_MATCH_PLAYERS) return previous
+      const taken = next[team]!.filter((entry) => !entry.tracked).length + 1
       const key = crypto.randomUUID()
-      next[team].push({
+      next[team]!.push({
         key,
         id: key,
         name: `Random ${taken}`,
@@ -132,8 +152,8 @@ export function Matches({
 
   const updateDamage = (team: number, key: string, damage: string) => {
     setTeams((previous) => {
-      const next: [DraftTeam, DraftTeam] = [[...previous[0]], [...previous[1]]]
-      next[team] = next[team].map((player) =>
+      const next = cloneTeams(previous)
+      next[team] = next[team]!.map((player) =>
         player.key === key ? { ...player, damage } : player,
       )
       return next
@@ -142,9 +162,27 @@ export function Matches({
 
   const remove = (team: number, key: string) => {
     setTeams((previous) => {
-      const next: [DraftTeam, DraftTeam] = [[...previous[0]], [...previous[1]]]
-      next[team] = next[team].filter((player) => player.key !== key)
+      const next = cloneTeams(previous)
+      next[team] = next[team]!.filter((player) => player.key !== key)
       return next
+    })
+  }
+
+  const addTeam = () => {
+    setTeams((previous) =>
+      previous.length >= MAX_MATCH_TEAMS ? previous : [...previous, []],
+    )
+  }
+
+  const removeTeam = (team: number) => {
+    setTeams((previous) =>
+      previous.length <= 2
+        ? previous
+        : previous.filter((_entry, index) => index !== team),
+    )
+    setWinner((previous) => {
+      if (previous === team) return 0
+      return previous > team ? previous - 1 : previous
     })
   }
 
@@ -247,7 +285,9 @@ export function Matches({
         </div>
         {remote && (
           <div className="k-control">
-            <label htmlFor="k-factor">K</label>
+            <label htmlFor="k-factor" title="Past ratings stay frozen">
+              K for new matches
+            </label>
             <input
               id="k-factor"
               className="k-input"
@@ -271,7 +311,7 @@ export function Matches({
           this device still work.
         </p>
       ) : (
-        <form className="match-form" onSubmit={save}>
+        <form className="match-form" onSubmit={save} ref={formRef}>
           <div className="match-form-head">
             <input
               className="input"
@@ -290,7 +330,19 @@ export function Matches({
             {teams.map((team, teamIndex) => (
               <div className="match-team" key={teamIndex}>
                 <div className="match-team-head">
-                  <span className="match-team-name">Team {teamIndex + 1}</span>
+                  <div className="match-team-actions">
+                    <span className="match-team-name">Team {teamIndex + 1}</span>
+                    {teams.length > 2 && (
+                      <button
+                        type="button"
+                        className="icon-button"
+                        aria-label={`Remove team ${teamIndex + 1}`}
+                        onClick={() => removeTeam(teamIndex)}
+                      >
+                        ×
+                      </button>
+                    )}
+                  </div>
                   <label className="winner-choice">
                     <input
                       type="radio"
@@ -359,6 +411,17 @@ export function Matches({
             ))}
           </div>
 
+          <div className="match-teams-foot">
+            <button
+              type="button"
+              className="quiet"
+              disabled={teams.length >= MAX_MATCH_TEAMS || saving}
+              onClick={addTeam}
+            >
+              + Team
+            </button>
+          </div>
+
           {error && (
             <p role="alert" className="error">
               {error}
@@ -405,6 +468,12 @@ export function Matches({
                 </li>
               )
             }
+            const rematchable = event.teams.every((team) =>
+              team.players.every(
+                (player) =>
+                  !player.tracked || players.some((entry) => entry.id === player.id),
+              ),
+            )
             return (
               <li className="match-row" key={event.id}>
                 <details>
@@ -462,6 +531,19 @@ export function Matches({
                         onClick={() => startEdit(event)}
                       >
                         Edit
+                      </button>
+                      <button
+                        type="button"
+                        className="quiet"
+                        disabled={!rematchable}
+                        title={
+                          rematchable
+                            ? 'Set up the same line-ups for a new match'
+                            : 'A player from this match is no longer on the roster'
+                        }
+                        onClick={() => startRematch(event)}
+                      >
+                        Rematch
                       </button>
                       <button
                         type="button"

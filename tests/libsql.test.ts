@@ -259,14 +259,16 @@ describe('libSQL adapter', () => {
       }).players
       return list.find((player) => player.name === name)!.elo
     }
-    expect(await eloOf('Ada')).toBe(516)
-    expect(await eloOf('Bo')).toBe(484)
+    // Both players are provisional, so the first match uses K 64.
+    expect(await eloOf('Ada')).toBe(532)
+    expect(await eloOf('Bo')).toBe(468)
 
     const log = (await (await call(env, '/api/matches', 'zoe')).json()) as {
       events: { id: string; teams: { players: { delta: number }[] }[] }[]
     }
-    expect(log.events[0]!.teams[0]!.players[0]!.delta).toBe(16)
+    expect(log.events[0]!.teams[0]!.players[0]!.delta).toBe(32)
 
+    // Changing K affects future matches only; the stored duel does not move.
     await call(env, '/api/settings', 'zoe', 'PUT', { kFactor: 64 })
     expect(await eloOf('Ada')).toBe(532)
     expect(await eloOf('Bo')).toBe(468)
@@ -320,5 +322,100 @@ describe('libSQL adapter', () => {
     })
     expect(body.rounds[0]!.config.teams[0]!.sum).toBe(900)
     expect(body.rounds[0]!.config.teams[0]!.players[0]!.elo).toBe(900)
+  })
+
+  test('legacy events stay identical through a K change, an edit and a new v2 match', async () => {
+    const executor = bunSqliteExecutor(':memory:')
+    const db = databaseFromExecutor(executor)
+    await ensureSchema(db)
+    const eventId = 'legacy-match'
+    const payload = {
+      label: 'Legacy',
+      winner: 0,
+      teams: [
+        { players: [{ id: 'a', name: 'Ada', damage: 100, tracked: true }] },
+        { players: [{ id: 'b', name: 'Bo', damage: 100, tracked: true }] },
+      ],
+    }
+    for (const [id, name, elo] of [
+      ['a', 'Ada', 516],
+      ['b', 'Bo', 484],
+    ] as const)
+      executor.raw.run(
+        `INSERT INTO players (id, owner_sub, name, skill, elo, base_elo, tags, sitting_out, created_at, updated_at)
+         VALUES (?, 'legacy', ?, 5, ?, 500, '[]', 0, 1, 1)`,
+        [id, name, elo],
+      )
+    executor.raw.run(
+      `INSERT INTO rating_events (id, owner_sub, position, kind, payload, created_at, updated_at)
+       VALUES (?, 'legacy', 0, 'match', ?, 10, 10)`,
+      [eventId, JSON.stringify(payload)],
+    )
+    executor.raw.run(
+      `INSERT INTO rating_results (event_id, owner_sub, slot, player_id, name, elo_before, elo_after, delta)
+       VALUES (?, 'legacy', '0:0', 'a', 'Ada', 500, 516, 16), (?, 'legacy', '1:0', 'b', 'Bo', 500, 484, -16)`,
+      [eventId, eventId],
+    )
+    executor.raw.run(
+      `INSERT INTO settings (owner_sub, k_factor, updated_at) VALUES ('legacy', 32, 10)`,
+    )
+    const env = makeEnv(db)
+    const players = async () =>
+      ((await (await call(env, '/api/players', 'legacy')).json()) as {
+        players: { id: string; elo: number; updatedAt: number }[]
+      }).players
+    const results = async () =>
+      (
+        await db
+          .prepare(
+            'SELECT event_id, slot, player_id, elo_before, elo_after, delta FROM rating_results WHERE owner_sub = ? AND event_id = ? ORDER BY slot',
+          )
+          .bind('legacy', eventId)
+          .all()
+      ).results
+
+    const startPlayers = await players()
+    const startResults = await results()
+
+    // A no-op edit replays the legacy event with the K that produced it.
+    const edited = await call(env, `/api/matches/${eventId}`, 'legacy', 'PATCH', {
+      input: payload,
+    })
+    expect(edited.status).toBe(200)
+    expect(await players()).toEqual(startPlayers)
+    expect(await results()).toEqual(startResults)
+    const legacyRow = await db
+      .prepare('SELECT payload FROM rating_events WHERE id = ?')
+      .bind(eventId)
+      .first<{ payload: string }>()
+    expect(JSON.parse(legacyRow!.payload)).not.toHaveProperty('formula')
+
+    // Changing K freezes the legacy K and leaves every stored number alone.
+    expect((await call(env, '/api/settings', 'legacy', 'PUT', { kFactor: 64 })).status).toBe(
+      200,
+    )
+    expect(await players()).toEqual(startPlayers)
+    expect(await results()).toEqual(startResults)
+    expect(
+      await db
+        .prepare('SELECT legacy_k FROM rating_meta WHERE owner_sub = ?')
+        .bind('legacy')
+        .first(),
+    ).toEqual({ legacy_k: 32 })
+
+    // A new match is stamped v2 with the new K; the legacy event still reads
+    // with its frozen K and its stored results are untouched.
+    expect(
+      (await call(env, '/api/matches', 'legacy', 'POST', { ...payload, label: 'New' }))
+        .status,
+    ).toBe(201)
+    const newRow = await db
+      .prepare(
+        'SELECT payload FROM rating_events WHERE owner_sub = ? AND position = 1',
+      )
+      .bind('legacy')
+      .first<{ payload: string }>()
+    expect(JSON.parse(newRow!.payload)).toMatchObject({ formula: 2, k: 64 })
+    expect(await results()).toEqual(startResults)
   })
 })

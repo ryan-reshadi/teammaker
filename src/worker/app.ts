@@ -7,6 +7,8 @@ import {
   MAX_DAMAGE,
   MAX_EVENTS,
   MAX_MATCH_PLAYERS,
+  MAX_MATCH_TEAMS,
+  RATING_FORMULA,
   clampElo,
   isKFactor,
   replay,
@@ -45,6 +47,8 @@ const MAX_BATCH = 50
 const MAX_ROUNDS = 100
 const MAX_LABEL = 60
 const MAX_REASON = 80
+const MATCH_ERROR =
+  'A match needs two to eight teams, damage for every player, a winner and at least one player from your roster.'
 
 const readName = (value: unknown): string | null => {
   if (typeof value !== 'string') return null
@@ -114,8 +118,12 @@ function readMatchInput(value: unknown): MatchInput | null {
         ? record.label.trim()
         : null
   if (label === null) return null
-  if (!Array.isArray(record.teams) || record.teams.length !== 2) return null
-  if (record.winner !== 0 && record.winner !== 1) return null
+  if (
+    !Array.isArray(record.teams) ||
+    record.teams.length < 2 ||
+    record.teams.length > MAX_MATCH_TEAMS
+  )
+    return null
 
   const seen = new Set<string>()
   const teams: MatchTeamInput[] = []
@@ -177,6 +185,13 @@ function readMatchInput(value: unknown): MatchInput | null {
     teams.push({ players })
   }
   if (tracked === 0 || totalDamage === 0) return null
+  if (
+    typeof record.winner !== 'number' ||
+    !Number.isInteger(record.winner) ||
+    record.winner < 0 ||
+    record.winner >= teams.length
+  )
+    return null
   return { label, teams, winner: record.winner }
 }
 
@@ -319,6 +334,47 @@ async function getKFactor(db: Database, owner: string): Promise<number> {
   return row && isKFactor(row.k_factor) ? row.k_factor : DEFAULT_K_FACTOR
 }
 
+/**
+ * The K that produced ratings written before versioning. Until a K change or
+ * the first v2 match pins it, the current setting is still exactly that K: the
+ * old code replayed every event with it.
+ */
+async function getLegacyK(
+  db: Database,
+  owner: string,
+  currentK: number,
+): Promise<number> {
+  const row = await db
+    .prepare('SELECT legacy_k FROM rating_meta WHERE owner_sub = ?')
+    .bind(owner)
+    .first<{ legacy_k: number }>()
+  return row && isKFactor(row.legacy_k) ? row.legacy_k : currentK
+}
+
+/** One additive row; it never rewrites an existing event or result. */
+async function pinLegacyK(
+  db: Database,
+  owner: string,
+  legacyK: number,
+): Promise<void> {
+  await db
+    .prepare(
+      'INSERT INTO rating_meta (owner_sub, legacy_k, created_at) VALUES (?, ?, ?) ON CONFLICT(owner_sub) DO NOTHING',
+    )
+    .bind(owner, legacyK, Date.now())
+    .run()
+}
+
+async function loadPlayers(db: Database, owner: string): Promise<Player[]> {
+  const result = await db
+    .prepare(
+      'SELECT id, name, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE owner_sub = ? ORDER BY created_at ASC, id ASC',
+    )
+    .bind(owner)
+    .all<PlayerRow>()
+  return result.results.map(mapPlayer)
+}
+
 async function nextPosition(db: Database, owner: string): Promise<number> {
   const row = await db
     .prepare(
@@ -364,12 +420,13 @@ async function recompute(
     .all<BaseRow>()
   const events = await loadEvents(db, owner)
   const kFactor = await getKFactor(db, owner)
+  const legacyK = await getLegacyK(db, owner, kFactor)
   const roster: MatchRoster[] = players.results.map((player) => ({
     id: player.id,
     name: player.name,
     baseElo: player.base_elo,
   }))
-  const { elos, outcomes }: ReplayResult = replay(events, roster, kFactor)
+  const { elos, outcomes }: ReplayResult = replay(events, roster, kFactor, legacyK)
 
   const statements: Statement[] = []
   for (const player of players.results) {
@@ -534,13 +591,13 @@ export function createApp(authenticate: Authenticate = currentUser) {
       await db.prepare('SELECT 1 AS ok').first<{ ok: number }>()
       const tables = await db
         .prepare(
-          "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('players', 'rounds', 'rating_events', 'rating_results', 'settings')",
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('players', 'rounds', 'rating_events', 'rating_results', 'settings', 'rating_meta')",
         )
         .all<{ name: string }>()
       return c.json({
         ok: true,
         database: 'ok',
-        schema: tables.results.length === 5 ? 'ready' : 'missing',
+        schema: tables.results.length === 6 ? 'ready' : 'missing',
       })
     } catch (error) {
       // The driver's message can name the host; it is not a secret, but keep it
@@ -597,16 +654,9 @@ export function createApp(authenticate: Authenticate = currentUser) {
     await next()
   })
 
-  app.get('/api/players', async (c) => {
-    const result = await c
-      .get('db')
-      .prepare(
-        'SELECT id, name, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE owner_sub = ? ORDER BY created_at ASC, id ASC',
-      )
-      .bind(c.get('user').sub)
-      .all<PlayerRow>()
-    return c.json({ players: result.results.map(mapPlayer) })
-  })
+  app.get('/api/players', async (c) =>
+    c.json({ players: await loadPlayers(c.get('db'), c.get('user').sub) }),
+  )
 
   app.post('/api/players', async (c) => {
     const body: unknown = await c.req.json().catch(() => null)
@@ -902,8 +952,7 @@ export function createApp(authenticate: Authenticate = currentUser) {
     if (!input)
       return c.json(
         {
-          error:
-            'A match needs two teams, damage for every player, a winner and at least one player from your roster.',
+          error: MATCH_ERROR,
         },
         400,
       )
@@ -926,11 +975,20 @@ export function createApp(authenticate: Authenticate = currentUser) {
     const position = await nextPosition(db, owner)
     const id = crypto.randomUUID()
     const now = Date.now()
+    const kFactor = await getKFactor(db, owner)
+    // Freeze the K that produced all older history before this event can use a
+    // different one. The row is additive; no event or result is rewritten.
+    await pinLegacyK(db, owner, kFactor)
+    const payload: MatchInput = {
+      ...input,
+      formula: RATING_FORMULA,
+      k: kFactor,
+    }
     await db
       .prepare(
         'INSERT INTO rating_events (id, owner_sub, position, kind, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
       )
-      .bind(id, owner, position, 'match', JSON.stringify(input), now, now)
+      .bind(id, owner, position, 'match', JSON.stringify(payload), now, now)
       .run()
     const players = await recompute(db, owner, position)
     return c.json({ match: { id, position }, players }, 201)
@@ -963,10 +1021,7 @@ export function createApp(authenticate: Authenticate = currentUser) {
       const input = readMatchInput(patch.input)
       if (!input)
         return c.json(
-          {
-            error:
-              'A match needs two teams, damage for every player, a winner and at least one player from your roster.',
-          },
+          { error: MATCH_ERROR },
           400,
         )
       const tracked = input.teams.flatMap((team) =>
@@ -974,11 +1029,24 @@ export function createApp(authenticate: Authenticate = currentUser) {
       )
       if (!(await trackedIdsExist(db, owner, tracked)))
         return c.json({ error: 'Those players are no longer on your roster.' }, 400)
+      // Editing never upgrades or re-rates an event: a legacy match stays
+      // legacy (and keeps its frozen K), and a v2 match keeps its recorded K.
+      let marker: { formula?: 2; k?: number } = {}
+      try {
+        const existing = JSON.parse(row.payload) as MatchInput
+        if (existing.formula === 2) {
+          marker = { formula: 2 }
+          if (isKFactor(existing.k)) marker.k = existing.k
+        }
+      } catch {
+        // A malformed legacy payload is left unmarked, as it was.
+      }
+      const nextInput: MatchInput = { ...input, ...marker }
       await db
         .prepare(
           'UPDATE rating_events SET payload = ?, updated_at = ? WHERE id = ? AND owner_sub = ?',
         )
-        .bind(JSON.stringify(input), Date.now(), id, owner)
+        .bind(JSON.stringify(nextInput), Date.now(), id, owner)
         .run()
     }
 
@@ -1046,14 +1114,16 @@ export function createApp(authenticate: Authenticate = currentUser) {
       return c.json({ error: 'K must be a whole number from 8 to 64.' }, 400)
     const db = c.get('db')
     const owner = c.get('user').sub
+    // Forward-only: freeze the K that produced existing history, then change
+    // the speed of future matches. No replay, no rewritten ratings.
+    await pinLegacyK(db, owner, await getKFactor(db, owner))
     await db
       .prepare(
         'INSERT INTO settings (owner_sub, k_factor, updated_at) VALUES (?, ?, ?) ON CONFLICT(owner_sub) DO UPDATE SET k_factor = excluded.k_factor, updated_at = excluded.updated_at',
       )
       .bind(owner, kFactor, Date.now())
       .run()
-    // K applies to the whole history: tuning it is the point.
-    const players = await recompute(db, owner, 0)
+    const players = await loadPlayers(db, owner)
     return c.json({ kFactor, players })
   })
 

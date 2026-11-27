@@ -22,7 +22,7 @@ export function History({ rounds, onRemove }: Props) {
           <h2 id="history-title">Saved rounds</h2>
           <p className="sub">
             {rounds.length
-              ? `${rounds.length} kept · sit-out counts come from here`
+              ? `${rounds.length} kept · snapshots of saved teams`
               : 'Nothing saved yet'}
           </p>
         </div>
@@ -30,8 +30,8 @@ export function History({ rounds, onRemove }: Props) {
 
       {rounds.length === 0 ? (
         <p className="empty-state">
-          Save a round you like and it lands here. It also keeps track of who has
-          already sat out, so the bench stays fair.
+          Save a round you like and it lands here as a snapshot of the teams and
+          the bench.
         </p>
       ) : (
         <ul className="round-list">

@@ -3,10 +3,13 @@ import {
   DEFAULT_K_FACTOR,
   ELO_MAX,
   ELO_MIN,
+  PROVISIONAL_MATCHES,
   clampElo,
   eloFromSkill,
   estimateRandomElo,
+  expectationsFromStrengths,
   isKFactor,
+  provisionalK,
   rateMatch,
   replay,
   skillFromElo,
@@ -260,6 +263,93 @@ describe('a single match', () => {
   })
 })
 
+describe('multi-team matches', () => {
+  test('a three-team match shares one win between the field and stays zero-sum', () => {
+    const { input, ratings } = match([
+      [{ elo: 500, damage: 100, name: 'a' }],
+      [{ elo: 500, damage: 100, name: 'b' }],
+      [{ elo: 500, damage: 100, name: 'c' }],
+    ])
+    const { result, updates } = rateMatch(input, ratings, 32)
+    expect(result.expected).toHaveLength(3)
+    for (const value of result.expected) expect(value).toBeCloseTo(1 / 3, 5)
+    expect(updates.get('a')).toBe(521)
+    expect(updates.get('b')).toBe(489)
+    expect(updates.get('c')).toBe(489)
+    // A win is worth more against a bigger field, and the losses pay for it.
+    const total = [...updates.values()].reduce((sum, elo) => sum + elo, 0)
+    expect(Math.abs(total - 1500)).toBeLessThanOrEqual(1)
+  })
+
+  test('damage is normalized by the players on the other teams', () => {
+    // The solo player faces four enemies, so 200 damage is 50 a head; the pairs
+    // face three enemies each, so their 150 is also 50 a head. Everyone has the
+    // same performance share and only the result and the rating sums move them.
+    const { input, ratings } = match(
+      [
+        [{ elo: 500, damage: 200, name: 'a' }],
+        [
+          { elo: 500, damage: 150, name: 'b' },
+          { elo: 500, damage: 150, name: 'c' },
+        ],
+        [
+          { elo: 500, damage: 150, name: 'd' },
+          { elo: 500, damage: 150, name: 'e' },
+        ],
+      ],
+      0,
+    )
+    const { result } = rateMatch(input, ratings, 32)
+    // One player against two pairs is a heavy underdog, so the win pays well.
+    expect(result.expected[0]).toBeCloseTo(0.0355, 3)
+    for (const team of result.teams)
+      expect(new Set(team.players.map((player) => player.delta)).size).toBe(1)
+    expect(result.teams[0]!.players[0]!.delta).toBe(31)
+    expect(result.teams[1]!.players[0]!.delta).toBe(-15)
+
+    // The same solo player's share is set by damage per enemy, not raw damage:
+    // 50 over four enemies is a quarter of the rate and earns a smaller swing.
+    const raw = rateMatch(
+      { ...input, teams: [{ players: [{ ...input.teams[0]!.players[0]!, damage: 50 }] }, ...input.teams.slice(1)] },
+      ratings,
+      32,
+    )
+    expect(raw.result.teams[0]!.players[0]!.delta).toBeLessThan(
+      result.teams[0]!.players[0]!.delta,
+    )
+  })
+
+  test('rejects fewer than two or more than eight teams and a winner out of range', () => {
+    const solo = match([[{ elo: 500, damage: 100 }]])
+    expect(rateMatch(solo.input, solo.ratings, 32).result.teams).toHaveLength(0)
+    const crowd = match(Array.from({ length: 9 }, () => [{ elo: 500, damage: 100 }]))
+    expect(rateMatch(crowd.input, crowd.ratings, 32).result.teams).toHaveLength(0)
+    const three = match([
+      [{ elo: 500, damage: 100 }],
+      [{ elo: 500, damage: 100 }],
+      [{ elo: 500, damage: 100 }],
+    ])
+    expect(
+      rateMatch({ ...three.input, winner: 3 }, three.ratings, 32).result.teams,
+    ).toHaveLength(0)
+  })
+
+  test('eight teams each get an expectation and a rating change', () => {
+    const { input, ratings } = match(
+      Array.from({ length: 8 }, (_entry, index) => [
+        { elo: 500, damage: 100, name: `t${index}` },
+      ]),
+      5,
+    )
+    const { result, updates } = rateMatch(input, ratings, 32)
+    expect(result.teams).toHaveLength(8)
+    for (const value of result.expected) expect(value).toBeCloseTo(1 / 8, 5)
+    expect(updates.get('t5')).toBeGreaterThan(500)
+    for (let index = 0; index < 8; index++)
+      if (index !== 5) expect(updates.get(`t${index}`)).toBeLessThan(500)
+  })
+})
+
 describe('replay', () => {
   const roster = [
     { id: 'a', name: 'Ada', baseElo: 700 },
@@ -370,5 +460,256 @@ describe('replay', () => {
     const high = replay(events, roster, 64)
     expect(low.elos.get('a')).toBe(704)
     expect(high.elos.get('a')).toBe(732)
+  })
+})
+
+describe('win expectations', () => {
+  test('the 400-point divisor pins the calibration anchors', () => {
+    const favourite = (gap: number) =>
+      expectationsFromStrengths([500, 500 + gap])[1]!
+    expect(expectationsFromStrengths([500, 500])[0]).toBeCloseTo(0.5, 6)
+    expect(favourite(100)).toBeCloseTo(0.6401, 3)
+    expect(favourite(200)).toBeCloseTo(0.7597, 3)
+    expect(favourite(300)).toBeCloseTo(0.8490, 3)
+    expect(favourite(400)).toBeCloseTo(0.9091, 3)
+    expect(favourite(500)).toBeCloseTo(0.9468, 3)
+    expect(expectationsFromStrengths([600, 500])[0]).toBeCloseTo(
+      1 - expectationsFromStrengths([500, 600])[0]!,
+      6,
+    )
+  })
+
+  test('multi-team shares still sum to one', () => {
+    const even = expectationsFromStrengths([1500, 1500, 1500])
+    for (const share of even) expect(share).toBeCloseTo(1 / 3, 6)
+    const field = expectationsFromStrengths([1800, 1500, 1200])
+    expect(field.reduce((sum, share) => sum + share, 0)).toBeCloseTo(1, 8)
+    expect(field[0]!).toBeGreaterThan(field[1]!)
+    expect(field[1]!).toBeGreaterThan(field[2]!)
+  })
+})
+
+describe('provisional K and formula versions', () => {
+  const roster = [
+    { id: 'a', name: 'Ada', baseElo: 700 },
+    { id: 'b', name: 'Bo', baseElo: 700 },
+  ]
+  const oneVone = (
+    id: string,
+    position: number,
+    winner: number,
+  ): RatingEvent => ({
+    id,
+    position,
+    kind: 'match',
+    createdAt: position,
+    updatedAt: position,
+    payload: {
+      label: id,
+      winner,
+      teams: [
+        { players: [{ id: 'a', name: 'Ada', damage: 100, tracked: true }] },
+        { players: [{ id: 'b', name: 'Bo', damage: 100, tracked: true }] },
+      ],
+    },
+  })
+
+  test('double K for the first five matches, capped at the maximum', () => {
+    expect(PROVISIONAL_MATCHES).toBe(5)
+    expect(provisionalK(32, 0)).toBe(64)
+    expect(provisionalK(32, 4)).toBe(64)
+    expect(provisionalK(32, 5)).toBe(32)
+    expect(provisionalK(8, 0)).toBe(16)
+    expect(provisionalK(64, 0)).toBe(64)
+  })
+
+  test('v2 applies the per-player K, while v1 keeps the passed K', () => {
+    const { input, ratings } = match([
+      [{ elo: 500, damage: 100 }],
+      [{ elo: 500, damage: 100 }],
+    ])
+    const provisional = rateMatch(input, ratings, 32, { formula: 2 })
+    expect(provisional.result.teams[0]!.players[0]!.delta).toBe(32)
+    const settled = rateMatch(input, ratings, 32, {
+      formula: 2,
+      priorMatches: new Map([['p0', 5], ['p1', 5]]),
+    })
+    expect(settled.result.teams[0]!.players[0]!.delta).toBe(16)
+    const legacy = rateMatch(input, ratings, 32)
+    expect(legacy.result.teams[0]!.players[0]!.delta).toBe(16)
+  })
+
+  test('adjustments do not count as provisional matches', () => {
+    const adjust: RatingEvent = {
+      id: 'adjust',
+      position: 0,
+      kind: 'adjust',
+      createdAt: 0,
+      updatedAt: 0,
+      payload: { playerId: 'a', elo: 700, reason: 'test' },
+    }
+    const duel: RatingEvent = {
+      id: 'duel',
+      position: 1,
+      kind: 'match',
+      createdAt: 1,
+      updatedAt: 1,
+      payload: {
+        label: '',
+        winner: 0,
+        formula: 2,
+        k: 32,
+        teams: [
+          { players: [{ id: 'a', name: 'Ada', damage: 100, tracked: true }] },
+          { players: [{ id: 'b', name: 'Bo', damage: 100, tracked: true }] },
+        ],
+      },
+    }
+    const result = replay([adjust, duel], roster, 32, 32)
+    const outcome = result.outcomes.get('duel')
+    expect(outcome?.kind).toBe('match')
+    if (outcome?.kind === 'match')
+      expect(outcome.result.teams[0]!.players[0]!.delta).toBe(32)
+  })
+
+  test('the legacy replay fixture pins the pre-versioning deltas', () => {
+    const four = [
+      { id: 'a', name: 'Ada', baseElo: 500 },
+      { id: 'b', name: 'Bo', baseElo: 500 },
+      { id: 'c', name: 'Cy', baseElo: 500 },
+      { id: 'd', name: 'Di', baseElo: 500 },
+    ]
+    const twoTeam: RatingEvent = {
+      id: 'two-team',
+      position: 0,
+      kind: 'match',
+      createdAt: 0,
+      updatedAt: 0,
+      payload: {
+        label: 'Two-team fixture',
+        winner: 0,
+        teams: [
+          {
+            players: [
+              { id: 'a', name: 'Ada', damage: 100, tracked: true },
+              { id: 'b', name: 'Bo', damage: 100, tracked: true },
+            ],
+          },
+          {
+            players: [
+              { id: 'c', name: 'Cy', damage: 100, tracked: true },
+              { id: 'd', name: 'Di', damage: 100, tracked: true },
+            ],
+          },
+        ],
+      },
+    }
+    const duel = replay([twoTeam], four, 32)
+    expect([...duel.elos]).toEqual([
+      ['a', 516],
+      ['b', 516],
+      ['c', 484],
+      ['d', 484],
+    ])
+
+    const six = [
+      { id: 'a', name: 'Ada', baseElo: 500 },
+      { id: 'b', name: 'Bo', baseElo: 500 },
+      { id: 'c', name: 'Cy', baseElo: 500 },
+      { id: 'd', name: 'Di', baseElo: 500 },
+      { id: 'e', name: 'Eve', baseElo: 500 },
+      { id: 'f', name: 'Finn', baseElo: 500 },
+    ]
+    const threeTeam: RatingEvent = {
+      id: 'three-team',
+      position: 0,
+      kind: 'match',
+      createdAt: 0,
+      updatedAt: 0,
+      payload: {
+        label: 'Three-team fixture',
+        winner: 0,
+        teams: [
+          {
+            players: [
+              { id: 'a', name: 'Ada', damage: 100, tracked: true },
+              { id: 'b', name: 'Bo', damage: 100, tracked: true },
+            ],
+          },
+          {
+            players: [
+              { id: 'c', name: 'Cy', damage: 100, tracked: true },
+              { id: 'd', name: 'Di', damage: 100, tracked: true },
+            ],
+          },
+          {
+            players: [
+              { id: 'e', name: 'Eve', damage: 100, tracked: true },
+              { id: 'f', name: 'Finn', damage: 100, tracked: true },
+            ],
+          },
+        ],
+      },
+    }
+    const field = replay([threeTeam], six, 32)
+    expect([...field.elos]).toEqual([
+      ['a', 521],
+      ['b', 521],
+      ['c', 489],
+      ['d', 489],
+      ['e', 489],
+      ['f', 489],
+    ])
+  })
+
+  test('a legacy event is identical whatever the current K is', () => {
+    const legacy = oneVone('legacy', 0, 0)
+    const old = replay([legacy], roster, 8, 32)
+    const changed = replay([legacy], roster, 64, 32)
+    expect([...changed.elos]).toEqual([...old.elos])
+    expect(changed.outcomes.get('legacy')).toEqual(old.outcomes.get('legacy'))
+  })
+
+  test('appending a v2 match leaves the earlier v1 outcome untouched', () => {
+    const legacy = oneVone('legacy', 0, 0)
+    const next: RatingEvent = {
+      id: 'next',
+      position: 1,
+      kind: 'match',
+      createdAt: 1,
+      updatedAt: 1,
+      payload: {
+        label: 'next',
+        winner: 1,
+        formula: 2,
+        k: 32,
+        teams: [
+          { players: [{ id: 'a', name: 'Ada', damage: 100, tracked: true }] },
+          { players: [{ id: 'b', name: 'Bo', damage: 100, tracked: true }] },
+        ],
+      },
+    }
+    const old = replay([legacy], roster, 8, 32)
+    const combined = replay([legacy, next], roster, 8, 32)
+    expect(combined.outcomes.get('legacy')).toEqual(old.outcomes.get('legacy'))
+    // The v2 event starts from the legacy result, not from the creation elo.
+    const outcome = combined.outcomes.get('next')
+    expect(outcome?.kind).toBe('match')
+    if (outcome?.kind === 'match')
+      expect(outcome.result.teams[0]!.players[0]!.eloBefore).toBe(
+        old.elos.get('a')!,
+      )
+  })
+
+  test('a v2 event uses its own K after the provisional window', () => {
+    const { input, ratings } = match([
+      [{ elo: 700, damage: 100 }],
+      [{ elo: 700, damage: 100 }],
+    ])
+    const result = rateMatch(input, ratings, 8, {
+      formula: 2,
+      priorMatches: new Map([['p0', 5], ['p1', 5]]),
+    })
+    expect(result.result.teams[0]!.players[0]!.delta).toBe(4)
   })
 })

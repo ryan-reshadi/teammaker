@@ -13,9 +13,14 @@ export const ELO_PER_SKILL = 100
 export const DEFAULT_K_FACTOR = 32
 export const MIN_K_FACTOR = 8
 export const MAX_K_FACTOR = 64
+/** New events carry this marker and their own K; unmarked events are v1. */
+export const RATING_FORMULA = 2
+export const PROVISIONAL_MATCHES = 5
+export const PROVISIONAL_K_MULTIPLIER = 2
 /** The event log is a bookkeeping aid, not an archive; this bounds a replay. */
 export const MAX_EVENTS = 1000
 export const MAX_MATCH_PLAYERS = 10
+export const MAX_MATCH_TEAMS = 8
 export const MAX_DAMAGE = 100_000
 
 /** How much of a player's performance swing the update carries. */
@@ -45,6 +50,36 @@ export const isKFactor = (value: unknown): value is number =>
   value >= MIN_K_FACTOR &&
   value <= MAX_K_FACTOR
 
+/**
+ * A new player moves faster: the first few rated matches use double K, capped
+ * at the same maximum as the account setting. Adjustments never count.
+ */
+export function provisionalK(baseK: number, matchesPlayed: number): number {
+  const k = isKFactor(baseK) ? baseK : DEFAULT_K_FACTOR
+  return matchesPlayed < PROVISIONAL_MATCHES
+    ? Math.min(MAX_K_FACTOR, k * PROVISIONAL_K_MULTIPLIER)
+    : k
+}
+
+/**
+ * Win shares from weighted team strengths. Two teams reduce to ordinary Elo;
+ * with more teams every pair is measured and the expectations share out one
+ * win, so the field stays zero-sum.
+ */
+export function expectationsFromStrengths(strengths: number[]): number[] {
+  if (strengths.length === 0) return []
+  if (strengths.length === 1) return [1]
+  const versus = strengths.map((value, index) =>
+    strengths.map((other, otherIndex) =>
+      otherIndex === index ? 0 : 1 / (1 + 10 ** ((other - value) / 400)),
+    ),
+  )
+  const totals = versus.map((row) => row.reduce((sum, value) => sum + value, 0))
+  const total = totals.reduce((sum, value) => sum + value, 0)
+  if (!(total > 0)) return strengths.map(() => 1 / strengths.length)
+  return totals.map((value) => value / total)
+}
+
 export type MatchPlayerInput = {
   /** A roster id for a tracked player, or a client key for a random. */
   id: string
@@ -57,10 +92,17 @@ export type MatchTeamInput = { players: MatchPlayerInput[] }
 
 export type MatchInput = {
   label: string
-  /** Two teams today; the shape leaves room for more. */
+  /** Two to `MAX_MATCH_TEAMS` teams, in display order. */
   teams: MatchTeamInput[]
   /** Index of the winning team. */
   winner: number
+  /**
+   * Server-stamped rating formula. Absent on every event written before
+   * versioning existed, which is how a replay knows to use the frozen legacy K.
+   */
+  formula?: 2
+  /** Server-stamped base K for this event. */
+  k?: number
 }
 
 export type MatchPlayerResult = {
@@ -195,26 +237,47 @@ export function estimateRandomElo(
 }
 
 /**
- * Rates one two-team match from the current ratings.
+ * Rates one match from the current ratings, for two to `MAX_MATCH_TEAMS` teams.
  *
  * The result term is ordinary Elo on the weighted rating sums, so a five-stack
- * is favoured over a four-stack. The performance term is centred on zero and
- * compares each player's share of the match's (size-normalized) damage with
- * the share their rating predicts, so a strong player on a losing team nets
- * close to nothing instead of the full loss.
+ * is favoured over a four-stack. With more than two teams each team is measured
+ * against every other team and the expectations are normalized to share out one
+ * win, so the field is zero-sum and a three-way lobby does not deflate ratings.
+ * The performance term is centred on zero and compares each player's share of
+ * the match's (size-normalized) damage with the share their rating predicts, so
+ * a strong player on a losing team nets close to nothing instead of the full
+ * loss.
  */
 export function rateMatch(
   input: MatchInput,
   ratings: ReadonlyMap<string, number>,
   kFactor: number,
+  options: {
+    formula?: 1 | 2
+    /** Tracked matches played before this event, for provisional K. */
+    priorMatches?: ReadonlyMap<string, number>
+  } = {},
 ): { result: MatchResult; updates: Map<string, number> } {
   const teams = input.teams
   const updates = new Map<string, number>()
-  if (teams.length !== 2 || teams.some((team) => team.players.length === 0))
+  const formula = options.formula ?? 1
+  const priorMatches = options.priorMatches
+  if (
+    teams.length < 2 ||
+    teams.length > MAX_MATCH_TEAMS ||
+    teams.some((team) => team.players.length === 0) ||
+    !Number.isInteger(input.winner) ||
+    input.winner < 0 ||
+    input.winner >= teams.length
+  )
     return { result: { teams: [], winner: input.winner, expected: [] }, updates }
 
   const sizes = teams.map((team) => team.players.length)
-  const enemiesFaced = [sizes[1]!, sizes[0]!]
+  // A player faces everyone outside their own team, so with two teams this is
+  // simply the other team's size.
+  const enemiesFaced = sizes.map((_size, index) =>
+    sizes.reduce((sum, size, other) => (other === index ? sum : sum + size), 0),
+  )
   const averageKnown = knownAverage(teams, ratings)
 
   const damagePerEnemy = teams.map((team, index) =>
@@ -253,10 +316,11 @@ export function rateMatch(
       0,
     ),
   )
-  const expected = [
-    1 / (1 + 10 ** ((strength[1]! - strength[0]!) / 400)),
-    1 / (1 + 10 ** ((strength[0]! - strength[1]!) / 400)),
-  ]
+  // Each team's head-to-head win chance against every other team, summed over
+  // the field and normalized so the expectations share out one win between
+  // them. For two teams the pair already sums to 1, which keeps the ordinary
+  // Elo expectation exactly.
+  const expected = expectationsFromStrengths(strength)
 
   const pool = teams.reduce(
     (sum, team, index) =>
@@ -294,8 +358,12 @@ export function rateMatch(
             ? Math.tanh(Math.log(actualShare / expectedShare) / PERFORMANCE_TAU)
             : -1
         const outcome = index === input.winner ? 1 : 0
+        const playerK =
+          formula === 2 && player.tracked
+            ? provisionalK(kFactor, priorMatches?.get(player.id) ?? 0)
+            : kFactor
         const delta = Math.round(
-          kFactor * (outcome - expected[index]! + PERFORMANCE_WEIGHT * performance),
+          playerK * (outcome - expected[index]! + PERFORMANCE_WEIGHT * performance),
         )
         const after = player.tracked ? clampElo(before + delta) : before
         if (player.tracked) updates.set(player.id, after)
@@ -324,10 +392,13 @@ export function replay(
   events: RatingEvent[],
   roster: MatchRoster[],
   kFactor: number,
+  /** The K that produced the stored ratings before versioning existed. */
+  legacyK = kFactor,
 ): ReplayResult {
   const elos = new Map<string, number>()
   for (const player of roster) elos.set(player.id, clampElo(player.baseElo))
   const outcomes = new Map<string, RatingOutcome>()
+  const matchesPlayed = new Map<string, number>()
   const ordered = [...events].sort(
     (a, b) => a.position - b.position || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
   )
@@ -344,8 +415,22 @@ export function replay(
       })
       continue
     }
-    const { result, updates } = rateMatch(event.payload, elos, kFactor)
+    const formula = event.payload.formula === 2 ? 2 : 1
+    const eventK =
+      formula === 2 && isKFactor(event.payload.k) ? event.payload.k : legacyK
+    const { result, updates } = rateMatch(event.payload, elos, eventK, {
+      formula,
+      priorMatches: matchesPlayed,
+    })
     for (const [id, elo] of updates) elos.set(id, elo)
+    if (result.teams.length > 0) {
+      const seen = new Set<string>()
+      for (const team of event.payload.teams)
+        for (const player of team.players)
+          if (player.tracked) seen.add(player.id)
+      for (const id of seen)
+        matchesPlayed.set(id, (matchesPlayed.get(id) ?? 0) + 1)
+    }
     outcomes.set(event.id, { eventId: event.id, kind: 'match', result })
   }
 
