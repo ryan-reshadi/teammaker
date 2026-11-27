@@ -12,6 +12,7 @@ import {
   isKFactor,
   replay,
   skillFromElo,
+  usesProvisionalK,
   type AdjustInput,
   type MatchEventView,
   type MatchInput,
@@ -34,11 +35,12 @@ import {
   type Statement,
 } from './db'
 import { sessionGuard, type AppContext, type Authenticate } from './guard'
-import { createRivalsRoutes } from './rivals'
 
 const ROSTER_LIMIT = 200
 const MAX_BATCH = 50
 const MAX_ROUNDS = 100
+/** Events a squash removes from the front and keeps at the back. */
+export const SQUASH_KEEP = 500
 const MAX_LABEL = 60
 const MAX_REASON = 80
 const MATCH_ERROR =
@@ -376,7 +378,7 @@ async function pinLegacyK(
 async function loadPlayers(db: Database, owner: string): Promise<Player[]> {
   const result = await db
     .prepare(
-      'SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE owner_sub = ? ORDER BY created_at ASC, id ASC',
+      'SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE owner_sub = ? AND deleted_at IS NULL ORDER BY created_at ASC, id ASC',
     )
     .bind(owner)
     .all<PlayerRow>()
@@ -420,9 +422,12 @@ async function recompute(
   owner: string,
   from: number,
 ): Promise<Player[]> {
+  // Archived players stay in this query: they are part of the replay roster, so
+  // keeping their base elo and their event outcomes makes a removal invisible to
+  // every later rating. The response filters them out instead.
   const players = await db
     .prepare(
-      'SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at, base_elo FROM players WHERE owner_sub = ? ORDER BY created_at ASC, id ASC',
+      'SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at, base_elo, deleted_at FROM players WHERE owner_sub = ? ORDER BY created_at ASC, id ASC',
     )
     .bind(owner)
     .all<BaseRow>()
@@ -501,13 +506,113 @@ async function recompute(
 
   if (statements.length > 0) await db.batch(statements)
 
-  return players.results.map((player) =>
-    mapPlayer({
-      ...player,
-      elo: elos.get(player.id) ?? player.elo,
-      skill: skillFromElo(elos.get(player.id) ?? player.elo),
-    }),
+  return players.results
+    .filter((player) => !player.deleted_at)
+    .map((player) =>
+      mapPlayer({
+        ...player,
+        elo: elos.get(player.id) ?? player.elo,
+        skill: skillFromElo(elos.get(player.id) ?? player.elo),
+      }),
+    )
+}
+
+async function countEvents(db: Database, owner: string): Promise<number> {
+  const row = await db
+    .prepare('SELECT COUNT(*) AS total FROM rating_events WHERE owner_sub = ?')
+    .bind(owner)
+    .first<{ total: number }>()
+  return row?.total ?? 0
+}
+
+/**
+ * Folds the oldest events into each player's replay anchor, then deletes them.
+ *
+ * `base_elo` becomes the elo at the cut, so the kept log replays forward to
+ * exactly the ratings it produced before: no `elo` moves and every kept
+ * `rating_results` row stays valid. Only the history is lost.
+ *
+ * A formula 2 or 3 event is never kept behind a deleted prefix: its K comes from
+ * the number of rated matches before it, which only the deleted events hold.
+ */
+export async function compactLog(
+  db: Database,
+  owner: string,
+  keep = SQUASH_KEEP,
+): Promise<{ removed: number; kept: number }> {
+  const events = await loadEvents(db, owner)
+  if (events.length <= keep) return { removed: 0, kept: events.length }
+
+  let cut = events.length - keep
+  // The kept window must start after the newest count-dependent event: its K
+  // reads how many rated matches precede it, and only the deleted events hold
+  // that. Formulas 1 and 4 do not care, so they are safe to keep.
+  for (let index = events.length - 1; index >= cut; index -= 1) {
+    const event = events[index]!
+    if (event.kind === 'match' && usesProvisionalK(eventFormula(event.payload))) {
+      cut = index + 1
+      break
+    }
+  }
+  // Only reachable when the newest event itself is count-dependent. This build
+  // never writes one, so it means there is nothing safe to cut.
+  if (cut >= events.length) return { removed: 0, kept: events.length }
+
+  // Archived players stay in this query: they seed the replay just like the
+  // roster does, so their anchor has to move with everyone else's.
+  const players = await db
+    .prepare(
+      'SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at, base_elo, deleted_at FROM players WHERE owner_sub = ? ORDER BY created_at ASC, id ASC',
+    )
+    .bind(owner)
+    .all<BaseRow>()
+  const kFactor = await getKFactor(db, owner)
+  const legacyK = await getLegacyK(db, owner, kFactor)
+  const roster: MatchRoster[] = players.results.map((player) => ({
+    id: player.id,
+    name: player.name,
+    baseElo: player.base_elo,
+  }))
+  const { elos } = replay(events.slice(0, cut), roster, kFactor, legacyK)
+
+  const oldest = `(SELECT id FROM rating_events WHERE owner_sub = ? ORDER BY position ASC, created_at ASC, id ASC LIMIT ${cut})`
+  const statements: Statement[] = []
+  for (const player of players.results) {
+    const anchor = clampElo(elos.get(player.id) ?? player.base_elo)
+    if (anchor === player.base_elo) continue
+    statements.push(
+      db
+        .prepare('UPDATE players SET base_elo = ? WHERE id = ? AND owner_sub = ?')
+        .bind(anchor, player.id, owner),
+    )
+  }
+  // Results first, then the events they belong to; both resolve the same
+  // oldest rows because the second subquery still sees the full event table.
+  statements.push(
+    db
+      .prepare(`DELETE FROM rating_results WHERE owner_sub = ? AND event_id IN ${oldest}`)
+      .bind(owner, owner),
+    db.prepare(`DELETE FROM rating_events WHERE id IN ${oldest}`).bind(owner),
+    // Recorded in the same transaction, so the note never disagrees with the log.
+    db
+      .prepare(
+        'INSERT INTO log_squashes (owner_sub, removed, squashed_at) VALUES (?, ?, ?) ON CONFLICT(owner_sub) DO UPDATE SET removed = log_squashes.removed + excluded.removed, squashed_at = excluded.squashed_at',
+      )
+      .bind(owner, cut, Date.now()),
   )
+  await db.batch(statements)
+  return { removed: cut, kept: events.length - cut }
+}
+
+/**
+ * Makes room for one more event, compacting a full log. `false` means the log is
+ * at the cap and nothing could safely be cut: a match refuses the write, while
+ * an adjustment compacts quietly and goes ahead anyway.
+ */
+async function makeRoom(db: Database, owner: string): Promise<boolean> {
+  if ((await countEvents(db, owner)) < MAX_EVENTS) return true
+  const { removed } = await compactLog(db, owner)
+  return removed > 0
 }
 
 async function matchViews(
@@ -570,26 +675,29 @@ async function matchViews(
   })
 }
 
+/**
+ * New matches may only name players on the roster. An edit passes
+ * `includeArchived`, because a lineup logged before a removal must stay
+ * editable and the archived row still has a real rating in the replay.
+ */
 async function trackedIdsExist(
   db: Database,
   owner: string,
   ids: string[],
+  includeArchived = false,
 ): Promise<boolean> {
   if (ids.length === 0) return true
   const rows = await db
     .prepare(
-      `SELECT id FROM players WHERE owner_sub = ? AND id IN (${ids.map(() => '?').join(', ')})`,
+      `SELECT id FROM players WHERE owner_sub = ?${includeArchived ? '' : ' AND deleted_at IS NULL'} AND id IN (${ids.map(() => '?').join(', ')})`,
     )
     .bind(owner, ...ids)
     .all<{ id: string }>()
   return rows.results.length === new Set(ids).size
 }
 
-/** Tests inject identities and the OCR fetch; production uses the SDK and platform fetch. */
-export function createApp(
-  authenticate: Authenticate = currentUser,
-  options: { fetchOcr?: typeof fetch } = {},
-) {
+/** Tests inject identities; production uses the SDK. */
+export function createApp(authenticate: Authenticate = currentUser) {
   const app = new Hono<AppContext>()
   // Reachability probe: one real round trip, no authentication, no rows written.
   // It answers the question the session flag cannot — `session.database` only
@@ -602,13 +710,13 @@ export function createApp(
       await db.prepare('SELECT 1 AS ok').first<{ ok: number }>()
       const tables = await db
         .prepare(
-          "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('players', 'rounds', 'rating_events', 'rating_results', 'settings', 'rating_meta')",
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('players', 'rounds', 'rating_events', 'rating_results', 'settings', 'rating_meta', 'log_squashes')",
         )
         .all<{ name: string }>()
       return c.json({
         ok: true,
         database: 'ok',
-        schema: tables.results.length === 6 ? 'ready' : 'missing',
+        schema: tables.results.length === 7 ? 'ready' : 'missing',
       })
     } catch (error) {
       // The driver's message can name the host; it is not a secret, but keep it
@@ -624,13 +732,6 @@ export function createApp(
     c.header('Cache-Control', 'private, no-store')
     await next()
   })
-  // Screenshot import has its own route chain — its own session guard and an
-  // 8 MB limit — mounted before the JSON limit below, so the 64 KB cap every
-  // other data route relies on stays exactly as it was.
-  app.route(
-    '/api/rivals',
-    createRivalsRoutes({ authenticate, fetchOcr: options.fetchOcr }),
-  )
   app.use(
     '/api/*',
     bodyLimit({
@@ -675,7 +776,9 @@ export function createApp(
     const db = c.get('db')
     const owner = c.get('user').sub
     const existing = await db
-      .prepare('SELECT COUNT(*) AS total FROM players WHERE owner_sub = ?')
+      .prepare(
+        'SELECT COUNT(*) AS total FROM players WHERE owner_sub = ? AND deleted_at IS NULL',
+      )
       .bind(owner)
       .first<{ total: number }>()
     if ((existing?.total ?? 0) + drafts.length > ROSTER_LIMIT)
@@ -731,7 +834,9 @@ export function createApp(
     const db = c.get('db')
     const owner = c.get('user').sub
     const current = await db
-      .prepare('SELECT id, elo FROM players WHERE id = ? AND owner_sub = ?')
+      .prepare(
+        'SELECT id, elo FROM players WHERE id = ? AND owner_sub = ? AND deleted_at IS NULL',
+      )
       .bind(id, owner)
       .first<{ id: string; elo: number }>()
     if (!current) return c.json({ error: 'Player not found.' }, 404)
@@ -811,6 +916,7 @@ export function createApp(
       .run()
 
     if (targetElo !== null && logAdjustment && targetElo !== current.elo) {
+      await makeRoom(db, owner)
       const position = await nextPosition(db, owner)
       const now = Date.now()
       await db
@@ -833,7 +939,7 @@ export function createApp(
 
     const row = await db
       .prepare(
-        'SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE id = ? AND owner_sub = ?',
+        'SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE id = ? AND owner_sub = ? AND deleted_at IS NULL',
       )
       .bind(id, owner)
       .first<PlayerRow>()
@@ -847,58 +953,23 @@ export function createApp(
     const owner = c.get('user').sub
     const id = c.req.param('id')
     const player = await db
-      .prepare('SELECT id FROM players WHERE id = ? AND owner_sub = ?')
+      .prepare(
+        'SELECT id FROM players WHERE id = ? AND owner_sub = ? AND deleted_at IS NULL',
+      )
       .bind(id, owner)
       .first<{ id: string }>()
     if (!player) return c.json({ error: 'Player not found.' }, 404)
-    const matches = await db
-      .prepare(
-        `SELECT COUNT(*) AS total FROM rating_results r
-         JOIN rating_events e ON e.id = r.event_id AND e.owner_sub = r.owner_sub
-         WHERE r.owner_sub = ? AND r.player_id = ? AND e.kind = 'match'`,
-      )
-      .bind(owner, id)
-      .first<{ total: number }>()
-    if ((matches?.total ?? 0) > 0)
-      return c.json(
-        {
-          error:
-            'This player has match history. Delete or edit those matches before removing them.',
-        },
-        409,
-      )
 
-    // A manual rating is not a match: drop the player's adjustment events with
-    // them, or the log would keep ratings for someone no longer on the roster.
-    const edits = await db
+    // Archive, do not erase. The row keeps its creation elo, so every replay
+    // seeds this player exactly as before and nobody else's rating moves. No
+    // event or result is touched, which is why no `recompute` is needed.
+    const now = Date.now()
+    await db
       .prepare(
-        'SELECT DISTINCT event_id FROM rating_results WHERE owner_sub = ? AND player_id = ?',
+        'UPDATE players SET deleted_at = ?, updated_at = ? WHERE id = ? AND owner_sub = ?',
       )
-      .bind(owner, id)
-      .all<{ event_id: string }>()
-    const eventIds = edits.results.map((row) => row.event_id)
-    const statements: Statement[] = []
-    if (eventIds.length > 0) {
-      const marks = eventIds.map(() => '?').join(', ')
-      statements.push(
-        db
-          .prepare(
-            `DELETE FROM rating_results WHERE owner_sub = ? AND event_id IN (${marks})`,
-          )
-          .bind(owner, ...eventIds),
-        db
-          .prepare(
-            `DELETE FROM rating_events WHERE owner_sub = ? AND id IN (${marks})`,
-          )
-          .bind(owner, ...eventIds),
-      )
-    }
-    statements.push(
-      db
-        .prepare('DELETE FROM players WHERE id = ? AND owner_sub = ?')
-        .bind(id, owner),
-    )
-    await db.batch(statements)
+      .bind(now, now, id, owner)
+      .run()
     return c.json({ ok: true })
   })
 
@@ -925,11 +996,14 @@ export function createApp(
     const owner = c.get('user').sub
     const id = c.req.param('id')
     const player = await db
-      .prepare('SELECT id, elo FROM players WHERE id = ? AND owner_sub = ?')
+      .prepare(
+        'SELECT id, elo FROM players WHERE id = ? AND owner_sub = ? AND deleted_at IS NULL',
+      )
       .bind(id, owner)
       .first<{ id: string; elo: number }>()
     if (!player) return c.json({ error: 'Player not found.' }, 404)
 
+    await makeRoom(db, owner)
     const position = await nextPosition(db, owner)
     const now = Date.now()
     await db
@@ -956,8 +1030,15 @@ export function createApp(
   app.get('/api/matches', async (c) => {
     const db = c.get('db')
     const owner = c.get('user').sub
+    const squash = await db
+      .prepare('SELECT removed, squashed_at FROM log_squashes WHERE owner_sub = ?')
+      .bind(owner)
+      .first<{ removed: number; squashed_at: number }>()
     return c.json({
       kFactor: await getKFactor(db, owner),
+      squashed: squash
+        ? { removed: squash.removed, at: squash.squashed_at }
+        : null,
       events: await matchViews(db, owner),
     })
   })
@@ -979,11 +1060,9 @@ export function createApp(
     )
     if (!(await trackedIdsExist(db, owner, tracked)))
       return c.json({ error: 'Those players are no longer on your roster.' }, 400)
-    const count = await db
-      .prepare('SELECT COUNT(*) AS total FROM rating_events WHERE owner_sub = ?')
-      .bind(owner)
-      .first<{ total: number }>()
-    if ((count?.total ?? 0) >= MAX_EVENTS)
+    // A full log is compacted, never refused: the oldest half is folded into the
+    // players' anchors, which leaves every rating exactly where it was.
+    if (!(await makeRoom(db, owner)))
       return c.json(
         { error: `The log holds ${MAX_EVENTS} events. Delete one to add another.` },
         400,
@@ -1043,7 +1122,9 @@ export function createApp(
       const tracked = input.teams.flatMap((team) =>
         team.players.filter((player) => player.tracked).map((player) => player.id),
       )
-      if (!(await trackedIdsExist(db, owner, tracked)))
+      // An edit may keep a player who was archived after the match was logged:
+      // their row still seeds the replay, so the lineup stays editable.
+      if (!(await trackedIdsExist(db, owner, tracked, true)))
         return c.json({ error: 'Those players are no longer on your roster.' }, 400)
       // Editing never upgrades or re-rates an event: a legacy match stays
       // legacy (and keeps its frozen K), and a marked match keeps the formula

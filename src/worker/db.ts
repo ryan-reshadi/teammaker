@@ -30,6 +30,7 @@ const schema = [
     base_elo INTEGER NOT NULL DEFAULT 0,
     tags TEXT NOT NULL DEFAULT '[]',
     sitting_out INTEGER NOT NULL DEFAULT 0,
+    deleted_at INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
   )`,
@@ -76,14 +77,25 @@ const schema = [
     legacy_k INTEGER NOT NULL,
     created_at INTEGER NOT NULL
   )`,
+  // What a squash removed, and when. Nothing replays from it: it only lets the
+  // match list say why older history is missing.
+  `CREATE TABLE IF NOT EXISTS log_squashes (
+    owner_sub TEXT PRIMARY KEY,
+    removed INTEGER NOT NULL,
+    squashed_at INTEGER NOT NULL
+  )`,
 ]
 
 const TAG_COLUMN = `ALTER TABLE players ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'`
 const USERNAME_COLUMN = `ALTER TABLE players ADD COLUMN username TEXT NOT NULL DEFAULT ''`
 const ELO_COLUMN = `ALTER TABLE players ADD COLUMN elo INTEGER NOT NULL DEFAULT 0`
 const BASE_ELO_COLUMN = `ALTER TABLE players ADD COLUMN base_elo INTEGER NOT NULL DEFAULT 0`
+// A removed player is archived, never deleted: the row still seeds the rating
+// replay, so nobody else's history shifts. NULL means the player is on the
+// roster.
+const DELETED_AT_COLUMN = `ALTER TABLE players ADD COLUMN deleted_at INTEGER`
 
-const TABLES = `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('players', 'rounds', 'rating_events', 'rating_results', 'settings', 'rating_meta')`
+const TABLES = `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('players', 'rounds', 'rating_events', 'rating_results', 'settings', 'rating_meta', 'log_squashes')`
 // A table-valued function rather than `PRAGMA table_info`: it is an ordinary
 // SELECT, so it stays valid on hosts that only proxy plain queries.
 const COLUMNS = "SELECT name FROM pragma_table_info('players')"
@@ -101,6 +113,7 @@ const ensureColumns = async (db: Database): Promise<void> => {
   if (!names.has('username')) missing.push(USERNAME_COLUMN)
   if (!names.has('elo')) missing.push(ELO_COLUMN)
   if (!names.has('base_elo')) missing.push(BASE_ELO_COLUMN)
+  if (!names.has('deleted_at')) missing.push(DELETED_AT_COLUMN)
   if (missing.length > 0) await db.batch(missing.map((sql) => db.prepare(sql)))
   if (!names.has('elo') || !names.has('base_elo')) {
     await db
@@ -116,7 +129,7 @@ const bootstrap = async (db: Database): Promise<void> => {
   // lock on the primary) for every CREATE TABLE IF NOT EXISTS, while a local
   // file makes that free. A cold start on a healthy database should only read.
   const tables = await db.prepare(TABLES).all<{ name: string }>()
-  if (tables.results.length < 6) {
+  if (tables.results.length < 7) {
     await db.batch(schema.map((sql) => db.prepare(sql)))
   }
   await ensureColumns(db)
@@ -164,6 +177,8 @@ export type PlayerRow = {
   elo: number
   tags: string | null
   sitting_out: number
+  /** Set when the player was removed from the roster; they stay in the log. */
+  deleted_at?: number | null
   created_at: number
   updated_at: number
 }

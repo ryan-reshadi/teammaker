@@ -1,7 +1,17 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test'
 import { Miniflare } from 'miniflare'
-import { createApp } from '../src/worker/app'
+import { compactLog, createApp } from '../src/worker/app'
 import { currentUser, type Env } from '../src/worker/auth'
+import {
+  FLAT_K_FORMULA,
+  RATING_FORMULA,
+  replay,
+  skillFromElo,
+  type MatchInput,
+  type MatchRoster,
+  type RatingEvent,
+} from '../src/shared/elo'
+import type { Database } from '../src/worker/db'
 
 const runtime = new Miniflare({
   workers: [
@@ -562,9 +572,8 @@ test('matches tune elo, replay edits, log manual ratings and stay private', asyn
   log = (await (await call('/api/matches', 'frank')).json()) as Logged
   expect(log.events.map((event) => event.kind)).toEqual(['match', 'adjust'])
 
-  // Match history pins a player to the log until those matches are gone.
-  expect((await call(`/api/players/${ada.id}`, 'frank', 'DELETE')).status).toBe(409)
-
+  // A player with match history is no longer pinned: removing them archives the
+  // row instead of answering 409 (the archive test below covers the ratings).
   const removed = await call(`/api/matches/${matchId}`, 'frank', 'DELETE')
   expect(removed.status).toBe(200)
   log = (await (await call('/api/matches', 'frank')).json()) as Logged
@@ -572,10 +581,13 @@ test('matches tune elo, replay edits, log manual ratings and stay private', asyn
   expect(await eloOf('Ada')).toBe(700)
   expect(await eloOf('Cy')).toBe(500)
 
-  // With the match gone only a manual edit remains, and the player can leave
-  // with it; the adjustment event disappears from the log too.
+  // With the match gone only a manual edit remains. Removing the player takes
+  // them off the roster but keeps that edit in the log, so the history stays
+  // readable and no rating is rewritten.
   expect((await call(`/api/players/${ada.id}`, 'frank', 'DELETE')).status).toBe(200)
   expect((await listed()).some((player) => player.id === ada.id)).toBe(false)
+  log = (await (await call('/api/matches', 'frank')).json()) as Logged
+  expect(log.events.map((event) => event.kind)).toEqual(['adjust'])
   expect((await call(`/api/players/${byName.get('Cy')!.id}`, 'frank', 'DELETE')).status).toBe(
     200,
   )
@@ -584,6 +596,70 @@ test('matches tune elo, replay edits, log manual ratings and stay private', asyn
   const strangers = (await (await call('/api/matches', 'gina')).json()) as Logged
   expect(strangers.events).toHaveLength(0)
   expect((await call(`/api/matches/${matchId}`, 'gina', 'DELETE')).status).toBe(404)
+})
+
+test('editing a v4 match keeps its stamped formula and K after the account K changes', async () => {
+  type PlayerRow = { id: string; name: string; elo: number }
+  type Logged = {
+    events: {
+      id: string
+      kind: string
+      teams?: { players: { name: string; delta: number }[] }[]
+    }[]
+  }
+  const created = await call('/api/players', 'jules', 'POST', {
+    players: [
+      { name: 'Ada', skill: 5 },
+      { name: 'Bo', skill: 5 },
+    ],
+  })
+  expect(created.status).toBe(201)
+  const roster = ((await created.json()) as { players: PlayerRow[] }).players
+  const byName = new Map(roster.map((player) => [player.name, player]))
+  const team = (name: string) => ({
+    players: [{ id: byName.get(name)!.id, name, damage: 100, tracked: true }],
+  })
+  const body = { label: 'Duel', winner: 0, teams: [team('Ada'), team('Bo')] }
+  const eloOf = async (name: string) =>
+    ((await (await call('/api/players', 'jules')).json()) as { players: PlayerRow[] }).players
+      .find((player) => player.name === name)!.elo
+  const stored = async (id: string) =>
+    JSON.parse(
+      (
+        await env.DB!.prepare('SELECT payload FROM rating_events WHERE id = ? AND owner_sub = ?')
+          .bind(id, 'jules')
+          .first<{ payload: string }>()
+      )!.payload,
+    ) as { formula?: number; k?: number }
+
+  // The first match pins the legacy K (32) that unmarked events replay with.
+  expect((await call('/api/matches', 'jules', 'POST', body)).status).toBe(201)
+  // Lower the account K before this one, so it is stamped with K 8.
+  expect((await call('/api/settings', 'jules', 'PUT', { kFactor: 8 })).status).toBe(200)
+  expect((await call('/api/matches', 'jules', 'POST', { ...body, winner: 1 })).status).toBe(
+    201,
+  )
+  const second = ((await (await call('/api/matches', 'jules')).json()) as Logged).events[1]!
+  expect(await stored(second.id)).toMatchObject({ formula: 4, k: 8 })
+  expect(second.teams![1]!.players[0]!.delta).toBe(4)
+  const settled = { ada: await eloOf('Ada'), bo: await eloOf('Bo') }
+
+  // Raise the account K, then edit the match. A v4 event keeps the K it was
+  // rated with: the new 16 would move Bo by 7 and the legacy 32 by 17.
+  expect((await call('/api/settings', 'jules', 'PUT', { kFactor: 16 })).status).toBe(200)
+  expect(
+    (
+      await call(`/api/matches/${second.id}`, 'jules', 'PATCH', {
+        input: { ...body, label: 'Duel (fixed)', winner: 1 },
+      })
+    ).status,
+  ).toBe(200)
+  expect(await stored(second.id)).toMatchObject({ formula: 4, k: 8 })
+  expect({ ada: await eloOf('Ada'), bo: await eloOf('Bo') }).toEqual(settled)
+  expect(
+    ((await (await call('/api/matches', 'jules')).json()) as Logged).events[1]!.teams![1]!
+      .players[0]!.delta,
+  ).toBe(4)
 })
 
 test('a match can have more than two teams', async () => {
@@ -699,3 +775,444 @@ test('a match can be reordered within the log', async () => {
       .status,
   ).toBe(400)
 })
+
+test('deleting a player archives them and never moves anyone elo', async () => {
+  type RosterPlayer = { id: string; name: string; elo: number }
+  type LogPlayer = {
+    id: string | null
+    name: string
+    damage: number
+    tracked: boolean
+    eloBefore: number
+    eloAfter: number
+    delta: number
+  }
+  type LogEvent = {
+    id: string
+    kind: string
+    position: number
+    label?: string
+    winner?: number
+    teams?: { players: LogPlayer[] }[]
+  }
+  type Log = { events: LogEvent[] }
+
+  const created = await call('/api/players', 'ivy', 'POST', {
+    players: [
+      { name: 'Ada', skill: 6 },
+      { name: 'Bo', skill: 5 },
+      { name: 'Cy', skill: 7 },
+      { name: 'Di', skill: 4 },
+    ],
+  })
+  expect(created.status).toBe(201)
+  const roster = ((await created.json()) as { players: RosterPlayer[] }).players
+  const [ada, bo, cy, di] = roster
+  expect(di).toBeDefined()
+
+  const duel = (
+    left: RosterPlayer,
+    leftDamage: number,
+    right: RosterPlayer,
+    rightDamage: number,
+    winner: number,
+  ) => ({
+    label: '',
+    winner,
+    teams: [
+      {
+        players: [
+          { id: left.id, name: left.name, damage: leftDamage, tracked: true },
+        ],
+      },
+      {
+        players: [
+          { id: right.id, name: right.name, damage: rightDamage, tracked: true },
+        ],
+      },
+    ],
+  })
+
+  // Ada plays both matches, so her second rating is the one a vanished opponent
+  // would silently re-rate.
+  expect(
+    (await call('/api/matches', 'ivy', 'POST', duel(ada!, 120, bo!, 90, 0))).status,
+  ).toBe(201)
+  expect(
+    (await call('/api/matches', 'ivy', 'POST', duel(ada!, 80, cy!, 140, 1))).status,
+  ).toBe(201)
+
+  const listed = async () =>
+    (await (await call('/api/matches', 'ivy')).json()) as Log
+  const rosterNow = async () =>
+    (
+      (await (await call('/api/players', 'ivy')).json()) as {
+        players: RosterPlayer[]
+      }
+    ).players
+  const snapshot = (log: Log) =>
+    log.events.map((event) => ({
+      id: event.id,
+      position: event.position,
+      players: (event.teams ?? []).flatMap((team) =>
+        team.players.map((player) => ({
+          id: player.id,
+          name: player.name,
+          eloBefore: player.eloBefore,
+          eloAfter: player.eloAfter,
+          delta: player.delta,
+        })),
+      ),
+    }))
+
+  const logBefore = await listed()
+  expect(logBefore.events).toHaveLength(2)
+  const elosBefore = new Map(
+    (await rosterNow()).map((player) => [player.name, player.elo]),
+  )
+
+  // Cy has match history, which used to answer 409.
+  expect((await call(`/api/players/${cy!.id}`, 'ivy', 'DELETE')).status).toBe(200)
+
+  const survivors = await rosterNow()
+  expect(survivors.map((player) => player.name)).toEqual(['Ada', 'Bo', 'Di'])
+  for (const player of survivors)
+    expect(player.elo).toBe(elosBefore.get(player.name)!)
+
+  // A no-op reorder replays the whole log from position 0 with unchanged input.
+  const first = logBefore.events[0]!
+  const replayed = await call(`/api/matches/${first.id}`, 'ivy', 'PATCH', {
+    position: 0,
+  })
+  expect(replayed.status).toBe(200)
+  expect(
+    ((await replayed.json()) as { players: RosterPlayer[] }).players.map(
+      (player) => player.name,
+    ),
+  ).toEqual(['Ada', 'Bo', 'Di'])
+
+  // Every stored rating is byte-identical, Cy's rows included: the history is
+  // kept, not orphaned.
+  const logAfter = await listed()
+  expect(snapshot(logAfter)).toEqual(snapshot(logBefore))
+  expect(
+    logAfter.events.flatMap((event) =>
+      (event.teams ?? []).flatMap((team) =>
+        team.players.filter((player) => player.id === cy!.id),
+      ),
+    ),
+  ).toHaveLength(1)
+  for (const player of await rosterNow())
+    expect(player.elo).toBe(elosBefore.get(player.name)!)
+
+  // A lineup that already names an archived player stays editable.
+  const archived = logAfter.events.find((event) =>
+    (event.teams ?? []).some((team) =>
+      team.players.some((player) => player.id === cy!.id),
+    ),
+  )!
+  const resaved = await call(`/api/matches/${archived.id}`, 'ivy', 'PATCH', {
+    input: {
+      label: archived.label ?? '',
+      winner: archived.winner!,
+      teams: (archived.teams ?? []).map((team) => ({
+        players: team.players.map((player) => ({
+          id: player.id,
+          name: player.name,
+          damage: player.damage,
+          tracked: player.tracked,
+        })),
+      })),
+    },
+  })
+  expect(resaved.status).toBe(200)
+  expect(snapshot(await listed())).toEqual(snapshot(logBefore))
+
+  // A new match may not add them, and they can no longer be edited or re-rated.
+  expect(
+    (await call('/api/matches', 'ivy', 'POST', duel(ada!, 100, cy!, 100, 0))).status,
+  ).toBe(400)
+  expect(
+    (await call(`/api/players/${cy!.id}`, 'ivy', 'PATCH', { name: 'Ghost' })).status,
+  ).toBe(404)
+  expect(
+    (await call(`/api/players/${cy!.id}/elo`, 'ivy', 'POST', { elo: 500 })).status,
+  ).toBe(404)
+})
+
+type SeedPlayer = { id: string; name: string; elo: number }
+
+/**
+ * Writes `count` duels straight into D1 and then stores the ratings a replay
+ * produces, which is the state every write path leaves behind. Building the log
+ * through the API would be a thousand round trips per fixture.
+ */
+async function seedLog(user: string, count: number, legacyAt = -1) {
+  const db = env.DB as unknown as Database
+  const created = await call('/api/players', user, 'POST', {
+    players: [
+      { name: 'Ada', skill: 6 },
+      { name: 'Bo', skill: 5 },
+      { name: 'Cy', skill: 4 },
+    ],
+  })
+  const players = ((await created.json()) as { players: SeedPlayer[] }).players
+  const [ada, bo, cy] = players as [SeedPlayer, SeedPlayer, SeedPlayer]
+  const roster: MatchRoster[] = players.map((player) => ({
+    id: player.id,
+    name: player.name,
+    baseElo: player.elo,
+  }))
+  const events: RatingEvent[] = Array.from({ length: count }, (_, index) => {
+    const payload: MatchInput = {
+      label: `duel ${index}`,
+      winner: index % 2,
+      formula: FLAT_K_FORMULA,
+      k: 32,
+      teams: [
+        {
+          players: [
+            { id: ada.id, name: 'Ada', damage: 100, tracked: true },
+            { id: cy.id, name: 'Cy', damage: 60, tracked: true },
+          ],
+        },
+        { players: [{ id: bo.id, name: 'Bo', damage: 90, tracked: true }] },
+      ],
+    }
+    if (index === legacyAt) payload.formula = RATING_FORMULA
+    return {
+      id: `evt-${user}-${index}`,
+      position: index,
+      kind: 'match',
+      createdAt: index + 1,
+      updatedAt: index + 1,
+      payload,
+    }
+  })
+  const { elos, outcomes } = replay(events, roster, 32, 32)
+
+  for (let start = 0; start < events.length; start += 20) {
+    const statements = events.slice(start, start + 20).flatMap((event) => {
+      const outcome = outcomes.get(event.id)
+      if (!outcome || outcome.kind !== 'match') return []
+      const rows = outcome.result.teams.flatMap((team, teamIndex) =>
+        team.players.map((player, slot) => ({ player, slot: `${teamIndex}:${slot}` })),
+      )
+      return [
+        db
+          .prepare(
+            'INSERT INTO rating_events (id, owner_sub, position, kind, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          )
+          .bind(
+            event.id,
+            user,
+            event.position,
+            'match',
+            JSON.stringify(event.payload),
+            event.createdAt,
+            event.updatedAt,
+          ),
+        ...rows.map(({ player, slot }) =>
+          db
+            .prepare(
+              'INSERT INTO rating_results (event_id, owner_sub, slot, player_id, name, elo_before, elo_after, delta) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            )
+            .bind(
+              event.id,
+              user,
+              slot,
+              player.id,
+              player.name,
+              player.eloBefore,
+              player.eloAfter,
+              player.delta,
+            ),
+        ),
+      ]
+    })
+    await db.batch(statements)
+  }
+  await db.batch(
+    players.map((player) => {
+      const elo = elos.get(player.id) ?? player.elo
+      return db
+        .prepare('UPDATE players SET elo = ?, skill = ? WHERE id = ? AND owner_sub = ?')
+        .bind(elo, skillFromElo(elo), player.id, user)
+    }),
+  )
+  return { db, players, events, roster }
+}
+
+const rosterNow = async (user: string) =>
+  (
+    (await (await call('/api/players', user)).json()) as {
+      players: { id: string; elo: number }[]
+    }
+  ).players
+
+const rowCounts = async (db: Database, user: string) =>
+  (await db
+    .prepare(
+      'SELECT (SELECT COUNT(*) FROM rating_events WHERE owner_sub = ?) AS events, (SELECT COUNT(*) FROM rating_results WHERE owner_sub = ?) AS results',
+    )
+    .bind(user, user)
+    .first<{ events: number; results: number }>())!
+
+test(
+  'a full log is squashed to its newest half without moving a rating',
+  async () => {
+    const user = 'squash-main'
+    const { db, events, roster } = await seedLog(user, 1000)
+    const before = await rosterNow(user)
+    const elosBefore = new Map(before.map((player) => [player.id, player.elo]))
+
+    // Nothing has gone missing yet, so there is nothing to explain.
+    expect(
+      ((await (await call('/api/matches', user)).json()) as { squashed: unknown })
+        .squashed,
+    ).toBeNull()
+
+    expect(await compactLog(db, user)).toEqual({ removed: 500, kept: 500 })
+    expect(await rowCounts(db, user)).toEqual({ events: 500, results: 1500 })
+
+    for (const player of await rosterNow(user))
+      expect(player.elo).toBe(elosBefore.get(player.id)!)
+
+    // The anchor is the rating at the cut, not the final one: replaying only the
+    // deleted events reproduces it, and the kept half builds on top.
+    const boundary = replay(events.slice(0, 500), roster, 32, 32)
+    const rows = await db
+      .prepare('SELECT id, elo, base_elo FROM players WHERE owner_sub = ?')
+      .bind(user)
+      .all<{ id: string; elo: number; base_elo: number }>()
+    for (const row of rows.results) {
+      expect(row.base_elo).toBe(boundary.elos.get(row.id)!)
+      expect(row.elo).toBe(elosBefore.get(row.id)!)
+    }
+
+    const log = (await (await call('/api/matches', user)).json()) as {
+      events: { position: number }[]
+      squashed: { removed: number; at: number } | null
+    }
+    expect(log.events).toHaveLength(500)
+    expect(log.events[0]!.position).toBe(500)
+    // The list can say why 500 entries vanished.
+    expect(log.squashed?.removed).toBe(500)
+    expect(log.squashed?.at).toBeGreaterThan(0)
+    expect(before).toHaveLength(3)
+  },
+  60_000,
+)
+
+test(
+  'adding a match at the cap squashes instead of refusing',
+  async () => {
+    const user = 'squash-cap'
+    const { db, players } = await seedLog(user, 1000)
+    const elosBefore = new Map(
+      (await rosterNow(user)).map((player) => [player.id, player.elo]),
+    )
+    const [ada, bo] = players as [SeedPlayer, SeedPlayer]
+
+    const response = await call('/api/matches', user, 'POST', {
+      label: 'after squash',
+      winner: 0,
+      teams: [
+        { players: [{ id: ada.id, name: 'Ada', damage: 100, tracked: true }] },
+        { players: [{ id: bo.id, name: 'Bo', damage: 70, tracked: true }] },
+      ],
+    })
+    expect(response.status).toBe(201)
+    expect((await rowCounts(db, user)).events).toBe(501)
+
+    const log = (await (await call('/api/matches', user)).json()) as {
+      events: {
+        label?: string
+        position: number
+        teams?: { players: { eloBefore: number }[] }[]
+      }[]
+    }
+    expect(log.events[0]!.position).toBe(500)
+    const added = log.events.find((event) => event.label === 'after squash')!
+    // Rated from the pre-squash ratings: the fold left nobody behind.
+    expect(added.teams![0]!.players[0]!.eloBefore).toBe(elosBefore.get(ada.id)!)
+    expect(added.teams![1]!.players[0]!.eloBefore).toBe(elosBefore.get(bo.id)!)
+  },
+  60_000,
+)
+
+test(
+  'a squash never keeps a count-dependent event behind a deleted prefix',
+  async () => {
+    // Formula 2 doubles K from a count built out of the log, so an event of that
+    // era has to fall inside the deleted prefix.
+    const user = 'squash-legacy'
+    const { db } = await seedLog(user, 300, 200)
+    const before = await rosterNow(user)
+    expect(await compactLog(db, user, 100)).toEqual({ removed: 201, kept: 99 })
+    for (const player of await rosterNow(user))
+      expect(player.elo).toBe(before.find((entry) => entry.id === player.id)!.elo)
+
+    // A legacy event already inside the prefix does not shrink the kept window.
+    const clean = 'squash-legacy-prefix'
+    const second = await seedLog(clean, 300, 10)
+    const beforeClean = await rosterNow(clean)
+    expect(await compactLog(second.db, clean, 100)).toEqual({
+      removed: 200,
+      kept: 100,
+    })
+    for (const player of await rosterNow(clean))
+      expect(player.elo).toBe(beforeClean.find((entry) => entry.id === player.id)!.elo)
+  },
+  60_000,
+)
+
+test(
+  'a squash folds an archived player without moving anyone else',
+  async () => {
+    const user = 'squash-archive'
+    const { db, players, events, roster } = await seedLog(user, 200)
+    const archived = players[2]!
+    expect((await call(`/api/players/${archived.id}`, user, 'DELETE')).status).toBe(200)
+    const before = await rosterNow(user)
+
+    expect(await compactLog(db, user, 100)).toEqual({ removed: 100, kept: 100 })
+    for (const player of await rosterNow(user))
+      expect(player.elo).toBe(before.find((entry) => entry.id === player.id)!.elo)
+
+    // The archived row still seeds the replay, so its anchor moved too.
+    const row = await db
+      .prepare('SELECT base_elo FROM players WHERE id = ?')
+      .bind(archived.id)
+      .first<{ base_elo: number }>()
+    expect(row!.base_elo).toBe(
+      replay(events.slice(0, 100), roster, 32, 32).elos.get(archived.id)!,
+    )
+  },
+  60_000,
+)
+
+test(
+  'editing after a squash replays from the folded anchor',
+  async () => {
+    const user = 'squash-edit'
+    const { db, events, roster } = await seedLog(user, 200)
+    expect(await compactLog(db, user, 100)).toEqual({ removed: 100, kept: 100 })
+
+    const log = (await (await call('/api/matches', user)).json()) as {
+      events: { id: string }[]
+    }
+    const newest = log.events[log.events.length - 1]!
+    expect((await call(`/api/matches/${newest.id}`, user, 'DELETE')).status).toBe(200)
+
+    const boundary = replay(events.slice(0, 100), roster, 32, 32)
+    const folded = roster.map((player) => ({
+      ...player,
+      baseElo: boundary.elos.get(player.id) ?? player.baseElo,
+    }))
+    const expected = replay(events.slice(100, 199), folded, 32, 32)
+    for (const player of await rosterNow(user))
+      expect(player.elo).toBe(expected.elos.get(player.id)!)
+  },
+  60_000,
+)

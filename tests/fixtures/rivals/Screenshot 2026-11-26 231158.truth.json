@@ -1,0 +1,13 @@
+{
+  "note": "4v4 Assist (Big Arena), 940x850. The list scrolls: the last row is cut by the bottom of the panel and is ignored. Usernames are the Roblox handles under the display names. Row 2's handle is 14 px tall and its first digit is drawn so close to an O that neither a person nor the engine can settle 0 vs O, so that username is not asserted.",
+  "teams": { "gold": 5, "purple": 4 },
+  "winner": "gold",
+  "rows": [
+    { "username": "destruction_lord9", "team": "gold", "damage": 1665 },
+    { "username": "TyggrGMR", "team": "gold", "damage": 1653 },
+    { "team": "purple", "damage": 1595 },
+    { "username": "MOnkeyman23287", "team": "gold", "damage": 1524 },
+    { "username": "Zydlian65", "team": "purple", "damage": 1508 },
+    { "username": "iantra92", "team": "purple", "damage": 1097 }
+  ]
+}

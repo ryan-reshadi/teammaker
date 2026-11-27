@@ -21,7 +21,9 @@
     "@freebuff/auth": "0.1.0",
     "@hono/node-server": "^2.1.11",
     "@libsql/client": "^0.18.0",
+    "@paddleocr/paddleocr-js": "^0.4.2",
     "hono": "^4.13.0",
+    "onnxruntime-web": "^1.31.1",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },

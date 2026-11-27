@@ -3,5 +3,5 @@
   "compilerOptions": {
     "types": ["vite/client", "bun", "@cloudflare/workers-types"]
   },
-  "include": ["tests/rivals-browser.test.tsx"]
+  "include": ["tests/rivals-browser.test.tsx", "tests/store.test.ts", "tests/rivals-layout.test.ts"]
 }

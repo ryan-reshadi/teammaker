@@ -10,8 +10,8 @@ export type BenchCounts = {
 
 /**
  * A roster player sat out a match when they already existed and were not on any
- * team. Adjustments are not sessions and never count. Deleted players simply
- * disappear with their history.
+ * team. Adjustments are not sessions and never count. Removed players are
+ * archived, so they stop appearing here while their history stays in the log.
  */
 export function matchSitOutCounts(
   events: RatingEventView[],

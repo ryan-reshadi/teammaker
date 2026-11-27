@@ -1,0 +1,9 @@
+{
+  "note": "1v1 Arena gearboard, small window 858x607, gold 4 vs purple 5. Usernames are the Roblox handles under the display names.",
+  "teams": { "gold": 4, "purple": 5 },
+  "winner": "purple",
+  "rows": [
+    { "username": "destruction_lord9", "team": "gold", "damage": 1193 },
+    { "username": "JIMSE79", "team": "purple", "damage": 1163 }
+  ]
+}

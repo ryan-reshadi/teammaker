@@ -8,6 +8,7 @@ import {
   type MatchEventView,
   type MatchInput,
   type RatingEventView,
+  type SquashInfo,
 } from '../../shared/elo'
 import type { RivalsScan } from '../../shared/rivals'
 import type { Player } from '../../shared/types'
@@ -16,21 +17,24 @@ import {
   type RematchPlayer as DraftPlayer,
   type RematchTeam as DraftTeam,
 } from '../rematch'
-import type { RivalsConfig } from '../store'
 import { RivalsImport } from './RivalsImport'
 
 type Props = {
   players: Player[]
   events: RatingEventView[]
   kFactor: number
+  squashed: SquashInfo | null
   remote: boolean
   onSave: (input: MatchInput, id?: string) => Promise<void>
   onDelete: (id: string) => Promise<void>
   onMove: (id: string, position: number) => Promise<void>
   onKFactor: (kFactor: number) => Promise<void>
   onRefresh: () => Promise<void>
-  onConfig: () => Promise<RivalsConfig>
-  onScan: (file: File) => Promise<RivalsScan>
+  onScan: (
+    file: File,
+    onProgress?: (message: string) => void,
+    signal?: AbortSignal,
+  ) => Promise<RivalsScan>
 }
 
 const emptyTeams = (): DraftTeam[] => [[], []]
@@ -53,13 +57,13 @@ export function Matches({
   players,
   events,
   kFactor,
+  squashed,
   remote,
   onSave,
   onDelete,
   onMove,
   onKFactor,
   onRefresh,
-  onConfig,
   onScan,
 }: Props) {
   const [label, setLabel] = useState('')
@@ -101,8 +105,13 @@ export function Matches({
     setTeams(result.draft.teams)
     setWinner(result.draft.winner)
     setError('')
+    const reduceMotion =
+      window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false
     window.requestAnimationFrame(() => {
-      formRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      formRef.current?.scrollIntoView({
+        behavior: reduceMotion ? 'auto' : 'smooth',
+        block: 'start',
+      })
       formRef.current
         ?.querySelector<HTMLInputElement>('.damage-input')
         ?.focus()
@@ -347,7 +356,6 @@ export function Matches({
           {mode === 'import' ? (
             <RivalsImport
               players={players}
-              onConfig={onConfig}
               onScan={onScan}
               onSave={onSave}
               onRefresh={onRefresh}
@@ -619,6 +627,15 @@ export function Matches({
             )
           })}
         </ul>
+      )}
+
+      {squashed && (
+        <p className="match-note">
+          {squashed.removed.toLocaleString()} older{' '}
+          {squashed.removed === 1 ? 'entry was' : 'entries were'} squashed on{' '}
+          {formatWhen(squashed.at)} to keep the log under its limit. Every rating
+          still counts them.
+        </p>
       )}
     </section>
   )

@@ -2,16 +2,13 @@ import { MAX_DAMAGE, MAX_MATCH_PLAYERS, type MatchInput } from './elo'
 import type { Player } from './types'
 
 /**
- * The screenshot-import seam. The Python OCR service produces the extraction
- * below, the Worker validates it before it reaches the browser, and the review
- * UI turns it into an ordinary `MatchInput`. Nothing here knows about elo: the
- * existing `POST /api/matches` route stays the only way a match is recorded.
+ * The screenshot-import seam. The browser's OCR pipeline produces the extraction
+ * below and the review UI turns it into an ordinary `MatchInput`. Nothing here
+ * knows about elo: the existing `POST /api/matches` route stays the only way a
+ * match is recorded.
  */
 
-export const RIVALS_SCAN_VERSION = 1
 export const RIVALS_MAX_BYTES = 8 * 1024 * 1024
-export const RIVALS_MAX_DIMENSION = 4096
-export const RIVALS_MIN_DIMENSION = 320
 /** Two teams of at most ten, so a scoreboard larger than this is not a duel. */
 export const RIVALS_MAX_ROWS = 20
 export const RIVALS_MAX_USERNAME = 64
@@ -20,43 +17,6 @@ export const RIVALS_DEFAULT_LABEL = 'RIVALS Screenshot Import'
 export const RIVALS_FUZZY_THRESHOLD = 0.82
 export const RIVALS_ACCEPTED_TYPES = ['image/png', 'image/jpeg', 'image/webp'] as const
 
-/**
- * Why screenshot import is or is not available. `ready` is the only state an
- * upload can succeed in; every other state names the thing to fix, so the UI
- * never has to guess between "not configured" and "configured but down".
- */
-export const RIVALS_CONFIG_STATUSES = [
-  'ready',
-  'unconfigured',
-  'invalid_url',
-  'unreachable',
-  'timeout',
-  'error',
-] as const
-
-export type RivalsConfigStatus = (typeof RIVALS_CONFIG_STATUSES)[number]
-export type RivalsEnvVar = 'OCR_SERVICE_URL' | 'OCR_SERVICE_TOKEN'
-
-/**
- * `GET /api/rivals/config`. The first three fields are the original contract, so
- * an older client still renders; `status`, `missing` and `message` are additive
- * detail for the import panel.
- */
-export type RivalsConfig = {
-  /** True only when both variables are set and the service answered a probe. */
-  configured: boolean
-  maxBytes: number
-  acceptedTypes: readonly string[]
-  status?: RivalsConfigStatus
-  /** Which variables are absent; empty when both are set. */
-  missing?: RivalsEnvVar[]
-  /** Shown verbatim by the import UI. Never contains the token. */
-  message?: string
-  /** The engine's own name, from the service's health response. */
-  engine?: string
-}
-
-export type RivalsImageType = (typeof RIVALS_ACCEPTED_TYPES)[number]
 export type RivalsTeamColor = 'gold' | 'purple'
 
 export const RIVALS_ISSUE_CODES = [
@@ -111,179 +71,6 @@ export type RivalsScan = {
   issues: RivalsIssue[]
 }
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  Boolean(value) && typeof value === 'object' && !Array.isArray(value)
-
-const isIndex = (value: unknown): value is number =>
-  typeof value === 'number' && Number.isInteger(value) && value >= 0
-
-const isConfidence = (value: unknown): value is number =>
-  typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1
-
-const isSlot = (value: unknown): value is 0 | 1 => value === 0 || value === 1
-
-const isColor = (value: unknown): value is RivalsTeamColor =>
-  value === 'gold' || value === 'purple'
-
-/** Magic-byte check, so a renamed HTML file never reaches the OCR service. */
-export function sniffImageType(bytes: Uint8Array): RivalsImageType | null {
-  if (
-    bytes.length >= 8 &&
-    bytes[0] === 0x89 &&
-    bytes[1] === 0x50 &&
-    bytes[2] === 0x4e &&
-    bytes[3] === 0x47 &&
-    bytes[4] === 0x0d &&
-    bytes[5] === 0x0a &&
-    bytes[6] === 0x1a &&
-    bytes[7] === 0x0a
-  )
-    return 'image/png'
-  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff)
-    return 'image/jpeg'
-  if (
-    bytes.length >= 12 &&
-    bytes[0] === 0x52 &&
-    bytes[1] === 0x49 &&
-    bytes[2] === 0x46 &&
-    bytes[3] === 0x46 &&
-    bytes[8] === 0x57 &&
-    bytes[9] === 0x45 &&
-    bytes[10] === 0x42 &&
-    bytes[11] === 0x50
-  )
-    return 'image/webp'
-  return null
-}
-
-function readIssue(value: unknown): RivalsIssue | null {
-  if (!isRecord(value)) return null
-  const code = value.code
-  if (
-    typeof code !== 'string' ||
-    !RIVALS_ISSUE_CODES.includes(code as RivalsIssueCode)
-  )
-    return null
-  const message = value.message
-  if (typeof message !== 'string' || message.length === 0 || message.length > 240)
-    return null
-  const issue: RivalsIssue = { code: code as RivalsIssueCode, message }
-  if (
-    value.field === 'username' ||
-    value.field === 'damage' ||
-    value.field === 'team' ||
-    value.field === 'score'
-  )
-    issue.field = value.field
-  if (isIndex(value.rowIndex)) issue.rowIndex = value.rowIndex
-  return issue
-}
-
-function readIssues(value: unknown): RivalsIssue[] | null {
-  if (!Array.isArray(value)) return null
-  const issues: RivalsIssue[] = []
-  for (const item of value) {
-    const issue = readIssue(item)
-    if (!issue) return null
-    issues.push(issue)
-  }
-  return issues
-}
-
-function readTeam(value: unknown): RivalsTeam | null {
-  if (!isRecord(value)) return null
-  if (!isSlot(value.slot) || !isColor(value.color)) return null
-  if (value.score !== null && !isIndex(value.score)) return null
-  if (value.score !== null && (value.score as number) > 999) return null
-  if (!isConfidence(value.confidence)) return null
-  return {
-    slot: value.slot,
-    color: value.color,
-    score: value.score as number | null,
-    confidence: value.confidence,
-  }
-}
-
-function readRow(value: unknown): RivalsRow | null {
-  if (!isRecord(value)) return null
-  if (!isIndex(value.index)) return null
-  if (value.teamSlot !== null && !isSlot(value.teamSlot)) return null
-  if (value.color !== null && !isColor(value.color)) return null
-  if (value.username !== null) {
-    if (typeof value.username !== 'string') return null
-    if (value.username.length > RIVALS_MAX_USERNAME) return null
-  }
-  if (!isConfidence(value.usernameConfidence)) return null
-  if (value.damage !== null) {
-    if (typeof value.damage !== 'number' || !Number.isInteger(value.damage)) return null
-    if (value.damage < 0 || value.damage > MAX_DAMAGE) return null
-  }
-  if (!isConfidence(value.damageConfidence)) return null
-  if (
-    value.rawDamageText !== undefined &&
-    value.rawDamageText !== null &&
-    typeof value.rawDamageText !== 'string'
-  )
-    return null
-  const issues = readIssues(value.issues)
-  if (!issues) return null
-  return {
-    index: value.index,
-    teamSlot: value.teamSlot as number | null,
-    color: value.color as RivalsTeamColor | null,
-    username: value.username as string | null,
-    usernameConfidence: value.usernameConfidence,
-    damage: value.damage as number | null,
-    damageConfidence: value.damageConfidence,
-    rawDamageText: (value.rawDamageText as string | null | undefined) ?? null,
-    issues,
-  }
-}
-
-/**
- * Validates the OCR service's response before the Worker hands it to the
- * browser. A shape this strict means a broken or hostile upstream cannot smuggle
- * anything into the review UI.
- */
-export function readRivalsScan(value: unknown): RivalsScan | null {
-  if (!isRecord(value)) return null
-  if (value.ok === false) return null
-  if (value.version !== RIVALS_SCAN_VERSION) return null
-  if (!isRecord(value.image)) return null
-  const width = value.image.width
-  const height = value.image.height
-  if (!isIndex(width) || !isIndex(height)) return null
-  if (width === 0 || height === 0) return null
-  if (!Array.isArray(value.teams) || value.teams.length !== 2) return null
-  const teams: RivalsTeam[] = []
-  for (const item of value.teams) {
-    const team = readTeam(item)
-    if (!team) return null
-    teams.push(team)
-  }
-  if (teams[0]!.slot === teams[1]!.slot) return null
-  if (teams[0]!.color === teams[1]!.color) return null
-  if (value.winnerSlot !== null && !isSlot(value.winnerSlot)) return null
-  if (!Array.isArray(value.rows) || value.rows.length === 0) return null
-  if (value.rows.length > RIVALS_MAX_ROWS) return null
-  const rows: RivalsRow[] = []
-  for (const item of value.rows) {
-    const row = readRow(item)
-    if (!row) return null
-    rows.push(row)
-  }
-  const issues = readIssues(value.issues)
-  if (!issues) return null
-  return {
-    version: RIVALS_SCAN_VERSION,
-    image: { width, height },
-    teams,
-    winnerSlot: value.winnerSlot as number | null,
-    rows,
-    issues,
-  }
-}
-
 export type RosterMatchStatus =
   | 'matched'
   | 'suggested'
@@ -309,6 +96,18 @@ export type RosterMatch = {
 /** Roblox handles are case-insensitive and have no internal whitespace. */
 export function normalizeUsername(value: string): string {
   return value.trim().replace(/\s+/g, '').toLowerCase()
+}
+
+/**
+ * A handle folded onto the glyphs a small scoreboard cannot separate.
+ *
+ * At 11 to 14 px the on-device recogniser cannot tell `O` from `0` or `I`, `l`
+ * and `1` apart, and it makes the same choice at every scale — a bias of the
+ * model, not something a better crop can fix. The roster holds the true
+ * spelling, so a folded key that names exactly one roster player settles it.
+ */
+export function foldConfusables(value: string): string {
+  return normalizeUsername(value).replace(/o/g, '0').replace(/[il]/g, '1')
 }
 
 function levenshtein(a: string, b: string): number {
@@ -354,12 +153,17 @@ export function matchRoster(
   players: Player[],
 ): RosterMatch[] {
   const byUsername = new Map<string, Player[]>()
+  const byFolded = new Map<string, Player[]>()
   for (const player of players) {
     const key = normalizeUsername(player.username ?? '')
     if (!key) continue
     const bucket = byUsername.get(key)
     if (bucket) bucket.push(player)
     else byUsername.set(key, [player])
+    const folded = foldConfusables(key)
+    const lookalikes = byFolded.get(folded)
+    if (lookalikes) lookalikes.push(player)
+    else byFolded.set(folded, [player])
   }
 
   const matches = usernames.map((username): RosterMatch => {
@@ -386,6 +190,25 @@ export function matchRoster(
         candidates: exact.map((player) => candidateOf(player, 1)),
         note: 'Two roster players share this username — choose one.',
       }
+
+    // A name that differs from exactly one roster handle only by look-alike
+    // glyphs is that player: the screenshot cannot have meant anything else.
+    const lookalikes = byFolded.get(foldConfusables(key)) ?? []
+    if (lookalikes.length === 1)
+      return {
+        status: 'matched',
+        playerId: lookalikes[0]!.id,
+        candidates: [candidateOf(lookalikes[0]!, 1)],
+        note: `Matched a look-alike spelling — your roster has ${lookalikes[0]!.username ?? lookalikes[0]!.name}.`,
+      }
+    if (lookalikes.length > 1)
+      return {
+        status: 'review',
+        playerId: null,
+        candidates: lookalikes.map((player) => candidateOf(player, 1)),
+        note: 'Roster players differ only by look-alike characters — choose one.',
+      }
+
     const fuzzy = players
       .map((player) => ({
         player,

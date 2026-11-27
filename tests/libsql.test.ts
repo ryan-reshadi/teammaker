@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
 import { databaseFromExecutor, type Executor } from '../src/server/libsql'
 import { createBunSqliteDatabase, bunSqliteExecutor } from '../scripts/bun-sqlite'
-import { createApp } from '../src/worker/app'
+import { compactLog, createApp } from '../src/worker/app'
 import type { Env } from '../src/worker/auth'
 import { ensureSchema, type Database } from '../src/worker/db'
 
@@ -59,7 +59,7 @@ describe('libSQL adapter', () => {
       .prepare('PRAGMA table_info(players)')
       .all<{ name: string }>()
     expect(columns.results.map((column) => column.name)).toEqual(
-      expect.arrayContaining(['tags', 'elo', 'base_elo']),
+      expect.arrayContaining(['tags', 'elo', 'base_elo', 'deleted_at']),
     )
     const migrated = await db
       .prepare('SELECT elo, base_elo, tags FROM players WHERE id = ?')
@@ -417,5 +417,73 @@ describe('libSQL adapter', () => {
       .first<{ payload: string }>()
     expect(JSON.parse(newRow!.payload)).toMatchObject({ formula: 4, k: 64 })
     expect(await results()).toEqual(startResults)
+  })
+
+  test('a squash folds the anchor into base_elo and drops the oldest events', async () => {
+    const db = env.DB!
+    const created = await call(env, '/api/players', 'squash', 'POST', {
+      players: [{ name: 'Ada', skill: 5 }],
+    })
+    const { players } = (await created.json()) as { players: { id: string }[] }
+    const id = players[0]!.id
+
+    // Adjustments are absolute, so this log needs no rating maths to be exact.
+    for (let position = 0; position < 5; position += 1) {
+      await db
+        .prepare(
+          'INSERT INTO rating_events (id, owner_sub, position, kind, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        )
+        .bind(
+          `evt-${position}`,
+          'squash',
+          position,
+          'adjust',
+          JSON.stringify({ playerId: id, elo: 600 + position * 10, reason: 'seed' }),
+          position + 1,
+          position + 1,
+        )
+        .run()
+      await db
+        .prepare(
+          'INSERT INTO rating_results (event_id, owner_sub, slot, player_id, name, elo_before, elo_after, delta) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        )
+        .bind(
+          `evt-${position}`,
+          'squash',
+          '0',
+          id,
+          'Ada',
+          590 + position * 10,
+          600 + position * 10,
+          10,
+        )
+        .run()
+    }
+    await db.prepare('UPDATE players SET elo = 640 WHERE id = ?').bind(id).run()
+
+    expect(await compactLog(db, 'squash', 2)).toEqual({ removed: 3, kept: 2 })
+    expect(
+      await db
+        .prepare('SELECT elo, base_elo FROM players WHERE id = ?')
+        .bind(id)
+        .first(),
+    ).toEqual({ elo: 640, base_elo: 620 })
+    expect(
+      await db
+        .prepare('SELECT COUNT(*) AS total FROM rating_events WHERE owner_sub = ?')
+        .bind('squash')
+        .first(),
+    ).toEqual({ total: 2 })
+    expect(
+      await db
+        .prepare('SELECT COUNT(*) AS total FROM rating_results WHERE owner_sub = ?')
+        .bind('squash')
+        .first(),
+    ).toEqual({ total: 2 })
+    expect(
+      ((await (await call(env, '/api/players', 'squash')).json()) as {
+        players: { elo: number }[]
+      }).players[0]!.elo,
+    ).toBe(640)
   })
 })

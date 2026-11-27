@@ -9,10 +9,6 @@ export type Env = {
   FREEBUFF_CLIENT_ID?: string
   FREEBUFF_ISSUER?: string
   APP_ORIGIN?: string
-  /** Loopback in development, the owner-hosted service in production. */
-  OCR_SERVICE_URL?: string
-  /** Bearer token for that service. Never sent to the browser. */
-  OCR_SERVICE_TOKEN?: string
 }
 
 const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]'])

@@ -1,0 +1,13 @@
+{
+  "note": "4v4 Elimination (Big Crossroads), 910x739. The list scrolls: the last row is cut by the bottom of the panel and is ignored. Usernames are the Roblox handles under the display names.",
+  "teams": { "gold": 5, "purple": 0 },
+  "winner": "gold",
+  "rows": [
+    { "username": "MOnkeyman23287", "team": "gold", "damage": 1050 },
+    { "username": "destruction_lord9", "team": "gold", "damage": 946 },
+    { "username": "DeltaRat13", "team": "gold", "damage": 711 },
+    { "username": "TyggrGMR", "team": "gold", "damage": 678 },
+    { "username": "Demon1X73", "team": "purple", "damage": 650 },
+    { "username": "Madhavr19", "team": "purple", "damage": 250 }
+  ]
+}

@@ -146,6 +146,11 @@ server.
   events before rolling back; the v1 history itself is unaffected.
 - Saved rounds are capped at the newest 100 per account; new saves prune older
   ones.
+- The event log is squashed, not archived: at 1000 events the oldest 500 are
+  folded into each player's `base_elo` and deleted. Ratings never move, but that
+  history is gone — the match list, per-player history and bench counts only
+  cover the kept window, and the match list notes how much was squashed and
+  when. D1 Time Travel (7 days free, 30 paid) is the only way back.
 
 ## How the ratings work
 
@@ -190,20 +195,30 @@ expectation and the damage pool. They are never updated.
   300-point gap to about 85/15 and a 500-point gap to about 95/5; those anchors
   are pinned in `tests/elo.test.ts`. A data-driven recalibration waits until
   enough matches exist and would be a new formula version, not a rewrite.
-- **Replay.** Ratings start at each player's creation elo and are recomputed from
-  the ordered event log. Every match and every manual elo edit stores each
-  player's before/after elo, so editing, reordering or deleting an event restores
-  exactly the ratings history would have produced. The log holds up to 1000 events.
-- **Formula versions.** New events are stamped with formula 2 and the K used for
-  them. Events written before this existed have no marker and are formula 1: they
-  replay with the frozen legacy K stored in `rating_meta`, so replaying old
-  history is byte-identical. Editing never upgrades an event; a v1 match stays v1
-  and a v2 match keeps its recorded K. To inspect a proposed K without changing
+- **Replay.** Ratings start at each player's anchor and are recomputed from the
+  ordered event log. Every match and every manual elo edit stores each player's
+  before/after elo, so editing, reordering or deleting an event restores exactly
+  the ratings history would have produced. When the log reaches 1000 events the
+  next write squashes it: the oldest 500 are replayed once, their result becomes
+  each player's new `base_elo`, and the events are deleted. The kept half then
+  replays forward to the same ratings, so a squash is invisible in the
+  scoreboard and only ever removes history.
+- **Formula versions.** New events are stamped with formula 4 and the K used for
+  them. Events written before versioning existed have no marker and are formula
+  1; those from the provisional era carry 2 or 3. Unmarked events replay with the
+  frozen legacy K stored in `rating_meta`, so replaying old history is
+  byte-identical. Editing never upgrades or re-rates an event; a v1 match stays v1
+  and a marked match keeps the formula and K it was rated with, even after the
+  account K changes. To inspect a proposed K without changing
   anything, run `bun run preview:replay [dbPath] [owner] [proposedK]`: it opens
   the local D1 file read-only and prints per-player current and proposed elo.
   There is no apply path.
-- **Deleting players.** A player named in a match cannot be removed until those
-matches are edited or deleted. Manual rating entries are removed with the player.
+- **Deleting players.** Removing a player archives them (`players.deleted_at`)
+rather than erasing the row. They leave the roster, match pickers and sit-out
+counts, and every match they played keeps its recorded result — editing an old
+match that names them still works. Because the row keeps its creation elo, the
+replay that rebuilds every rating seeds them exactly as before, so no other
+player's elo moves when someone is removed, now or on a later replay.
 
 ## Roles (the tag framework)
 
@@ -260,6 +275,11 @@ each player's DMG value, which team their row belongs to (gold or purple) and th
 two team scores at the top — then asks you to review everything before submitting
 an ordinary match.
 
+- **Paste or upload.** A capture that is already on the clipboard — Print Screen
+  and every snipping tool put it there — is pasted straight into the panel with
+  Ctrl+V, and goes through the same type and size checks as a picked file. The
+  paste is accepted only while the panel is waiting for a screenshot, so it can
+  never replace a scan in progress or a review being edited.
 - **Handles, not display names.** Each row's username is the Roblox handle
   printed under the display name (the `@name` line), so a roster player is
   matched by `destruction_lord9` rather than by `PVPDreadlord`. A row that shows
@@ -290,30 +310,20 @@ an ordinary match.
   screen, the match log is refreshed, and saving becomes possible again only after
   you have checked the log.
 
-### The OCR service
+### Reading a screenshot
 
-The browser never talks to an OCR provider. `POST /api/rivals/scan` on the Worker
-signs the request with a bearer token, forwards the image to a small Python
-service and validates the JSON before returning it; the credential never reaches
-the client. Screenshots are held in memory only, never written to storage, and
-both sides cap size (8 MB) and pixel dimensions (4096). The route has its own
-8 MB body limit, so the 64 KB limit every other data route depends on is
-unchanged.
+The scan runs in the browser, on the user's own machine. The Worker has no
+screenshot route and holds no OCR credential, and the image is never uploaded:
+the client decodes it (PNG/JPEG/WebP, 8 MB, 4096 px), runs the ported geometry
+and PaddleOCR through `onnxruntime-web`, and hands the review UI the same shape
+it always consumed. The engine is a lazy chunk, so a visitor who never imports a
+screenshot downloads none of it. Screenshots stay in memory and are never
+stored.
 
-The OCR call itself is bounded at **28 s**, which leaves 2 s for the rest of the
-function under Vercel's 30 s `maxDuration`. On the five real captures a cold
-first request costs 2–5 s on a many-core host and 15–24 s pinned to two vCPUs,
-so that is the smallest container the budget supports; one vCPU needs 30–51 s
-and always times out. A scan that overruns is answered with a retryable 502 and
-never records anything. Recognition cost is dominated by the table pass (one
-call, every text line), not by image size, so more pixels of CPU buy more than
-smaller screenshots.
-
-The service lives in `ocr/` and is optional at runtime: when it is not running,
-the import panel says exactly what is wrong and every other feature works as
-before. Create its virtualenv once, then use the npm scripts — they run that
-interpreter, and stop with the install command if the venv, or PaddleOCR inside
-it, is missing:
+The Python implementation in `ocr/` is kept as the reference the browser port was
+checked against, capture by capture. Create its virtualenv once, then use the npm
+scripts — they run that interpreter, and stop with the install command if the
+venv, or PaddleOCR inside it, is missing:
 
 ```sh
 python -m venv ocr/.venv
@@ -325,17 +335,9 @@ bun run ocr:test       # the Python suite, same interpreter
 bun run ocr:captures   # measure the real screenshots in ocr/tests/captures
 ```
 
-Then copy `.dev.vars.example` to `.dev.vars` (the token must match the one the
-service was started with) and start `bun run dev` — Vite reads `.dev.vars` once,
-at startup, so restart it after editing the file.
-
-`GET /api/rivals/config` is what the import panel renders: it probes the
-service's `/health` once and reports `ready`, `unconfigured` (with `missing`
-naming `OCR_SERVICE_URL` and/or `OCR_SERVICE_TOKEN`), `invalid_url`,
-`unreachable`, `timeout` or `error`, plus a `message` the UI shows verbatim. The
-original `configured`, `maxBytes` and `acceptedTypes` fields are unchanged, so an
-older client keeps working. `ocr/README.md` documents the request/response
-contract, the pipeline stages, the Docker image and the hosting constraints.
+`bun run dev` serves the whole app; importing a screenshot needs nothing else
+running. `ocr/README.md` documents the reference service's request/response
+contract, pipeline stages and Docker image.
 
 ### Measuring real screenshots
 
@@ -387,12 +389,14 @@ rating_results(event_id TEXT, owner_sub TEXT, slot TEXT, player_id TEXT,
 settings(owner_sub TEXT PRIMARY KEY, k_factor INTEGER, updated_at INTEGER)
 
 rating_meta(owner_sub TEXT PRIMARY KEY, legacy_k INTEGER, created_at INTEGER)
+
+log_squashes(owner_sub TEXT PRIMARY KEY, removed INTEGER, squashed_at INTEGER)
 ```
 
 `players.tags` is a JSON array of role ids (`'["sniper","igl"]'`). `elo` is the
-live rating, `base_elo` is the creation anchor replay starts from, and `skill` is
-a derived mirror (round(elo / 100)) kept so older readers and saved rounds still
-work. Workspaces created before roles or elo existed are migrated in place:
+live rating, `base_elo` is the anchor replay starts from (the creation elo, moved
+forward by a squash), and `skill` is a derived mirror (round(elo / 100)) kept so
+older readers and saved rounds still work. Workspaces created before roles or elo existed are migrated in place:
 `ensureSchema` reads `PRAGMA table_info(players)`, adds the missing columns and
 sets `elo = base_elo = skill × 100` for existing players. No history is invented.
 
@@ -401,6 +405,8 @@ with damage, the index of the winner, and — on new events only — `formula: 4
 and the base `k`) or a manual adjustment (player id, elo, reason). `rating_meta`
 pins the K that produced pre-versioning ratings; it is written lazily, never
 rewrites an event, and has no row until a K change or the first v2 match.
+`log_squashes` accumulates what each squash removed and when it last ran; it is
+read only to explain missing history and never feeds a replay.
 `rating_results` holds the per-player before/after bookkeeping for each event,
 rewritten whenever the affected part of the log is replayed. Rows are scoped by
 `owner_sub = user.sub`.
@@ -453,9 +459,9 @@ device.
 | POST | `/api/players` | `{ name, username?, skill, tags? }` or `{ players: [...] }` (max 50) |
 | PATCH | `/api/players/:id` | any of `name`, `username`, `skill`, `elo`, `tags`, `sittingOut` |
 | POST | `/api/players/:id/elo` | `{ elo, reason? }`, logs a manual adjustment |
-| DELETE | `/api/players/:id` | 409 while the player has match history |
+| DELETE | `/api/players/:id` | archives the player; their match history is kept |
 | GET | `/api/matches` | the ordered rating log, with before/after elo |
-| POST | `/api/matches` | `{ label?, teams: [team, …], winner }`, 2–8 teams |
+| POST | `/api/matches` | `{ label?, teams: [team, …], winner }`, 2–8 teams; a full log is squashed first |
 | PATCH | `/api/matches/:id` | `{ input }` and/or `{ position }`, then replays |
 | DELETE | `/api/matches/:id` | removes the event and replays the rest |
 | GET | `/api/settings` | `{ kFactor }` |
@@ -463,14 +469,10 @@ device.
 | GET | `/api/rounds` | newest 60 snapshots |
 | POST | `/api/rounds` | `{ config }`, validated and pruned to 100 |
 | DELETE | `/api/rounds/:id` | |
-| GET | `/api/rivals/config` | screenshot import availability, size and type limits |
-| POST | `/api/rivals/scan` | multipart `image`, proxied to the OCR service |
 
 Data routes answer 401 when signed out, 403 for cross-origin mutations, 400 for
-invalid input, 413 above 64 KB and 503 when no database is bound. The screenshot
-route is the one exception to the body limit: it has its own 8 MB cap and its own
-session guard, mounted ahead of the JSON limit rather than widening it. Responses
-are `Cache-Control: private, no-store` and every query binds parameters.
+invalid input, 413 above 64 KB and 503 when no database is bound. Responses are
+`Cache-Control: private, no-store` and every query binds parameters.
 
 ## Tests
 
@@ -496,7 +498,9 @@ are `Cache-Control: private, no-store` and every query binds parameters.
 - `tests/app.test.ts` — the real API against a Miniflare D1 database: CRUD, bulk
   add, two-user isolation, round snapshots, role tags round-tripping through
   create and patch (with unknown ids rejected), signed-out refusals, foreign and
-  absent origins, malformed input, oversized bodies and the missing-database path.
+  absent origins, malformed input, oversized bodies, the missing-database path,
+  and editing a v4 match keeping its stamped formula and K after the account K
+  changes.
 - `tests/roles.test.ts` — the catalogue, tag normalisation and bitmasks, coverage
   gaps (including specialists being ignored), role ranking breaking ties between
   equally balanced splits, and a multi-role player counting for every role.
@@ -513,15 +517,20 @@ are `Cache-Control: private, no-store` and every query binds parameters.
 - `tests/rematch.test.ts` — line-up copying, fresh random keys, blank damage and
   missing-player refusal.
 - `tests/rivals.test.ts` — the screenshot extraction contract, exact and
-  case-insensitive roster matching, fuzzy suggestions that are never applied
-  automatically, duplicate usernames and duplicate players, team swaps, zero
-  damage, invalid damage and winner values, untracked randoms, the exact
-  `MatchInput` payload, and the scan validator.
-- `tests/rivals-import.test.ts` — the screenshot routes against Miniflare D1:
-  signed-out 401s, foreign-origin 403s, the unconfigured 503, magic-byte
-  rejection, the 8 MB cap, a 1 MB upload that the 64 KB JSON limit must not
-  block, the unweakened JSON limit, the proxied OCR call and its bearer token,
-  and upstream failures becoming 502s.
+  case-insensitive roster matching, look-alike handles settled by the roster,
+  fuzzy suggestions that are never applied automatically, duplicate usernames
+  and duplicate players, team swaps, zero damage, invalid damage and winner
+  values, untracked randoms, and the exact `MatchInput` payload.
+- `tests/rivals-browser.test.tsx` — the real import panel in a DOM, with only the
+  OCR engine stubbed: the File reaches the scanner, the panel needs no service
+  configured, an engine that cannot start shows an error, and a confirmed review
+  submits through the actual Worker app.
+- `tests/rivals-layout.test.ts` — the scoreboard geometry a 5v5 capture broke:
+  the DMG window is one player row tall, so a merged team band cannot reach the
+  kill count beside it, and a handle the recogniser split at a highlight band is
+  joined back into one username.
+- `tests/body-limit.test.ts` — the 64 KB JSON cap still refuses a 70 KB body now
+  that no route carries a larger limit of its own.
 
 `python ocr/tests/run_tests.py` runs the OCR service's own suite against
 synthetic scoreboard fixtures: username, damage, zero damage, team colours
@@ -588,34 +597,10 @@ missing env var. The environment names are the same everywhere:
 | `TURSO_AUTH_TOKEN` | Vercel | libSQL token |
 | `APP_ORIGIN` | Vercel / Sites | canonical origin for cookies and CSRF |
 | `FREEBUFF_CLIENT_ID` / `FREEBUFF_ISSUER` | Vercel / Sites | public OIDC client |
-| `OCR_SERVICE_URL` | Vercel / Sites | base URL of the OCR service (loopback in development) |
-| `OCR_SERVICE_TOKEN` | Vercel / Sites | bearer token for that service; a secret, never public |
 
-The OCR service is the one piece that cannot live on Sites or in the Vercel
-function: Workers cannot run OpenCV/PaddlePaddle native code, and the Python
-function bundle limit is a poor fit for Paddle's wheels and models. Until the two
-variables below are set *and* the service behind them answers, the import mode
-reports the specific reason and no other feature changes.
-
-1. Run the container in `ocr/Dockerfile` on an always-on public **CPU** host:
-   **at least 2 vCPUs** and 1 GB RAM, with **no scale-to-zero**. Measured on the
-   five real captures, a cold first request takes 15–24 s on two vCPUs (roughly
-   2–5 s on eight or more); the first request also loads the Paddle models, and
-   a scale-to-zero container pays that again after every idle period. oneDNN is
-   deliberately off — it crashes with the Paddle version pinned in
-   `ocr/requirements.txt` on Linux as well as Windows — so cores, not a flag,
-   are what buy headroom.
-2. Give it `OCR_HOST=0.0.0.0`, `OCR_PORT=8000` and a long random
-   `OCR_SERVICE_TOKEN`. It speaks plain HTTP, so terminate TLS in front of it
-   (the host's ingress or a reverse proxy) and confirm `https://<host>/health`
-   answers `{"ok":true,…}` from outside your network.
-3. In Vercel, set `OCR_SERVICE_URL=https://<host>` (the base URL only — the
-   Worker appends `/scan` and `/health`) and the same `OCR_SERVICE_TOKEN`, for
-   the Production environment.
-4. **Redeploy.** Vercel applies environment variables only to new deployments,
-   so an existing one keeps reporting the old state until it is rebuilt.
-
-A different port is fine as long as `OCR_SERVICE_URL` includes it.
+Screenshot import needs no extra deployment: scanning runs in the browser, so
+there is no OCR service to host and no credential to configure. The reference
+implementation in `ocr/` (see `ocr/README.md`) is for local comparison only.
 
 `bun run serve:node` starts the same handler on `127.0.0.1:5174` under Bun
 against a SQLite file. To exercise the **actual Vercel runtime path** — plain

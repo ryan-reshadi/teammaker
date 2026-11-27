@@ -3,8 +3,6 @@ import {
   buildRivalsMatchInput,
   matchRoster,
   normalizeUsername,
-  readRivalsScan,
-  sniffImageType,
   usernameSimilarity,
   type RivalsDraft,
   type RivalsScan,
@@ -100,8 +98,15 @@ describe('roster matching', () => {
     expect(match?.playerId).toBe('p1')
   })
 
-  test('a fuzzy match is only a suggestion', () => {
+  test('a look-alike spelling is settled by the roster', () => {
+    // The on-device recogniser reads O as 0 and I/l as 1; the roster spelling wins.
     const [match] = matchRoster(['sniperk1ng'], players)
+    expect(match?.status).toBe('matched')
+    expect(match?.playerId).toBe('p1')
+  })
+
+  test('a fuzzy match is only a suggestion', () => {
+    const [match] = matchRoster(['sniperkng'], players)
     expect(match?.status).toBe('suggested')
     expect(match?.playerId).toBeNull()
     expect(match?.candidates[0]?.id).toBe('p1')
@@ -176,7 +181,7 @@ describe('review draft', () => {
     const draft = draftFromScan(
       scan([
         row({ index: 0, username: 'sniperking', damage: 10 }),
-        row({ index: 1, username: 'sniperk1ng', damage: 20 }),
+        row({ index: 1, username: 'sniperkng', damage: 20 }),
         row({ index: 2, teamSlot: 1, color: 'purple', username: 'nightowl', damage: 30 }),
       ]),
       players,
@@ -414,58 +419,3 @@ describe('MatchInput building', () => {
   })
 })
 
-describe('scan validator', () => {
-  const valid = typicalScan()
-
-  test('accepts the documented document', () => {
-    expect(readRivalsScan(JSON.parse(JSON.stringify(valid)))).not.toBeNull()
-  })
-
-  test('rejects an unsupported version or shape', () => {
-    expect(readRivalsScan({ ...valid, version: 2 })).toBeNull()
-    expect(readRivalsScan({ ...valid, image: { width: 0, height: 10 } })).toBeNull()
-    expect(readRivalsScan({ ...valid, ok: false })).toBeNull()
-    expect(readRivalsScan('nope')).toBeNull()
-  })
-
-  test('rejects damage that is not an integer in range', () => {
-    const bad = JSON.parse(JSON.stringify(valid)) as RivalsScan
-    ;(bad.rows[0] as unknown as { damage: unknown }).damage = '5'
-    expect(readRivalsScan(bad)).toBeNull()
-    const negative = JSON.parse(JSON.stringify(valid)) as RivalsScan
-    ;(negative.rows[0] as unknown as { damage: unknown }).damage = -1
-    expect(readRivalsScan(negative)).toBeNull()
-  })
-
-  test('rejects teams that cannot be told apart', () => {
-    const bad = JSON.parse(JSON.stringify(valid)) as RivalsScan
-    bad.teams = [
-      { slot: 0, color: 'gold', score: 1, confidence: 0.5 },
-      { slot: 1, color: 'gold', score: 2, confidence: 0.5 },
-    ]
-    expect(readRivalsScan(bad)).toBeNull()
-  })
-
-  test('rejects an unknown issue code or confidence above 1', () => {
-    const unknownIssue = JSON.parse(JSON.stringify(valid)) as unknown as {
-      issues: { code: string; message: string }[]
-    }
-    unknownIssue.issues = [{ code: 'guessed', message: 'nope' }]
-    expect(readRivalsScan(unknownIssue)).toBeNull()
-    const badConfidence = JSON.parse(JSON.stringify(valid)) as RivalsScan
-    ;(badConfidence.rows[0] as unknown as { usernameConfidence: number }).usernameConfidence = 2
-    expect(readRivalsScan(badConfidence)).toBeNull()
-  })
-
-  test('magic bytes decide the upload type', () => {
-    expect(sniffImageType(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))).toBe(
-      'image/png',
-    )
-    expect(sniffImageType(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]))).toBe('image/jpeg')
-    const webp = new Uint8Array(16)
-    webp.set([0x52, 0x49, 0x46, 0x46], 0)
-    webp.set([0x57, 0x45, 0x42, 0x50], 8)
-    expect(sniffImageType(webp)).toBe('image/webp')
-    expect(sniffImageType(new TextEncoder().encode('<html></html>'))).toBeNull()
-  })
-})

@@ -7,12 +7,7 @@ import {
   type MatchesResponse,
 } from '../shared/elo'
 import { normalizeTags } from '../shared/roles'
-import {
-  RIVALS_ACCEPTED_TYPES,
-  RIVALS_MAX_BYTES,
-  type RivalsConfig,
-  type RivalsScan,
-} from '../shared/rivals'
+import type { RivalsScan } from '../shared/rivals'
 import type { Player, Round, RoundConfig } from '../shared/types'
 
 export type PlayerDraft = {
@@ -24,8 +19,6 @@ export type PlayerDraft = {
 export type PlayerPatch = Partial<
   Pick<Player, 'name' | 'username' | 'skill' | 'elo' | 'tags' | 'sittingOut'>
 >
-
-export type { RivalsConfig }
 
 export type Store = {
   players: () => Promise<Player[]>
@@ -41,8 +34,15 @@ export type Store = {
   rounds: () => Promise<Round[]>
   addRound: (config: RoundConfig) => Promise<Round>
   removeRound: (id: string) => Promise<void>
-  rivalsConfig: () => Promise<RivalsConfig>
-  scanRivals: (file: File) => Promise<RivalsScan>
+  /**
+   * Reads a scoreboard screenshot on this device. `onProgress` carries the
+   * engine's loading and reading messages straight to the panel.
+   */
+  scanRivals: (
+    file: File,
+    onProgress?: (message: string) => void,
+    signal?: AbortSignal,
+  ) => Promise<RivalsScan>
 }
 
 const PLAYERS_KEY = 'teammaker.players.v1'
@@ -125,7 +125,14 @@ function localStore(): Store {
       const players = readLocal<Player>(PLAYERS_KEY).map(withElo)
       const current = players.find((player) => player.id === id)
       if (!current) throw new Error('That player is no longer on the roster.')
-      const next = withElo({ ...current, ...patch, updatedAt: Date.now() })
+      const merged = { ...current, ...patch, updatedAt: Date.now() }
+      // The 1-10 control sends a skill-only patch, and elo is the stored
+      // rating: convert it the way the remote route does. An explicit elo wins.
+      const next = withElo(
+        patch.elo === undefined && patch.skill !== undefined
+          ? { ...merged, elo: eloFromSkill(patch.skill) }
+          : merged,
+      )
       writeLocal(
         PLAYERS_KEY,
         players.map((player) => (player.id === id ? next : player)),
@@ -138,7 +145,11 @@ function localStore(): Store {
         readLocal<Player>(PLAYERS_KEY).filter((player) => player.id !== id),
       )
     },
-    matches: unsupported,
+    async matches() {
+      // Device-only mode has no match log by design: guests rate by hand and
+      // nothing is replayed. A future local log must return it from here.
+      return { kFactor: DEFAULT_K_FACTOR, events: [], squashed: null }
+    },
     addMatch: unsupported,
     updateMatch: unsupported,
     moveMatch: unsupported,
@@ -158,17 +169,6 @@ function localStore(): Store {
         ROUNDS_KEY,
         readLocal<Round>(ROUNDS_KEY).filter((round) => round.id !== id),
       )
-    },
-    async rivalsConfig() {
-      // Guests never reach the Worker, so there is no service to probe here.
-      return {
-        configured: false,
-        status: 'unconfigured' as const,
-        missing: [],
-        message: 'Sign in to import matches from a screenshot.',
-        maxBytes: RIVALS_MAX_BYTES,
-        acceptedTypes: [...RIVALS_ACCEPTED_TYPES],
-      }
     },
     scanRivals: unsupported,
   }
@@ -242,28 +242,14 @@ function remoteStore(): Store {
     async removeRound(id) {
       await request(`/api/rounds/${id}`, { method: 'DELETE' })
     },
-    async rivalsConfig() {
-      return request<RivalsConfig>('/api/rivals/config')
-    },
-    async scanRivals(file) {
-      // A separate request path from the JSON routes: this one uploads an
-      // image, so it must not share the 64 KB JSON body limit.
-      const form = new FormData()
-      form.append('image', file)
-      const response = await fetch('/api/rivals/scan', {
-        method: 'POST',
-        body: form,
-      })
-      const body = (await response.json().catch(() => null)) as
-        | (RivalsScan & { error?: string })
-        | null
-      if (!response.ok)
-        throw new Error(
-          body?.error || 'That screenshot could not be read. Please try again.',
-        )
-      if (!body)
-        throw new Error('The screenshot service returned nothing. Please try again.')
-      return body
+    async scanRivals(file, onProgress, signal) {
+      // The whole scan runs in this tab: the screenshot never leaves the device,
+      // so there is no service to keep running and no per-import cost.
+      //
+      // Imported on demand: the engine plus its WASM is tens of megabytes, and a
+      // user who never imports a screenshot should never download any of it.
+      const { scanScreenshot } = await import('./ocr')
+      return scanScreenshot(file, onProgress, { signal })
     },
   }
 }

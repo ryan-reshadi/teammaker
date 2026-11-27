@@ -6,10 +6,11 @@
 ## Why
 
 The roster is the app's editing surface, but each player is a single line carrying
-six controls: name, elo badge, provisional `P`, rating-history arrow, ten rating
-ticks, "Sit out" and `×`. The panel is capped at 400px and the name is the only
-flexible column, so it collapses to roughly 70px and every name truncates
-(`A...`, `T... Bu...`, `Mink...`). Renaming is worse: the name and username inputs
+controls: name, elo badge, rating-history arrow, ten rating ticks, "Sit out" and
+`×`. (The provisional `P` badge has since been retired with the flat-K change, so
+the roster no longer shows it; the layout below is otherwise current.) The panel
+is capped at 400px and the name is the only flexible column, so it collapses to
+roughly 70px and every name truncates (`A...`, `T... Bu...`, `Mink...`). Renaming is worse: the name and username inputs
 are forced into that same 70px column, so you cannot read what you are typing.
 
 ## Goals
@@ -62,7 +63,7 @@ Markup in `src/client/components/Roster.tsx`:
     name button (name, then username underneath)  |  details editor
   </div>
   <div class="player-rating">      ← line 2, full width
-    rating ticks + value            ...            elo badge · P · history arrow
+    rating ticks + value            ...            elo badge · history arrow
   </div>
   <div class="player-foot">        ← line 3, wraps
     role chips                     ...            sit-out toggle · remove
@@ -76,15 +77,15 @@ Sketch:
 ```
 Ada Lovelace
 ada#1
-▮▮▮▮▮▯▯▯▯▯ 5                     [500] P ↗
+▮▮▮▮▮▯▯▯▯▯ 5                     [500] ↗
 Sniper IGL                   [Sit out]  ×
 ```
 
 - Line 1 holds only the identity, so the name and username get the full ~350px;
   the username sits under the name in muted text rather than as a truncated chip
   beside it.
-- Line 2 is the rating on its own line, with the exact elo, the provisional `P`
-  and the history arrow aligned right. The ticks can grow into the freed width
+- Line 2 is the rating on its own line, with the exact elo and the history arrow
+  aligned right. The ticks can grow into the freed width
   instead of being 6px slivers.
 - Line 3 carries the role chips (left) and sit-out plus remove (right).
 - `.player-details-editor` replaces line 1 with the two inputs stacked at full

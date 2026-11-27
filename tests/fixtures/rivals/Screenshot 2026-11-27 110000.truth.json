@@ -1,0 +1,12 @@
+{
+  "note": "5v5 Docks, 812x684, gold 4 vs purple 5. Rows 0, 3 and 4 print only a display name, and M0nkeyman23287's second glyph is an O/0 the board draws identically, so their usernames are not asserted. Rows 1 and 2 print handles, and those are.",
+  "teams": { "gold": 4, "purple": 5 },
+  "winner": "purple",
+  "rows": [
+    { "team": "gold", "damage": 2107 },
+    { "username": "TyggrGMR", "team": "gold", "damage": 1737 },
+    { "username": "destruction_lord9", "team": "purple", "damage": 929 },
+    { "team": "purple", "damage": 788 },
+    { "team": "purple", "damage": 582 }
+  ]
+}

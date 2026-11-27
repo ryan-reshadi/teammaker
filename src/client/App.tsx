@@ -8,6 +8,7 @@ import {
   skillFromElo,
   type MatchInput,
   type RatingEventView,
+  type SquashInfo,
 } from '../shared/elo'
 import type { Player, Round, RoundConfig, Session } from '../shared/types'
 import { Build } from './components/Build'
@@ -47,6 +48,7 @@ export function App() {
   const [rounds, setRounds] = useState<Round[]>([])
   const [events, setEvents] = useState<RatingEventView[]>([])
   const [kFactor, setKFactor] = useState(DEFAULT_K_FACTOR)
+  const [squashed, setSquashed] = useState<SquashInfo | null>(null)
   const [teamCount, setTeamCount] = useState(3)
   const [tolerance, setTolerance] = useState(300)
   const [error, setError] = useState('')
@@ -84,18 +86,28 @@ export function App() {
     setReady(false)
     void (async () => {
       try {
-        const [loadedPlayers, loadedRounds, loadedMatches] = await Promise.all([
+        // Load the sections independently: a missing match log must not blank
+        // the roster and rounds, and one failed request should not discard the
+        // sections that answered.
+        const results = await Promise.allSettled([
           store.players(),
           store.rounds(),
           store.matches(),
         ])
         if (!live) return
-        setPlayers(loadedPlayers)
-        setRounds(loadedRounds)
-        setEvents(loadedMatches.events)
-        setKFactor(loadedMatches.kFactor)
-      } catch (problem) {
-        if (live) setError(message(problem))
+        const [loadedPlayers, loadedRounds, loadedMatches] = results
+        if (loadedPlayers.status === 'fulfilled')
+          setPlayers(loadedPlayers.value)
+        if (loadedRounds.status === 'fulfilled') setRounds(loadedRounds.value)
+        if (loadedMatches.status === 'fulfilled') {
+          setEvents(loadedMatches.value.events)
+          setKFactor(loadedMatches.value.kFactor)
+          setSquashed(loadedMatches.value.squashed)
+        }
+        const failure = results.find(
+          (result): result is PromiseRejectedResult => result.status === 'rejected',
+        )
+        if (failure) setError(message(failure.reason))
       } finally {
         if (live) setReady(true)
       }
@@ -119,6 +131,7 @@ export function App() {
     const loaded = await store.matches()
     setEvents(loaded.events)
     setKFactor(loaded.kFactor)
+    setSquashed(loaded.squashed)
   }, [store])
 
   const addPlayers = useCallback(
@@ -411,20 +424,16 @@ export function App() {
           players={players}
           events={events}
           kFactor={kFactor}
+          squashed={squashed}
           remote={remote}
           onSave={saveMatch}
           onDelete={removeMatch}
           onMove={moveMatch}
           onKFactor={changeKFactor}
           onRefresh={refreshMatches}
-          onConfig={() =>
+          onScan={(file, onProgress, signal) =>
             store
-              ? store.rivalsConfig()
-              : Promise.reject(new Error('Sign in to import screenshots.'))
-          }
-          onScan={(file) =>
-            store
-              ? store.scanRivals(file)
+              ? store.scanRivals(file, onProgress, signal)
               : Promise.reject(new Error('Sign in to import screenshots.'))
           }
         />

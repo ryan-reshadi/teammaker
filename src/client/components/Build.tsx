@@ -50,7 +50,12 @@ function TeamColumn({
   return (
     <div
       className="team"
-      style={{ '--team-color': teamColor(index) } as CSSProperties}
+      style={
+        {
+          '--team-color': teamColor(index),
+          '--team-index': index,
+        } as CSSProperties
+      }
     >
       <div className="team-head">
         <span className="team-name">Team {index + 1}</span>

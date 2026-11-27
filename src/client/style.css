@@ -15,6 +15,12 @@
   --warn-soft: #f8e9d8;
   --danger: #9a4037;
   --radius: 20px;
+  /* Motion: one rhythm for the whole app. */
+  --dur-1: 120ms;
+  --dur-2: 180ms;
+  --dur-3: 260ms;
+  --ease-out: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --ease-soft: cubic-bezier(0.4, 0, 0.2, 1);
   color-scheme: light;
 }
 
@@ -61,6 +67,46 @@ button {
 button:disabled {
   cursor: not-allowed;
   opacity: 0.45;
+}
+
+/* One hover/press rhythm for every control, so nothing snaps while its
+   neighbour fades. Focus rings are deliberately left instant. */
+button.primary,
+.stepper button,
+.pager button,
+.icon-button,
+.elo-badge,
+.history-button,
+.skill-tick,
+.sit-toggle,
+.role-option,
+.match-mode .chip,
+.rivals-drop {
+  transition:
+    background-color var(--dur-1) var(--ease-soft),
+    border-color var(--dur-1) var(--ease-soft),
+    color var(--dur-1) var(--ease-soft),
+    opacity var(--dur-1) var(--ease-soft),
+    transform var(--dur-1) var(--ease-soft);
+}
+
+.quiet,
+.buried-link,
+.link-button {
+  transition: color var(--dur-1) var(--ease-soft);
+}
+
+/* A press is a nudge, never a size or position change. */
+button.primary:active:not(:disabled),
+.stepper button:active:not(:disabled),
+.pager button:active:not(:disabled),
+.icon-button:active,
+.elo-badge:active,
+.history-button:active,
+.sit-toggle:active,
+.role-option:active,
+.match-mode .chip:active {
+  transform: translateY(1px);
 }
 
 ul {
@@ -332,15 +378,10 @@ button.primary {
   font-size: 13.5px;
   font-weight: 550;
   min-height: 38px;
-  transition: background 120ms ease, transform 120ms ease;
 }
 
 button.primary:hover:not(:disabled) {
   background: #253c2f;
-}
-
-button.primary:active:not(:disabled) {
-  transform: translateY(1px);
 }
 
 button.quiet {
@@ -409,7 +450,7 @@ button.quiet {
   gap: 6px;
   padding: 12px 0;
   border-bottom: 1px solid var(--line);
-  transition: opacity 140ms ease;
+  transition: opacity var(--dur-2) var(--ease-soft);
 }
 
 .player-main {
@@ -465,8 +506,10 @@ button.quiet {
   margin-left: auto;
 }
 
+/* Dimmed, not hidden: 0.7 keeps the row's text above 4.5:1 on the card and
+   the "Out" chip carries the state. */
 .player-row.benched {
-  opacity: 0.55;
+  opacity: 0.7;
 }
 
 .player-name {
@@ -574,7 +617,8 @@ button.quiet {
   border: 0;
   border-radius: 2px;
   background: var(--paper-deep);
-  transition: background 100ms ease, transform 100ms ease;
+  /* Grows upward like a level meter, so hover never shifts the row. */
+  transform-origin: bottom center;
 }
 
 .skill-tick.filled {
@@ -584,6 +628,13 @@ button.quiet {
 .skill-tick:hover {
   background: #93a891;
   transform: scaleY(1.12);
+}
+
+/* The tick that was just chosen presses down and settles, so a click that
+   only recolours its neighbours still has a visible place. Fires on the
+   checked tick alone, which is exactly the value being set. */
+.skill-tick[aria-checked='true'] {
+  animation: tick-pop var(--dur-3) var(--ease-out);
 }
 
 .skill-value {
@@ -606,7 +657,6 @@ button.quiet {
   background: transparent;
   color: var(--muted);
   white-space: nowrap;
-  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
 }
 
 .sit-toggle:hover {
@@ -793,16 +843,26 @@ button.generate {
 }
 
 .skeleton span {
+  position: relative;
+  overflow: hidden;
   height: 14px;
   border-radius: 7px;
+  background: var(--paper-deep);
+}
+
+/* The sweep is a translated layer, not a moving background: no repaint. */
+.skeleton span::after {
+  content: '';
+  position: absolute;
+  inset: 0;
   background: linear-gradient(
     90deg,
-    var(--paper-deep) 0%,
-    #f3efe4 50%,
-    var(--paper-deep) 100%
+    transparent 0%,
+    #f7f4ec 50%,
+    transparent 100%
   );
-  background-size: 200% 100%;
-  animation: shimmer 1.2s linear infinite;
+  transform: translateX(-100%);
+  animation: shimmer 1.4s var(--ease-soft) infinite;
 }
 
 .skeleton span:nth-child(1) {
@@ -888,32 +948,10 @@ button.generate {
   border-radius: 14px;
   padding: 12px;
   min-width: 0;
-  animation: rise 320ms cubic-bezier(0.2, 0.7, 0.3, 1) backwards;
-}
-
-.team:nth-child(1) {
-  animation-delay: 0ms;
-}
-.team:nth-child(2) {
-  animation-delay: 40ms;
-}
-.team:nth-child(3) {
-  animation-delay: 80ms;
-}
-.team:nth-child(4) {
-  animation-delay: 120ms;
-}
-.team:nth-child(5) {
-  animation-delay: 160ms;
-}
-.team:nth-child(6) {
-  animation-delay: 200ms;
-}
-.team:nth-child(7) {
-  animation-delay: 240ms;
-}
-.team:nth-child(8) {
-  animation-delay: 280ms;
+  /* A short, capped stagger: the last team is in by ~400ms, so paging
+     confirms the change instead of making the reader wait for it. */
+  animation: rise var(--dur-2) var(--ease-out) backwards;
+  animation-delay: calc(var(--team-index, 0) * 28ms);
 }
 
 .team-head {
@@ -950,7 +988,10 @@ button.generate {
   height: 100%;
   border-radius: 999px;
   background: var(--team-color);
-  transition: width 260ms ease;
+  /* scaleX, not width: the fill grows on the compositor with no reflow. */
+  transform-origin: left center;
+  animation: grow var(--dur-3) var(--ease-out) backwards;
+  animation-delay: calc(var(--team-index, 0) * 28ms);
 }
 
 .team-list {
@@ -1043,7 +1084,7 @@ button.generate {
   text-align: center;
   color: var(--muted);
   font-size: 14px;
-  transition: transform 160ms ease;
+  transition: transform var(--dur-2) var(--ease-out);
 }
 
 .round-row[open] .round-caret {
@@ -1054,6 +1095,11 @@ button.generate {
   display: grid;
   gap: 6px;
   padding: 8px 0 2px;
+}
+
+/* Runs when the details opens, so the panel settles instead of snapping. */
+.round-row[open] .round-teams {
+  animation: reveal var(--dur-1) var(--ease-out);
 }
 
 .round-team {
@@ -1108,7 +1154,6 @@ button.generate {
   border: 1px solid var(--line-strong);
   background: transparent;
   color: var(--ink-soft);
-  transition: background 110ms ease, border-color 110ms ease, color 110ms ease;
 }
 
 .role-option:hover {
@@ -1226,7 +1271,42 @@ button.generate {
 @keyframes rise {
   from {
     opacity: 0;
-    transform: translateY(6px);
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes grow {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+
+@keyframes tick-pop {
+  0% {
+    transform: scaleY(0.9);
+    background-color: #93a891;
+  }
+  55% {
+    transform: scaleY(1.16);
+    background-color: var(--accent);
+  }
+  100% {
+    transform: scaleY(1);
+    background-color: var(--accent);
+  }
+}
+
+@keyframes reveal {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
   }
   to {
     opacity: 1;
@@ -1236,11 +1316,20 @@ button.generate {
 
 @keyframes shimmer {
   from {
-    background-position: 200% 0;
+    transform: translateX(-100%);
   }
   to {
-    background-position: -200% 0;
+    transform: translateX(100%);
   }
+}
+
+/* Notices, errors and warnings settle in rather than pop. Appearance only:
+   they still leave instantly, so nothing lingers once the message is stale. */
+.notice,
+.error,
+.warning,
+.saved {
+  animation: reveal var(--dur-2) var(--ease-out);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1248,8 +1337,12 @@ button.generate {
   *::before,
   *::after {
     animation-duration: 0.001ms !important;
+    /* Delays are part of the motion: leaving them would still stagger
+       the team cards into view one at a time. */
+    animation-delay: 0ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
   }
 }
 
@@ -1524,6 +1617,12 @@ button.generate {
   border-top: 1px solid var(--line);
 }
 
+.match-note {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
 .match-row {
   padding: 8px 0;
   border-bottom: 1px solid var(--line);
@@ -1583,12 +1682,21 @@ button.generate {
 
 .match-caret {
   color: var(--muted);
+  transition: transform var(--dur-2) var(--ease-out);
+}
+
+.match-row details[open] .match-caret {
+  transform: rotate(45deg);
 }
 
 .match-detail {
   display: grid;
   gap: 10px;
   padding: 10px 0 4px 120px;
+}
+
+.match-row details[open] .match-detail {
+  animation: reveal var(--dur-1) var(--ease-out);
 }
 
 .match-detail-team ul {

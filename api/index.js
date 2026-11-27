@@ -79,8 +79,8 @@ function createLibsqlDatabase(url, authToken) {
 }
 
 // src/worker/app.ts
-import { Hono as Hono2 } from "hono";
-import { bodyLimit as bodyLimit2 } from "hono/body-limit";
+import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 
 // src/shared/elo.ts
 var ELO_MIN = 100;
@@ -157,6 +157,7 @@ function eventFormula(payload) {
     return PLACEMENT_FORMULA;
   return payload.formula === RATING_FORMULA ? RATING_FORMULA : 1;
 }
+var usesProvisionalK = (formula) => formula !== 1 && formula !== FLAT_K_FORMULA;
 function knownAverage(teams, ratings) {
   let total = 0;
   let count = 0;
@@ -223,7 +224,7 @@ function rateMatch(input, ratings, kFactor, options = {}) {
         const againstLobby = lobbyMedian > 0 ? rate > 0 ? Math.tanh(Math.log(rate / lobbyMedian) / PERFORMANCE_TAU) : -1 : 0;
         const performance = againstLobby > 0 ? Math.max(predicted, againstLobby) : predicted;
         const outcome = placed ? placed[index] : index === input.winner ? 1 : 0;
-        const playerK = formula !== 1 && formula !== FLAT_K_FORMULA && player.tracked ? provisionalK(kFactor, priorMatches?.get(player.id) ?? 0) : kFactor;
+        const playerK = usesProvisionalK(formula) && player.tracked ? provisionalK(kFactor, priorMatches?.get(player.id) ?? 0) : kFactor;
         const delta = Math.round(playerK * (outcome - expected[index] + PERFORMANCE_WEIGHT * performance));
         const after = player.tracked ? clampElo(before + delta) : before;
         if (player.tracked)
@@ -400,6 +401,7 @@ var schema = [
     base_elo INTEGER NOT NULL DEFAULT 0,
     tags TEXT NOT NULL DEFAULT '[]',
     sitting_out INTEGER NOT NULL DEFAULT 0,
+    deleted_at INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
   )`,
@@ -442,13 +444,19 @@ var schema = [
     owner_sub TEXT PRIMARY KEY,
     legacy_k INTEGER NOT NULL,
     created_at INTEGER NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS log_squashes (
+    owner_sub TEXT PRIMARY KEY,
+    removed INTEGER NOT NULL,
+    squashed_at INTEGER NOT NULL
   )`
 ];
 var TAG_COLUMN = `ALTER TABLE players ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'`;
 var USERNAME_COLUMN = `ALTER TABLE players ADD COLUMN username TEXT NOT NULL DEFAULT ''`;
 var ELO_COLUMN = `ALTER TABLE players ADD COLUMN elo INTEGER NOT NULL DEFAULT 0`;
 var BASE_ELO_COLUMN = `ALTER TABLE players ADD COLUMN base_elo INTEGER NOT NULL DEFAULT 0`;
-var TABLES = `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('players', 'rounds', 'rating_events', 'rating_results', 'settings', 'rating_meta')`;
+var DELETED_AT_COLUMN = `ALTER TABLE players ADD COLUMN deleted_at INTEGER`;
+var TABLES = `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('players', 'rounds', 'rating_events', 'rating_results', 'settings', 'rating_meta', 'log_squashes')`;
 var COLUMNS = "SELECT name FROM pragma_table_info('players')";
 var ensureColumns = async (db) => {
   const columns = await db.prepare(COLUMNS).all();
@@ -462,6 +470,8 @@ var ensureColumns = async (db) => {
     missing.push(ELO_COLUMN);
   if (!names.has("base_elo"))
     missing.push(BASE_ELO_COLUMN);
+  if (!names.has("deleted_at"))
+    missing.push(DELETED_AT_COLUMN);
   if (missing.length > 0)
     await db.batch(missing.map((sql) => db.prepare(sql)));
   if (!names.has("elo") || !names.has("base_elo")) {
@@ -470,7 +480,7 @@ var ensureColumns = async (db) => {
 };
 var bootstrap = async (db) => {
   const tables = await db.prepare(TABLES).all();
-  if (tables.results.length < 6) {
+  if (tables.results.length < 7) {
     await db.batch(schema.map((sql) => db.prepare(sql)));
   }
   await ensureColumns(db);
@@ -575,353 +585,12 @@ function sessionGuard(authenticate) {
   };
 }
 
-// src/worker/rivals.ts
-import { Hono } from "hono";
-import { bodyLimit } from "hono/body-limit";
-
-// src/shared/rivals.ts
-var RIVALS_SCAN_VERSION = 1;
-var RIVALS_MAX_BYTES = 8 * 1024 * 1024;
-var RIVALS_MAX_ROWS = 20;
-var RIVALS_MAX_USERNAME = 64;
-var RIVALS_ACCEPTED_TYPES = ["image/png", "image/jpeg", "image/webp"];
-var RIVALS_ISSUE_CODES = [
-  "row_obscured",
-  "damage_unreadable",
-  "username_unreadable",
-  "team_ambiguous",
-  "header_unreadable",
-  "score_ambiguous",
-  "low_confidence"
-];
-var isRecord = (value) => Boolean(value) && typeof value === "object" && !Array.isArray(value);
-var isIndex = (value) => typeof value === "number" && Number.isInteger(value) && value >= 0;
-var isConfidence = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
-var isSlot = (value) => value === 0 || value === 1;
-var isColor = (value) => value === "gold" || value === "purple";
-function sniffImageType(bytes) {
-  if (bytes.length >= 8 && bytes[0] === 137 && bytes[1] === 80 && bytes[2] === 78 && bytes[3] === 71 && bytes[4] === 13 && bytes[5] === 10 && bytes[6] === 26 && bytes[7] === 10)
-    return "image/png";
-  if (bytes.length >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255)
-    return "image/jpeg";
-  if (bytes.length >= 12 && bytes[0] === 82 && bytes[1] === 73 && bytes[2] === 70 && bytes[3] === 70 && bytes[8] === 87 && bytes[9] === 69 && bytes[10] === 66 && bytes[11] === 80)
-    return "image/webp";
-  return null;
-}
-function readIssue(value) {
-  if (!isRecord(value))
-    return null;
-  const code = value.code;
-  if (typeof code !== "string" || !RIVALS_ISSUE_CODES.includes(code))
-    return null;
-  const message = value.message;
-  if (typeof message !== "string" || message.length === 0 || message.length > 240)
-    return null;
-  const issue = { code, message };
-  if (value.field === "username" || value.field === "damage" || value.field === "team" || value.field === "score")
-    issue.field = value.field;
-  if (isIndex(value.rowIndex))
-    issue.rowIndex = value.rowIndex;
-  return issue;
-}
-function readIssues(value) {
-  if (!Array.isArray(value))
-    return null;
-  const issues = [];
-  for (const item of value) {
-    const issue = readIssue(item);
-    if (!issue)
-      return null;
-    issues.push(issue);
-  }
-  return issues;
-}
-function readTeam(value) {
-  if (!isRecord(value))
-    return null;
-  if (!isSlot(value.slot) || !isColor(value.color))
-    return null;
-  if (value.score !== null && !isIndex(value.score))
-    return null;
-  if (value.score !== null && value.score > 999)
-    return null;
-  if (!isConfidence(value.confidence))
-    return null;
-  return {
-    slot: value.slot,
-    color: value.color,
-    score: value.score,
-    confidence: value.confidence
-  };
-}
-function readRow(value) {
-  if (!isRecord(value))
-    return null;
-  if (!isIndex(value.index))
-    return null;
-  if (value.teamSlot !== null && !isSlot(value.teamSlot))
-    return null;
-  if (value.color !== null && !isColor(value.color))
-    return null;
-  if (value.username !== null) {
-    if (typeof value.username !== "string")
-      return null;
-    if (value.username.length > RIVALS_MAX_USERNAME)
-      return null;
-  }
-  if (!isConfidence(value.usernameConfidence))
-    return null;
-  if (value.damage !== null) {
-    if (typeof value.damage !== "number" || !Number.isInteger(value.damage))
-      return null;
-    if (value.damage < 0 || value.damage > MAX_DAMAGE)
-      return null;
-  }
-  if (!isConfidence(value.damageConfidence))
-    return null;
-  if (value.rawDamageText !== undefined && value.rawDamageText !== null && typeof value.rawDamageText !== "string")
-    return null;
-  const issues = readIssues(value.issues);
-  if (!issues)
-    return null;
-  return {
-    index: value.index,
-    teamSlot: value.teamSlot,
-    color: value.color,
-    username: value.username,
-    usernameConfidence: value.usernameConfidence,
-    damage: value.damage,
-    damageConfidence: value.damageConfidence,
-    rawDamageText: value.rawDamageText ?? null,
-    issues
-  };
-}
-function readRivalsScan(value) {
-  if (!isRecord(value))
-    return null;
-  if (value.ok === false)
-    return null;
-  if (value.version !== RIVALS_SCAN_VERSION)
-    return null;
-  if (!isRecord(value.image))
-    return null;
-  const width = value.image.width;
-  const height = value.image.height;
-  if (!isIndex(width) || !isIndex(height))
-    return null;
-  if (width === 0 || height === 0)
-    return null;
-  if (!Array.isArray(value.teams) || value.teams.length !== 2)
-    return null;
-  const teams = [];
-  for (const item of value.teams) {
-    const team = readTeam(item);
-    if (!team)
-      return null;
-    teams.push(team);
-  }
-  if (teams[0].slot === teams[1].slot)
-    return null;
-  if (teams[0].color === teams[1].color)
-    return null;
-  if (value.winnerSlot !== null && !isSlot(value.winnerSlot))
-    return null;
-  if (!Array.isArray(value.rows) || value.rows.length === 0)
-    return null;
-  if (value.rows.length > RIVALS_MAX_ROWS)
-    return null;
-  const rows = [];
-  for (const item of value.rows) {
-    const row = readRow(item);
-    if (!row)
-      return null;
-    rows.push(row);
-  }
-  const issues = readIssues(value.issues);
-  if (!issues)
-    return null;
-  return {
-    version: RIVALS_SCAN_VERSION,
-    image: { width, height },
-    teams,
-    winnerSlot: value.winnerSlot,
-    rows,
-    issues
-  };
-}
-
-// src/worker/rivals.ts
-var OCR_TIMEOUT_MS = 28000;
-var CONFIG_PROBE_TIMEOUT_MS = 2500;
-var MAX_LABEL = Math.round(RIVALS_MAX_BYTES / (1024 * 1024));
-var ENV_HINT = {
-  OCR_SERVICE_URL: "OCR_SERVICE_URL (the OCR service's base URL, for example http://127.0.0.1:8000 in development)",
-  OCR_SERVICE_TOKEN: "OCR_SERVICE_TOKEN (the bearer token the OCR service was started with)"
-};
-var missingVars = (env) => {
-  const missing = [];
-  if (!env.OCR_SERVICE_URL?.trim())
-    missing.push("OCR_SERVICE_URL");
-  if (!env.OCR_SERVICE_TOKEN?.trim())
-    missing.push("OCR_SERVICE_TOKEN");
-  return missing;
-};
-var missingMessage = (missing) => `Screenshot import is not configured: set ${missing.map((name) => ENV_HINT[name]).join(" and ")}, then redeploy.`;
-var endpoint = (base, leaf) => {
-  try {
-    const url = new URL(base);
-    if (url.protocol !== "http:" && url.protocol !== "https:")
-      return null;
-    url.pathname = `${url.pathname.replace(/\/+$/, "")}/${leaf}`;
-    url.search = "";
-    url.hash = "";
-    return url;
-  } catch {
-    return null;
-  }
-};
-var timedOut = (error) => error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");
-async function probeService(base, fetchOcr) {
-  const target = endpoint(base, "health");
-  if (!target)
-    return {
-      status: "invalid_url",
-      message: "OCR_SERVICE_URL is not a valid http(s) URL, so the OCR service cannot be reached. Fix it, then redeploy."
-    };
-  let response;
-  try {
-    response = await fetchOcr(target.toString(), {
-      method: "GET",
-      headers: { Accept: "application/json" },
-      signal: AbortSignal.timeout(CONFIG_PROBE_TIMEOUT_MS)
-    });
-  } catch (error) {
-    console.error(`Teammaker: OCR health probe ${timedOut(error) ? "timed out" : "failed"}`, error instanceof Error ? error.message : error);
-    return timedOut(error) ? {
-      status: "timeout",
-      message: `The OCR service did not answer within ${CONFIG_PROBE_TIMEOUT_MS / 1000} s. It may still be starting (the first load reads its models) or the host is blocking the request — check again in a moment.`
-    } : {
-      status: "unreachable",
-      message: 'The OCR service could not be reached. Start it with "bun run ocr:serve" in development, or check that the deployed container is running and publicly reachable, then check again.'
-    };
-  }
-  const payload = await response.json().catch(() => null);
-  if (!response.ok)
-    return {
-      status: "error",
-      message: `The OCR service answered HTTP ${response.status} instead of a health response. It is running but not healthy — check its logs.`
-    };
-  if (!payload || typeof payload !== "object" || payload.ok === false)
-    return {
-      status: "error",
-      message: "The OCR service answered without a health response. Check that OCR_SERVICE_URL points at the OCR service and not at something else."
-    };
-  const engine = payload.engine;
-  return {
-    status: "ready",
-    message: "Screenshot import is ready.",
-    ...typeof engine === "string" ? { engine: engine.slice(0, 40) } : {}
-  };
-}
-function createRivalsRoutes({
-  authenticate,
-  fetchOcr = fetch
-}) {
-  const app = new Hono;
-  const guard = sessionGuard(authenticate);
-  const configState = async (env) => {
-    const missing = missingVars(env);
-    if (missing.length > 0)
-      return {
-        configured: false,
-        status: "unconfigured",
-        missing,
-        message: missingMessage(missing)
-      };
-    const probe = await probeService(env.OCR_SERVICE_URL.trim(), fetchOcr);
-    return {
-      configured: probe.status === "ready",
-      status: probe.status,
-      missing: [],
-      message: probe.message,
-      ...probe.engine ? { engine: probe.engine } : {}
-    };
-  };
-  app.use("*", async (c, next) => {
-    c.header("Cache-Control", "private, no-store");
-    await next();
-  });
-  app.use("*", guard);
-  app.use("*", bodyLimit({
-    maxSize: RIVALS_MAX_BYTES,
-    onError: (c) => c.json({ error: `Screenshots are up to ${MAX_LABEL} MB.` }, 413)
-  }));
-  app.get("/config", async (c) => c.json({
-    ...await configState(c.env),
-    maxBytes: RIVALS_MAX_BYTES,
-    acceptedTypes: [...RIVALS_ACCEPTED_TYPES]
-  }));
-  app.post("/scan", async (c) => {
-    const url = c.env.OCR_SERVICE_URL?.trim();
-    const token = c.env.OCR_SERVICE_TOKEN?.trim();
-    if (!url || !token)
-      return c.json({ error: missingMessage(missingVars(c.env)) }, 503);
-    const target = endpoint(url, "scan");
-    if (!target)
-      return c.json({
-        error: "Screenshot import is misconfigured: OCR_SERVICE_URL is not a valid http(s) URL."
-      }, 503);
-    const form = await c.req.formData().catch(() => null);
-    if (!form)
-      return c.json({ error: "Send the screenshot as a multipart field named image." }, 400);
-    const file = form.get("image");
-    if (!file || typeof file === "string")
-      return c.json({ error: "Send the screenshot as an image file." }, 400);
-    if (file.size === 0)
-      return c.json({ error: "That screenshot is empty." }, 400);
-    if (file.size > RIVALS_MAX_BYTES)
-      return c.json({ error: `Screenshots are up to ${MAX_LABEL} MB.` }, 413);
-    const bytes = new Uint8Array(await file.arrayBuffer());
-    const type = sniffImageType(bytes);
-    if (!type)
-      return c.json({ error: "Only PNG, JPEG or WebP screenshots are supported." }, 415);
-    let upstream;
-    try {
-      upstream = await fetchOcr(target.toString(), {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": type,
-          Accept: "application/json"
-        },
-        body: bytes,
-        signal: AbortSignal.timeout(OCR_TIMEOUT_MS)
-      });
-    } catch (error) {
-      console.error(`Teammaker: OCR service ${timedOut(error) ? "timed out" : "unreachable"}`, error instanceof Error ? error.message : error);
-      return c.json({
-        error: timedOut(error) ? "The screenshot service took too long to answer. It may still be loading its models — try again in a moment." : "The screenshot service could not be reached. Check that the OCR service is running, then try again."
-      }, 502);
-    }
-    if (!upstream.ok)
-      return c.json({
-        error: upstream.status === 422 ? "That does not look like a RIVALS scoreboard." : "The screenshot could not be read. Try a clearer image."
-      }, 502);
-    const payload = await upstream.json().catch(() => null);
-    const scan = readRivalsScan(payload);
-    if (!scan)
-      return c.json({ error: "The screenshot service returned an unreadable result." }, 502);
-    return c.json(scan);
-  });
-  app.notFound((c) => c.json({ error: "Endpoint not found." }, 404));
-  return app;
-}
-
 // src/worker/app.ts
 var ROSTER_LIMIT = 200;
 var MAX_BATCH = 50;
 var MAX_ROUNDS = 100;
-var MAX_LABEL2 = 60;
+var SQUASH_KEEP = 500;
+var MAX_LABEL = 60;
 var MAX_REASON = 80;
 var MATCH_ERROR = "A match needs two to eight teams, damage for every player, a winner and at least one player from your roster.";
 var readName = (value) => {
@@ -979,7 +648,7 @@ function readMatchInput(value) {
   const record = value;
   if (Object.keys(record).some((key) => key !== "label" && key !== "teams" && key !== "winner"))
     return null;
-  const label = record.label === undefined ? "" : typeof record.label === "string" && record.label.trim().length <= MAX_LABEL2 ? record.label.trim() : null;
+  const label = record.label === undefined ? "" : typeof record.label === "string" && record.label.trim().length <= MAX_LABEL ? record.label.trim() : null;
   if (label === null)
     return null;
   if (!Array.isArray(record.teams) || record.teams.length < 2 || record.teams.length > MAX_MATCH_TEAMS)
@@ -1129,7 +798,7 @@ async function pinLegacyK(db, owner, legacyK) {
   await db.prepare("INSERT INTO rating_meta (owner_sub, legacy_k, created_at) VALUES (?, ?, ?) ON CONFLICT(owner_sub) DO NOTHING").bind(owner, legacyK, Date.now()).run();
 }
 async function loadPlayers(db, owner) {
-  const result = await db.prepare("SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE owner_sub = ? ORDER BY created_at ASC, id ASC").bind(owner).all();
+  const result = await db.prepare("SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE owner_sub = ? AND deleted_at IS NULL ORDER BY created_at ASC, id ASC").bind(owner).all();
   return result.results.map(mapPlayer);
 }
 async function nextPosition(db, owner) {
@@ -1141,7 +810,7 @@ async function findEvent(db, owner, id) {
 }
 var insertResultSql = "INSERT INTO rating_results (event_id, owner_sub, slot, player_id, name, elo_before, elo_after, delta) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
 async function recompute(db, owner, from) {
-  const players = await db.prepare("SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at, base_elo FROM players WHERE owner_sub = ? ORDER BY created_at ASC, id ASC").bind(owner).all();
+  const players = await db.prepare("SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at, base_elo, deleted_at FROM players WHERE owner_sub = ? ORDER BY created_at ASC, id ASC").bind(owner).all();
   const events = await loadEvents(db, owner);
   const kFactor = await getKFactor(db, owner);
   const legacyK = await getLegacyK(db, owner, kFactor);
@@ -1179,11 +848,56 @@ async function recompute(db, owner, from) {
   }
   if (statements.length > 0)
     await db.batch(statements);
-  return players.results.map((player) => mapPlayer({
+  return players.results.filter((player) => !player.deleted_at).map((player) => mapPlayer({
     ...player,
     elo: elos.get(player.id) ?? player.elo,
     skill: skillFromElo(elos.get(player.id) ?? player.elo)
   }));
+}
+async function countEvents(db, owner) {
+  const row = await db.prepare("SELECT COUNT(*) AS total FROM rating_events WHERE owner_sub = ?").bind(owner).first();
+  return row?.total ?? 0;
+}
+async function compactLog(db, owner, keep = SQUASH_KEEP) {
+  const events = await loadEvents(db, owner);
+  if (events.length <= keep)
+    return { removed: 0, kept: events.length };
+  let cut = events.length - keep;
+  for (let index = events.length - 1;index >= cut; index -= 1) {
+    const event = events[index];
+    if (event.kind === "match" && usesProvisionalK(eventFormula(event.payload))) {
+      cut = index + 1;
+      break;
+    }
+  }
+  if (cut >= events.length)
+    return { removed: 0, kept: events.length };
+  const players = await db.prepare("SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at, base_elo, deleted_at FROM players WHERE owner_sub = ? ORDER BY created_at ASC, id ASC").bind(owner).all();
+  const kFactor = await getKFactor(db, owner);
+  const legacyK = await getLegacyK(db, owner, kFactor);
+  const roster = players.results.map((player) => ({
+    id: player.id,
+    name: player.name,
+    baseElo: player.base_elo
+  }));
+  const { elos } = replay(events.slice(0, cut), roster, kFactor, legacyK);
+  const oldest = `(SELECT id FROM rating_events WHERE owner_sub = ? ORDER BY position ASC, created_at ASC, id ASC LIMIT ${cut})`;
+  const statements = [];
+  for (const player of players.results) {
+    const anchor = clampElo(elos.get(player.id) ?? player.base_elo);
+    if (anchor === player.base_elo)
+      continue;
+    statements.push(db.prepare("UPDATE players SET base_elo = ? WHERE id = ? AND owner_sub = ?").bind(anchor, player.id, owner));
+  }
+  statements.push(db.prepare(`DELETE FROM rating_results WHERE owner_sub = ? AND event_id IN ${oldest}`).bind(owner, owner), db.prepare(`DELETE FROM rating_events WHERE id IN ${oldest}`).bind(owner), db.prepare("INSERT INTO log_squashes (owner_sub, removed, squashed_at) VALUES (?, ?, ?) ON CONFLICT(owner_sub) DO UPDATE SET removed = log_squashes.removed + excluded.removed, squashed_at = excluded.squashed_at").bind(owner, cut, Date.now()));
+  await db.batch(statements);
+  return { removed: cut, kept: events.length - cut };
+}
+async function makeRoom(db, owner) {
+  if (await countEvents(db, owner) < MAX_EVENTS)
+    return true;
+  const { removed } = await compactLog(db, owner);
+  return removed > 0;
 }
 async function matchViews(db, owner) {
   const events = await loadEvents(db, owner);
@@ -1233,14 +947,14 @@ async function matchViews(db, owner) {
     };
   });
 }
-async function trackedIdsExist(db, owner, ids) {
+async function trackedIdsExist(db, owner, ids, includeArchived = false) {
   if (ids.length === 0)
     return true;
-  const rows = await db.prepare(`SELECT id FROM players WHERE owner_sub = ? AND id IN (${ids.map(() => "?").join(", ")})`).bind(owner, ...ids).all();
+  const rows = await db.prepare(`SELECT id FROM players WHERE owner_sub = ?${includeArchived ? "" : " AND deleted_at IS NULL"} AND id IN (${ids.map(() => "?").join(", ")})`).bind(owner, ...ids).all();
   return rows.results.length === new Set(ids).size;
 }
-function createApp(authenticate = currentUser, options = {}) {
-  const app = new Hono2;
+function createApp(authenticate = currentUser) {
+  const app = new Hono;
   app.get("/api/health", async (c) => {
     c.header("Cache-Control", "private, no-store");
     const db = c.env.DB;
@@ -1248,11 +962,11 @@ function createApp(authenticate = currentUser, options = {}) {
       return c.json({ ok: true, database: "unconfigured" });
     try {
       await db.prepare("SELECT 1 AS ok").first();
-      const tables = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('players', 'rounds', 'rating_events', 'rating_results', 'settings', 'rating_meta')").all();
+      const tables = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('players', 'rounds', 'rating_events', 'rating_results', 'settings', 'rating_meta', 'log_squashes')").all();
       return c.json({
         ok: true,
         database: "ok",
-        schema: tables.results.length === 6 ? "ready" : "missing"
+        schema: tables.results.length === 7 ? "ready" : "missing"
       });
     } catch (error) {
       console.error("Teammaker: database health check failed", error instanceof Error ? error.message : error);
@@ -1263,8 +977,7 @@ function createApp(authenticate = currentUser, options = {}) {
     c.header("Cache-Control", "private, no-store");
     await next();
   });
-  app.route("/api/rivals", createRivalsRoutes({ authenticate, fetchOcr: options.fetchOcr }));
-  app.use("/api/*", bodyLimit2({
+  app.use("/api/*", bodyLimit({
     maxSize: 64 * 1024,
     onError: (c) => c.json({ error: "Request is too large." }, 413)
   }));
@@ -1287,7 +1000,7 @@ function createApp(authenticate = currentUser, options = {}) {
       return c.json({ error: "Each player needs a name and a skill from 1 to 10." }, 400);
     const db = c.get("db");
     const owner = c.get("user").sub;
-    const existing = await db.prepare("SELECT COUNT(*) AS total FROM players WHERE owner_sub = ?").bind(owner).first();
+    const existing = await db.prepare("SELECT COUNT(*) AS total FROM players WHERE owner_sub = ? AND deleted_at IS NULL").bind(owner).first();
     if ((existing?.total ?? 0) + drafts.length > ROSTER_LIMIT)
       return c.json({ error: "A roster holds up to 200 players." }, 400);
     const createdAt = Date.now();
@@ -1315,7 +1028,7 @@ function createApp(authenticate = currentUser, options = {}) {
     const id = c.req.param("id");
     const db = c.get("db");
     const owner = c.get("user").sub;
-    const current = await db.prepare("SELECT id, elo FROM players WHERE id = ? AND owner_sub = ?").bind(id, owner).first();
+    const current = await db.prepare("SELECT id, elo FROM players WHERE id = ? AND owner_sub = ? AND deleted_at IS NULL").bind(id, owner).first();
     if (!current)
       return c.json({ error: "Player not found." }, 404);
     const sets = [];
@@ -1382,38 +1095,25 @@ function createApp(authenticate = currentUser, options = {}) {
     values.push(Date.now(), id, owner);
     await db.prepare(`UPDATE players SET ${sets.join(", ")} WHERE id = ? AND owner_sub = ?`).bind(...values).run();
     if (targetElo !== null && logAdjustment && targetElo !== current.elo) {
+      await makeRoom(db, owner);
       const position = await nextPosition(db, owner);
       const now = Date.now();
       await db.prepare("INSERT INTO rating_events (id, owner_sub, position, kind, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), owner, position, "adjust", JSON.stringify({ playerId: id, elo: targetElo, reason }), now, now).run();
       const players = await recompute(db, owner, position);
       return c.json({ player: players.find((entry) => entry.id === id) ?? null });
     }
-    const row = await db.prepare("SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE id = ? AND owner_sub = ?").bind(id, owner).first();
+    const row = await db.prepare("SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE id = ? AND owner_sub = ? AND deleted_at IS NULL").bind(id, owner).first();
     return row ? c.json({ player: mapPlayer(row) }) : c.json({ error: "Player not found." }, 404);
   });
   app.delete("/api/players/:id", async (c) => {
     const db = c.get("db");
     const owner = c.get("user").sub;
     const id = c.req.param("id");
-    const player = await db.prepare("SELECT id FROM players WHERE id = ? AND owner_sub = ?").bind(id, owner).first();
+    const player = await db.prepare("SELECT id FROM players WHERE id = ? AND owner_sub = ? AND deleted_at IS NULL").bind(id, owner).first();
     if (!player)
       return c.json({ error: "Player not found." }, 404);
-    const matches = await db.prepare(`SELECT COUNT(*) AS total FROM rating_results r
-         JOIN rating_events e ON e.id = r.event_id AND e.owner_sub = r.owner_sub
-         WHERE r.owner_sub = ? AND r.player_id = ? AND e.kind = 'match'`).bind(owner, id).first();
-    if ((matches?.total ?? 0) > 0)
-      return c.json({
-        error: "This player has match history. Delete or edit those matches before removing them."
-      }, 409);
-    const edits = await db.prepare("SELECT DISTINCT event_id FROM rating_results WHERE owner_sub = ? AND player_id = ?").bind(owner, id).all();
-    const eventIds = edits.results.map((row) => row.event_id);
-    const statements = [];
-    if (eventIds.length > 0) {
-      const marks = eventIds.map(() => "?").join(", ");
-      statements.push(db.prepare(`DELETE FROM rating_results WHERE owner_sub = ? AND event_id IN (${marks})`).bind(owner, ...eventIds), db.prepare(`DELETE FROM rating_events WHERE owner_sub = ? AND id IN (${marks})`).bind(owner, ...eventIds));
-    }
-    statements.push(db.prepare("DELETE FROM players WHERE id = ? AND owner_sub = ?").bind(id, owner));
-    await db.batch(statements);
+    const now = Date.now();
+    await db.prepare("UPDATE players SET deleted_at = ?, updated_at = ? WHERE id = ? AND owner_sub = ?").bind(now, now, id, owner).run();
     return c.json({ ok: true });
   });
   app.post("/api/players/:id/elo", async (c) => {
@@ -1432,9 +1132,10 @@ function createApp(authenticate = currentUser, options = {}) {
     const db = c.get("db");
     const owner = c.get("user").sub;
     const id = c.req.param("id");
-    const player = await db.prepare("SELECT id, elo FROM players WHERE id = ? AND owner_sub = ?").bind(id, owner).first();
+    const player = await db.prepare("SELECT id, elo FROM players WHERE id = ? AND owner_sub = ? AND deleted_at IS NULL").bind(id, owner).first();
     if (!player)
       return c.json({ error: "Player not found." }, 404);
+    await makeRoom(db, owner);
     const position = await nextPosition(db, owner);
     const now = Date.now();
     await db.prepare("INSERT INTO rating_events (id, owner_sub, position, kind, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), owner, position, "adjust", JSON.stringify({ playerId: id, elo, reason }), now, now).run();
@@ -1447,8 +1148,10 @@ function createApp(authenticate = currentUser, options = {}) {
   app.get("/api/matches", async (c) => {
     const db = c.get("db");
     const owner = c.get("user").sub;
+    const squash = await db.prepare("SELECT removed, squashed_at FROM log_squashes WHERE owner_sub = ?").bind(owner).first();
     return c.json({
       kFactor: await getKFactor(db, owner),
+      squashed: squash ? { removed: squash.removed, at: squash.squashed_at } : null,
       events: await matchViews(db, owner)
     });
   });
@@ -1464,8 +1167,7 @@ function createApp(authenticate = currentUser, options = {}) {
     const tracked = input.teams.flatMap((team) => team.players.filter((player) => player.tracked).map((player) => player.id));
     if (!await trackedIdsExist(db, owner, tracked))
       return c.json({ error: "Those players are no longer on your roster." }, 400);
-    const count = await db.prepare("SELECT COUNT(*) AS total FROM rating_events WHERE owner_sub = ?").bind(owner).first();
-    if ((count?.total ?? 0) >= MAX_EVENTS)
+    if (!await makeRoom(db, owner))
       return c.json({ error: `The log holds ${MAX_EVENTS} events. Delete one to add another.` }, 400);
     const position = await nextPosition(db, owner);
     const id = crypto.randomUUID();
@@ -1502,7 +1204,7 @@ function createApp(authenticate = currentUser, options = {}) {
       if (!input)
         return c.json({ error: MATCH_ERROR }, 400);
       const tracked = input.teams.flatMap((team) => team.players.filter((player) => player.tracked).map((player) => player.id));
-      if (!await trackedIdsExist(db, owner, tracked))
+      if (!await trackedIdsExist(db, owner, tracked, true))
         return c.json({ error: "Those players are no longer on your roster." }, 400);
       let marker = {};
       try {
@@ -1607,9 +1309,7 @@ function readEnv() {
     DB: url ? connectDatabase(url, process.env.TURSO_AUTH_TOKEN) : undefined,
     FREEBUFF_CLIENT_ID: process.env.FREEBUFF_CLIENT_ID,
     FREEBUFF_ISSUER: process.env.FREEBUFF_ISSUER,
-    APP_ORIGIN: process.env.APP_ORIGIN,
-    OCR_SERVICE_URL: process.env.OCR_SERVICE_URL,
-    OCR_SERVICE_TOKEN: process.env.OCR_SERVICE_TOKEN
+    APP_ORIGIN: process.env.APP_ORIGIN
   };
 }
 var env;

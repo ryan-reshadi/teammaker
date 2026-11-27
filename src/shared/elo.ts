@@ -29,7 +29,10 @@ export const PLACEMENT_FORMULA = 3
 export const FLAT_K_FORMULA = 4
 export const PROVISIONAL_MATCHES = 5
 export const PROVISIONAL_K_MULTIPLIER = 2
-/** The event log is a bookkeeping aid, not an archive; this bounds a replay. */
+/**
+ * The event log is a bookkeeping aid, not an archive: at this many events the
+ * oldest half is folded into each player's anchor and deleted.
+ */
 export const MAX_EVENTS = 1000
 export const MAX_MATCH_PLAYERS = 10
 export const MAX_MATCH_TEAMS = 8
@@ -154,6 +157,14 @@ export function eventFormula(payload: MatchInput): 1 | 2 | 3 | 4 {
   return payload.formula === RATING_FORMULA ? RATING_FORMULA : 1
 }
 
+/**
+ * Formulas 2 and 3 double K until a player has `PROVISIONAL_MATCHES` rated
+ * matches, so their update depends on how much history precedes them: a squash
+ * must never keep one of these behind a deleted prefix.
+ */
+export const usesProvisionalK = (formula: 1 | 2 | 3 | 4): boolean =>
+  formula !== 1 && formula !== FLAT_K_FORMULA
+
 export type MatchPlayerInput = {
   /** A roster id for a tracked player, or a client key for a random. */
   id: string
@@ -275,12 +286,22 @@ export type AdjustEventView = {
 
 export type RatingEventView = MatchEventView | AdjustEventView
 
-export type MatchesResponse = { kFactor: number; events: RatingEventView[] }
+/** What the last squash took, so the match list can explain missing history. */
+export type SquashInfo = { removed: number; at: number }
+
+export type MatchesResponse = {
+  kFactor: number
+  events: RatingEventView[]
+  squashed: SquashInfo | null
+}
 
 export type MatchRoster = {
   id: string
   name: string
-  /** Elo at creation. A replay starts here and applies every event in order. */
+  /**
+   * The elo a replay starts from — the creation elo, or the anchor a squash
+   * moved forward. Every event in the log is then applied in order.
+   */
   baseElo: number
 }
 
@@ -393,6 +414,10 @@ export function rateMatch(
           trackedAverage,
         )
       }
+      // A tracked id missing from the roster is an orphan from a hard delete
+      // that predates archiving (see the players `deleted_at` column). It rates
+      // from the lobby average so that old history still replays instead of
+      // failing; live removals keep the row, so this path stays closed to them.
       const rating = ratings.get(player.id)
       return rating === undefined ? clampElo(averageKnown) : clampElo(rating)
     }),
@@ -476,7 +501,7 @@ export function rateMatch(
         const performance = againstLobby > 0 ? Math.max(predicted, againstLobby) : predicted
         const outcome = placed ? placed[index]! : index === input.winner ? 1 : 0
         const playerK =
-          formula !== 1 && formula !== FLAT_K_FORMULA && player.tracked
+          usesProvisionalK(formula) && player.tracked
             ? provisionalK(kFactor, priorMatches?.get(player.id) ?? 0)
             : kFactor
         const delta = Math.round(

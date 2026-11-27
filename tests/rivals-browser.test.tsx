@@ -1,7 +1,7 @@
-import { afterAll, beforeAll, expect, test } from 'bun:test'
+import { afterAll, beforeAll, expect, mock, test } from 'bun:test'
 import { Window } from 'happy-dom'
 import { Miniflare } from 'miniflare'
-import type { RivalsConfig, RivalsScan } from '../src/shared/rivals'
+import type { RivalsScan } from '../src/shared/rivals'
 import type { Env } from '../src/worker/auth'
 import type { createApp as createAppFactory } from '../src/worker/app'
 
@@ -9,11 +9,11 @@ import type { createApp as createAppFactory } from '../src/worker/app'
  * The browser half of the screenshot importer, exercised for real.
  *
  * `App` (the component the real entry mounts) is rendered into a DOM, the real
- * `store.scanRivals` uploads a File, the real review helpers run, and the real
- * `RivalsImport` submits through the actual Hono app in this process. Only the
- * OCR service is stubbed, and nothing in the client path is mocked: a drifted
- * multipart field name, a wrong method, a changed scan response shape or a
- * broken same-origin request fails this suite.
+ * `store.scanRivals` hands the File to the scanner, the real review helpers run,
+ * and the real `RivalsImport` submits through the actual Hono app in this
+ * process. Only the OCR engine itself is stubbed — it is ONNX/WASM and cannot
+ * run in this DOM — so a changed scan shape, a broken same-origin request or a
+ * drifted route fails this suite.
  */
 
 const ORIGIN = 'http://app.test'
@@ -43,6 +43,42 @@ Object.assign(
 )
 ;(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =
   true
+
+// ── The OCR engine, stubbed at its own boundary ──────────────────────────
+// Everything above the engine stays real: the store passes the File through, the
+// progress messages reach the panel, and the scan shape is validated by the
+// review helpers exactly as it is in the browser.
+
+type OcrMode = 'ok' | 'issues' | 'unreachable' | 'hang'
+let ocrMode: OcrMode = 'ok'
+const scannedFiles: { name: string; type: string; size: number }[] = []
+const progressSeen: string[] = []
+
+mock.module('../src/client/ocr/index.ts', () => ({
+  cancelError: () => new Error('The scan was cancelled.'),
+  scanScreenshot: async (
+    file: File,
+    onProgress?: (message: string) => void,
+    options: { signal?: AbortSignal } = {},
+  ) => {
+    scannedFiles.push({ name: file.name, type: file.type, size: file.size })
+    for (const message of ['Loading the OCR engine…', 'Reading the scoreboard…']) {
+      progressSeen.push(message)
+      onProgress?.(message)
+    }
+    if (ocrMode === 'unreachable')
+      throw new Error('The OCR engine could not start in this browser.')
+    // A scan that never finishes, so cancel and timeout are exercised without a
+    // real wedged engine.
+    if (ocrMode === 'hang')
+      return new Promise<RivalsScan>((_resolve, reject) => {
+        options.signal?.addEventListener('abort', () =>
+          reject(new Error('The scan was cancelled.')),
+        )
+      })
+    return ocrMode === 'issues' ? issueScan : cleanScan
+  },
+}))
 
 const React = await import('react')
 const { act } = React
@@ -130,16 +166,6 @@ const issueScan: RivalsScan = {
   issues: [],
 }
 
-type OcrMode = 'ok' | 'issues' | 'unreachable'
-let ocrMode: OcrMode = 'ok'
-const ocrCalls: { url: string; init?: RequestInit }[] = []
-
-const fetchOcr = (async (input: RequestInfo | URL, init?: RequestInit) => {
-  ocrCalls.push({ url: String(input), init })
-  if (ocrMode === 'unreachable') throw new Error('ECONNREFUSED 127.0.0.1:8000')
-  return Response.json(ocrMode === 'issues' ? issueScan : cleanScan)
-}) as unknown as typeof fetch
-
 const runtime = new Miniflare({
   workers: [
     {
@@ -167,8 +193,6 @@ let env: Env = {}
 let app: ReturnType<typeof createAppFactory>
 
 const originalFetch = globalThis.fetch
-type ScanRequest = { method: string; contentType: string; fields: string[] }
-const scanRequests: ScanRequest[] = []
 
 /**
  * Stands in for the browser's network layer: relative URLs resolve against the
@@ -188,16 +212,6 @@ function installFetchShim() {
     if (!headers.has('Origin') && request.method !== 'GET')
       headers.set('Origin', ORIGIN)
     const forwarded = new Request(request, { headers })
-    if (url.pathname === '/api/rivals/scan') {
-      // Read a clone so the Worker still receives the untouched body. This is
-      // what fails loudly if the multipart field name ever drifts.
-      const form = await forwarded.clone().formData()
-      scanRequests.push({
-        method: forwarded.method,
-        contentType: headers.get('content-type') ?? '',
-        fields: [...form.keys()],
-      })
-    }
     return app.fetch(forwarded, env)
   }) as typeof fetch
 }
@@ -251,6 +265,21 @@ const upload = async (name = 'scoreboard.png') => {
   })
 }
 
+/**
+ * A paste the way a browser delivers one: a clipboard entry of kind `file` with
+ * an image type and the pixels behind `getAsFile()`.
+ */
+const pasteScreenshot = async (name = 'pasted.png', type = 'image/png') => {
+  const file = new File([pngBytes() as unknown as BlobPart], name, { type })
+  const event = new win.Event('paste', { bubbles: true })
+  Object.defineProperty(event, 'clipboardData', {
+    value: { items: [{ kind: 'file', type, getAsFile: () => file }] },
+  })
+  await act(async () => {
+    win.document.dispatchEvent(event)
+  })
+}
+
 const openImport = async () => {
   if (!document.querySelector('.rivals-drop')) {
     await click(button('Import from RIVALS Screenshot'))
@@ -267,10 +296,8 @@ beforeAll(async () => {
   env = {
     DB: db as unknown as D1Database,
     APP_ORIGIN: ORIGIN,
-    OCR_SERVICE_URL: 'http://ocr.test:8000',
-    OCR_SERVICE_TOKEN: 'ocr-test-token',
   }
-  app = createApp(async () => ({ sub: 'browser-test' }), { fetchOcr })
+  app = createApp(async () => ({ sub: 'browser-test' }))
 
   const seeded = await app.request(
     `${ORIGIN}/api/players`,
@@ -325,38 +352,17 @@ test('the Matches screen switches between manual entry and screenshot import', a
   expect(document.querySelector('.rivals-drop')).toBeNull()
 })
 
-test('the import panel renders the server’s exact reason and re-checks on demand', async () => {
+test('the import panel needs no service configured and no environment variable', async () => {
   const { RivalsImport } = await import('../src/client/components/RivalsImport')
   const host = win.document.createElement('div')
   win.document.body.append(host)
   const localRoot = createRoot(host as unknown as HTMLElement)
 
-  const unavailable: RivalsConfig = {
-    configured: false,
-    status: 'unconfigured',
-    missing: ['OCR_SERVICE_TOKEN'],
-    message:
-      'Screenshot import is not configured: set OCR_SERVICE_TOKEN (the bearer token the OCR service was started with), then redeploy.',
-    maxBytes: 8 * 1024 * 1024,
-    acceptedTypes: ['image/png'],
-  }
-  const ready: RivalsConfig = {
-    ...unavailable,
-    configured: true,
-    status: 'ready',
-    missing: [],
-    message: 'Screenshot import is ready.',
-  }
-  let state: RivalsConfig = unavailable
-
   await act(async () => {
     localRoot.render(
       React.createElement(RivalsImport, {
         players: [],
-        onConfig: async () => state,
-        onScan: async () => {
-          throw new Error('not used')
-        },
+        onScan: async () => cleanScan,
         onSave: async () => undefined,
         onRefresh: async () => undefined,
       }),
@@ -364,21 +370,12 @@ test('the import panel renders the server’s exact reason and re-checks on dema
   })
 
   const panel = () => host.textContent ?? ''
-  const fileInput = () =>
-    host.querySelector('input[type="file"]') as unknown as HTMLInputElement | null
-  await waitFor(() => panel().includes('OCR_SERVICE_TOKEN'), 'the reason')
-  expect(fileInput()?.disabled).toBe(true)
-
-  // Starting the service and pressing the button is enough — no page reload.
-  state = ready
-  const buttons = Array.from(
-    host.querySelectorAll('button') as unknown as HTMLButtonElement[],
-  )
-  const again = buttons.find((entry) => (entry.textContent ?? '').trim() === 'Check again')
-  if (!again) throw new Error(`No “Check again” button — body: ${panel().slice(0, 400)}`)
-  await click(again)
-  await waitFor(() => !panel().includes('OCR_SERVICE_TOKEN'), 'the healthy state')
-  expect(fileInput()?.disabled).toBe(false)
+  await waitFor(() => panel().includes('read on this device'), 'the on-device hint')
+  expect(panel()).not.toContain('OCR_SERVICE')
+  const fileInput = host.querySelector(
+    'input[type="file"]',
+  ) as unknown as HTMLInputElement | null
+  expect(fileInput?.disabled).toBe(false)
 
   await act(async () => {
     localRoot.unmount()
@@ -386,13 +383,13 @@ test('the import panel renders the server’s exact reason and re-checks on dema
   host.remove()
 }, 20_000)
 
-test('an unreachable OCR service is shown as a visible error, not a silent no-op', async () => {
+test('an engine that cannot start is shown as a visible error, not a silent no-op', async () => {
   await openImport()
   ocrMode = 'unreachable'
   await upload()
   await waitFor(
-    () => text().includes('The screenshot service could not be reached'),
-    'the unreachable-service error',
+    () => text().includes('The OCR engine could not start in this browser'),
+    'the engine error',
   )
   // The flow returns to the upload screen, ready to retry.
   expect(document.querySelector('.rivals-drop')).not.toBeNull()
@@ -417,8 +414,8 @@ test('extraction issues are visible and block submission', async () => {
 test('upload → scan → review → submit creates a replayed match and refreshes the log', async () => {
   await openImport()
   ocrMode = 'ok'
-  scanRequests.length = 0
-  ocrCalls.length = 0
+  scannedFiles.length = 0
+  progressSeen.length = 0
   await upload()
 
   await waitFor(() => text().includes('Matched'), 'the review with matched rows')
@@ -429,18 +426,12 @@ test('upload → scan → review → submit creates a replayed match and refresh
   expect(document.querySelector<HTMLInputElement>('input[name="rivals-winner"]')?.checked).toBe(true)
   expect(button('Log match').disabled).toBe(false)
 
-  // The client really uploaded a multipart image field.
-  const uploadRequest = scanRequests.at(-1)
-  expect(uploadRequest?.method).toBe('POST')
-  expect(uploadRequest?.fields).toEqual(['image'])
-  expect(uploadRequest?.contentType.startsWith('multipart/form-data')).toBe(true)
-
-  // The Worker really called the OCR service with its bearer token.
-  const ocrCall = ocrCalls.at(-1)
-  expect(ocrCall?.url).toBe('http://ocr.test:8000/scan')
-  const ocrHeaders = ocrCall?.init?.headers as Record<string, string>
-  expect(ocrHeaders.Authorization).toBe('Bearer ocr-test-token')
-  expect(ocrHeaders['Content-Type']).toBe('image/png')
+  // The real store handed the actual File to the on-device scanner.
+  const scanned = scannedFiles.at(-1)
+  expect(scanned?.name).toBe('scoreboard.png')
+  expect(scanned?.type).toBe('image/png')
+  expect(scanned?.size).toBe(64)
+  expect(progressSeen).toContain('Reading the scoreboard…')
 
   await click(button('Log match'))
   await waitFor(
@@ -475,3 +466,92 @@ test('upload → scan → review → submit creates a replayed match and refresh
   expect(elo?.elo).not.toBe(700)
   expect(elo?.elo).toBeGreaterThan(700)
 }, 30_000)
+
+test('a screenshot on the clipboard can be pasted in instead of uploaded', async () => {
+  await openImport()
+  ocrMode = 'ok'
+  scannedFiles.length = 0
+  await pasteScreenshot('clipboard.png')
+
+  await waitFor(() => text().includes('Matched'), 'the review from a pasted screenshot')
+  expect(document.querySelector<HTMLInputElement>('input[aria-label="Damage for sniperking"]')?.value).toBe('12000')
+  // The pasted File went through the same scanner as an uploaded one.
+  const scanned = scannedFiles.at(-1)
+  expect(scanned?.name).toBe('clipboard.png')
+  expect(scanned?.type).toBe('image/png')
+  expect(scanned?.size).toBe(64)
+
+  await click(button('Reject screenshot'))
+  await waitFor(() => Boolean(document.querySelector('.rivals-drop')), 'the upload screen')
+})
+
+test('a wedged scan can be cancelled from the panel', async () => {
+  await openImport()
+  ocrMode = 'hang'
+  await upload()
+  await waitFor(
+    () => Boolean(document.querySelector('.rivals-scanning')),
+    'the scanning state',
+  )
+  expect(button('Cancel scan')).toBeDefined()
+
+  await click(button('Cancel scan'))
+  await waitFor(() => text().includes('Scan cancelled'), 'the cancellation message')
+
+  // Back to the upload screen with nothing to review and nothing saved.
+  expect(document.querySelector('.rivals-drop')).not.toBeNull()
+  expect(document.querySelector('.rivals-summary')).toBeNull()
+  ocrMode = 'ok'
+}, 20_000)
+
+test('a scan that outlives its budget is stopped and explained', async () => {
+  const { RivalsImport } = await import('../src/client/components/RivalsImport')
+  const host = win.document.createElement('div')
+  win.document.body.append(host)
+  const localRoot = createRoot(host as unknown as HTMLElement)
+
+  const hang = (
+    _file: File,
+    _onProgress?: (message: string) => void,
+    signal?: AbortSignal,
+  ) =>
+    new Promise<RivalsScan>((_resolve, reject) => {
+      signal?.addEventListener('abort', () => reject(new Error('cancelled')))
+    })
+
+  await act(async () => {
+    localRoot.render(
+      React.createElement(RivalsImport, {
+        players: [],
+        onScan: hang,
+        onSave: async () => undefined,
+        onRefresh: async () => undefined,
+        scanTimeoutMs: 80,
+      }),
+    )
+  })
+
+  const input = host.querySelector('input[type="file"]') as unknown as HTMLInputElement
+  const file = new File([pngBytes() as unknown as BlobPart], 'scoreboard.png', {
+    type: 'image/png',
+  })
+  Object.defineProperty(input, 'files', { value: [file], configurable: true })
+  await act(async () => {
+    input.dispatchEvent(new win.Event('change', { bubbles: true }) as unknown as Event)
+  })
+
+  await waitFor(
+    () => (host.textContent ?? '').includes('and was stopped'),
+    'the timeout message',
+  )
+  const panel = host.textContent ?? ''
+  expect(panel).toContain('longer than 1 second')
+  expect(panel).toContain('Nothing was saved')
+  expect(host.querySelector('.rivals-drop')).not.toBeNull()
+  expect(host.querySelector('.rivals-summary')).toBeNull()
+
+  await act(async () => {
+    localRoot.unmount()
+  })
+  host.remove()
+}, 20_000)

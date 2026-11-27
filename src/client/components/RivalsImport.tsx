@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { MatchInput } from '../../shared/elo'
-import type {
-  RosterMatchStatus,
-  RivalsScan,
+import {
+  RIVALS_ACCEPTED_TYPES,
+  RIVALS_MAX_BYTES,
+  type RosterMatchStatus,
+  type RivalsScan,
 } from '../../shared/rivals'
 import type { Player } from '../../shared/types'
-import type { RivalsConfig } from '../store'
 import {
   buildImportInput,
   choosePlayer,
@@ -25,10 +26,15 @@ import {
 
 type Props = {
   players: Player[]
-  onConfig: () => Promise<RivalsConfig>
-  onScan: (file: File) => Promise<RivalsScan>
+  onScan: (
+    file: File,
+    onProgress?: (message: string) => void,
+    signal?: AbortSignal,
+  ) => Promise<RivalsScan>
   onSave: (input: MatchInput) => Promise<void>
   onRefresh: () => Promise<void>
+  /** How long a scan may run before it is stopped. Tests pass a short budget. */
+  scanTimeoutMs?: number
 }
 
 type Stage = 'idle' | 'scanning' | 'review' | 'saving' | 'uncertain'
@@ -51,9 +57,14 @@ const STATUS_TONE: Record<RosterMatchStatus, string> = {
 
 const percent = (value: number) => `${Math.round(Math.max(0, Math.min(1, value)) * 100)}%`
 
-/** An older Worker sends only `configured`; that deployment still reads fine. */
-const FALLBACK_CONFIG =
-  'Screenshot import needs an OCR service. Set OCR_SERVICE_URL and OCR_SERVICE_TOKEN for this deployment, then try again.'
+/**
+ * A cold import downloads ~28 MB of engine and models before it reads anything,
+ * which is minutes on a slow connection — so the ceiling is deliberately far
+ * above any honest scan. It is the backstop that stops a wedged engine from
+ * parking the panel on "Reading the scoreboard…" with no way out; the Cancel
+ * button is the fast path for someone who is merely impatient.
+ */
+const SCAN_TIMEOUT_MS = 300_000
 
 /**
  * Upload → OCR → review → the existing match form. Nothing here records a
@@ -62,54 +73,58 @@ const FALLBACK_CONFIG =
  */
 export function RivalsImport({
   players,
-  onConfig,
   onScan,
   onSave,
   onRefresh,
+  scanTimeoutMs = SCAN_TIMEOUT_MS,
 }: Props) {
   const [stage, setStage] = useState<Stage>('idle')
   const [draft, setDraft] = useState<ImportDraft | null>(null)
   const [preview, setPreview] = useState('')
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
-  const [config, setConfig] = useState<RivalsConfig | null>(null)
-  const [checking, setChecking] = useState(false)
+  const [progress, setProgress] = useState('')
   const inputRef = useRef<HTMLInputElement>(null)
   const busy = useRef(false)
   const previewRef = useRef('')
-
-  useEffect(() => {
-    let live = true
-    void onConfig()
-      .then((next) => {
-        if (live) setConfig(next)
-      })
-      .catch(() => {
-        if (live) setConfig(null)
-      })
-    return () => {
-      live = false
-    }
-  }, [onConfig])
-
-  /** The service may have been started (or fixed) while this panel was open. */
-  const recheck = async () => {
-    setChecking(true)
-    try {
-      setConfig(await onConfig())
-    } catch {
-      setConfig(null)
-    } finally {
-      setChecking(false)
-    }
-  }
+  const scanRef = useRef<AbortController | null>(null)
 
   useEffect(
     () => () => {
+      scanRef.current?.abort()
       if (previewRef.current) URL.revokeObjectURL(previewRef.current)
     },
     [],
   )
+
+  /**
+   * Ctrl+V, while the panel is waiting for a screenshot.
+   *
+   * A capture is usually already on the clipboard — Print Screen and every
+   * snipping tool put it there — so choosing it through the file picker again is
+   * the slow path. The listener sits on the document because nothing in this
+   * stage is focused and the drop zone cannot hold focus; it is attached only in
+   * the idle stage, so a paste cannot replace a scan in progress or a review the
+   * user is working through.
+   */
+  useEffect(() => {
+    if (stage !== 'idle') return
+    const onPaste = (event: ClipboardEvent) => {
+      const items = event.clipboardData?.items
+      if (!items) return
+      for (let index = 0; index < items.length; index += 1) {
+        const item = items[index]
+        if (!item || item.kind !== 'file' || !item.type.startsWith('image/')) continue
+        const file = item.getAsFile()
+        if (!file) continue
+        event.preventDefault()
+        acceptFile(file)
+        return
+      }
+    }
+    document.addEventListener('paste', onPaste)
+    return () => document.removeEventListener('paste', onPaste)
+  }, [stage])
 
   const statuses = useMemo(
     () => (draft ? draftStatuses(draft, players) : {}),
@@ -142,13 +157,46 @@ export function RivalsImport({
     previewRef.current = url
     setPreview(url)
     setStage('scanning')
+    setProgress('Preparing the screenshot…')
     setError('')
     setNotice('')
+
+    // A scan cannot be interrupted mid-inference, so it stops between passes:
+    // the scanner checks this signal before each OCR call. The timer is the
+    // backstop that keeps a wedged import from parking the panel forever.
+    const controller = new AbortController()
+    scanRef.current = controller
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, scanTimeoutMs)
+
     try {
-      const scan = await onScan(file)
+      const scan = await onScan(file, setProgress, controller.signal)
+      // Cancelled after the last pass: `cancelScan` already reset the panel.
+      if (controller.signal.aborted) return
       setDraft(draftFromScan(scan, players))
       setStage('review')
+      setProgress('')
     } catch (problem) {
+      if (controller.signal.aborted) {
+        if (timedOut) {
+          const seconds = Math.max(1, Math.round(scanTimeoutMs / 1000))
+          setProgress('')
+          clearPreview()
+          setDraft(null)
+          setStage('idle')
+          setError(
+            `The scan took longer than ${seconds} ${
+              seconds === 1 ? 'second' : 'seconds'
+            } and was stopped. Nothing was saved — try again, or log the match by hand.`,
+          )
+          if (inputRef.current) inputRef.current.value = ''
+        }
+        return
+      }
+      setProgress('')
       clearPreview()
       setDraft(null)
       setStage('idle')
@@ -158,14 +206,38 @@ export function RivalsImport({
           : 'That screenshot could not be read.',
       )
       if (inputRef.current) inputRef.current.value = ''
+    } finally {
+      clearTimeout(timer)
+      if (scanRef.current === controller) scanRef.current = null
     }
   }
 
-  const chooseFile = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0]
-    if (!file) return
-    const limit = config?.maxBytes ?? 8 * 1024 * 1024
-    const types = config?.acceptedTypes ?? ['image/png', 'image/jpeg', 'image/webp']
+  /**
+   * Stops the scan and returns to the upload screen. The engine keeps whatever
+   * pass it is in until that pass returns; its result is then discarded by the
+   * aborted branch in `runScan`.
+   */
+  const cancelScan = () => {
+    const controller = scanRef.current
+    if (!controller) return
+    scanRef.current = null
+    controller.abort()
+    setProgress('')
+    clearPreview()
+    setDraft(null)
+    setStage('idle')
+    setError('Scan cancelled. Nothing was saved.')
+    if (inputRef.current) inputRef.current.value = ''
+  }
+
+  /**
+   * One gate for every way a screenshot arrives: the file picker and the
+   * clipboard are validated against the same type and size rules, so a pasted
+   * image cannot skip a check an uploaded one has to pass.
+   */
+  const acceptFile = (file: File) => {
+    const limit = RIVALS_MAX_BYTES
+    const types: readonly string[] = RIVALS_ACCEPTED_TYPES
     const looksImage =
       types.includes(file.type) || /\.(png|jpe?g|webp)$/i.test(file.name)
     if (!looksImage) {
@@ -177,6 +249,11 @@ export function RivalsImport({
       return
     }
     void runScan(file)
+  }
+
+  const chooseFile = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    if (file) acceptFile(file)
   }
 
   const update = (next: ImportDraft) => setDraft(next)
@@ -226,44 +303,29 @@ export function RivalsImport({
   if (stage === 'idle' || stage === 'scanning')
     return (
       <div className="match-form rivals-import">
-        {config && !config.configured && (
-          <div
-            className="rivals-config"
-            data-status={config.status ?? 'unconfigured'}
-          >
-            <p className="notice">{config.message ?? FALLBACK_CONFIG}</p>
-            <button
-              type="button"
-              className="quiet"
-              disabled={checking}
-              onClick={() => void recheck()}
-            >
-              {checking ? 'Checking…' : 'Check again'}
-            </button>
-          </div>
-        )}
         <div className="rivals-upload">
           <label className="rivals-drop" htmlFor="rivals-file">
             <span className="rivals-drop-title">
               Import from RIVALS Screenshot
             </span>
             <span className="rivals-drop-hint">
-              Upload a screenshot of the in-game Tab scoreboard. Teams are read
-              from the row colours (gold and purple), damage from the DMG column
-              and the winner from the two team scores.
+              Upload a screenshot of the in-game Tab scoreboard, or press Ctrl+V
+              to paste one from the clipboard. Teams are read from the row
+              colours (gold and purple), damage from the DMG column and the
+              winner from the two team scores.
             </span>
             <input
               id="rivals-file"
               ref={inputRef}
               type="file"
               accept="image/png,image/jpeg,image/webp"
-              disabled={stage === 'scanning' || config?.configured === false}
+              disabled={stage === 'scanning'}
               onChange={chooseFile}
             />
           </label>
           <p className="hint">
-            PNG, JPEG or WebP up to 8 MB. The image is sent once to the OCR
-            service and is never stored.
+            PNG, JPEG or WebP up to 8 MB. The screenshot is read on this device
+            and is never uploaded or stored.
           </p>
         </div>
         {stage === 'scanning' && (
@@ -272,8 +334,11 @@ export function RivalsImport({
               <img className="rivals-preview" src={preview} alt="Uploaded scoreboard" />
             )}
             <p className="rivals-progress" role="status">
-              Reading the scoreboard…
+              {progress || 'Reading the scoreboard…'}
             </p>
+            <button type="button" className="quiet" onClick={cancelScan}>
+              Cancel scan
+            </button>
           </div>
         )}
         {error && (

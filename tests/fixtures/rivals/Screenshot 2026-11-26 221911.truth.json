@@ -1,0 +1,9 @@
+{
+  "note": "1v1 Arena, 501x375, gold 5 vs purple 2. Usernames are the Roblox handles under the display names.",
+  "teams": { "gold": 5, "purple": 2 },
+  "winner": "gold",
+  "rows": [
+    { "username": "destruction_lord9", "team": "gold", "damage": 962 },
+    { "username": "noob123qw94", "team": "purple", "damage": 862 }
+  ]
+}

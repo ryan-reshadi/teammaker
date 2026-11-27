@@ -14,10 +14,8 @@ import type { Database } from '../src/worker/db'
  * itself, so there is no ASSETS binding here.
  *
  * Environment: APP_ORIGIN, FREEBUFF_CLIENT_ID, FREEBUFF_ISSUER,
- * TURSO_DATABASE_URL, TURSO_AUTH_TOKEN, and optionally OCR_SERVICE_URL plus
- * OCR_SERVICE_TOKEN for screenshot import. Without the database URL the app
- * stays in guest mode instead of failing requests; without the OCR pair the
- * import mode reports that it is not configured.
+ * TURSO_DATABASE_URL and TURSO_AUTH_TOKEN. Without the database URL the app
+ * stays in guest mode instead of failing requests.
  */
 function connectDatabase(url: string, authToken?: string): Database | undefined {
   try {
@@ -37,8 +35,6 @@ function readEnv(): Env {
     FREEBUFF_CLIENT_ID: process.env.FREEBUFF_CLIENT_ID,
     FREEBUFF_ISSUER: process.env.FREEBUFF_ISSUER,
     APP_ORIGIN: process.env.APP_ORIGIN,
-    OCR_SERVICE_URL: process.env.OCR_SERVICE_URL,
-    OCR_SERVICE_TOKEN: process.env.OCR_SERVICE_TOKEN,
   }
 }
 

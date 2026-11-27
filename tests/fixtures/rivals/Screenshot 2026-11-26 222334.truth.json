@@ -1,0 +1,9 @@
+{
+  "note": "1v1 Arena, 556x388, gold 5 vs purple 2. Usernames are the Roblox handles under the display names. Row 0's handle is 12 px tall, where a capital I, a lowercase l and a double underscore cannot be told apart, so that username is not asserted.",
+  "teams": { "gold": 5, "purple": 2 },
+  "winner": "gold",
+  "rows": [
+    { "team": "gold", "damage": 1095 },
+    { "username": "destruction_lord9", "team": "purple", "damage": 808 }
+  ]
+}
