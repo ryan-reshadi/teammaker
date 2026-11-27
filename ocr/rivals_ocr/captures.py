@@ -69,6 +69,10 @@ class CaptureReport:
     issues: list[str]
     seconds: float
     error: str | None = None
+    #: The document the pipeline produced, so the report can show what it read.
+    result: dict = field(default_factory=dict)
+    #: How many rows the pipeline segmented, which can differ from the truth.
+    read_rows: int = 0
 
 
 @dataclass
@@ -247,6 +251,8 @@ def measure_capture(capture: Capture, reader) -> CaptureReport:
         checks,
         [issue["code"] for issue in result.get("issues", [])],
         time.time() - started,
+        result=result,
+        read_rows=len(actual_rows),
     )
 
 
@@ -333,17 +339,24 @@ def format_capture(report: CaptureReport) -> list[str]:
             )
         if row.issues:
             lines.append(f"{row_header}  issues    {', '.join(row.issues)}")
-    if len(report.rows) < len(report.capture.truth.get("rows", [])) or not report.rows:
-        lines.append(
-            f"  rows: read {len(report.rows)} of {len(report.capture.truth.get('rows', []))}"
-        )
+    expected_rows = len(report.capture.truth.get("rows", []))
+    if report.read_rows != expected_rows:
+        lines.append(f"  rows: read {report.read_rows} of {expected_rows}")
+    scores = {team.get("color"): team.get("score") for team in report.result.get("teams", [])}
     for name in ("goldScore", "purpleScore", "winner"):
-        if name in report.checks:
-            if name.endswith("Score"):
-                expected = report.capture.truth.get("teams", {}).get(name[: -len("Score")])
-            else:
-                expected = report.capture.truth.get("winner")
-            lines.append(f"  {name:9} expected {_value(expected):12} {mark(report.checks[name])}")
+        if name not in report.checks:
+            continue
+        if name.endswith("Score"):
+            color = name[: -len("Score")]
+            expected = report.capture.truth.get("teams", {}).get(color)
+            actual = scores.get(color)
+        else:
+            expected = report.capture.truth.get("winner")
+            actual = _actual_winner(report.result)
+        lines.append(
+            f"  {name:9} expected {_value(expected):12} read {_value(actual):12}"
+            f" {mark(report.checks[name])}"
+        )
     if report.issues:
         lines.append(f"  document issues: {', '.join(report.issues)}")
     return lines

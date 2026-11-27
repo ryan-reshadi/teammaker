@@ -1,0 +1,15 @@
+$ vite --host 127.0.0.1
+[2m11:14:54 PM[22m [36m[1m[vite][22m[39m [90m[2m(teammaker)[22m[39m Re-optimizing dependencies because lockfile has changed
+[2mDefault inspector port 9229 not available, using 9232 instead
+[22m
+Using secrets defined in .dev.vars
+[2m11:15:59 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m Re-optimizing dependencies because lockfile has changed
+Port 5173 is in use, trying another one...
+Port 5174 is in use, trying another one...
+Port 5175 is in use, trying another one...
+
+  [32m[1mVITE[22m v8.3.8[39m  [2mready in [0m[1m68070[22m[2m[0m ms[22m
+
+  [32m➜[39m  [1mLocal[22m:   [36mhttp://127.0.0.1:[1m5176[22m/[39m
+  [32m➜[39m  [1mDebug[22m:   [2m[33mhttp://127.0.0.1:[1m5176[22m[2m/__debug[39m[22m
+[2m11:16:02 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [optimizer] scanning dependencies...

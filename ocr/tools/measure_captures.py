@@ -56,7 +56,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _utf8_streams() -> None:
+    """The OCR engine returns characters a Windows code-page console cannot encode."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _utf8_streams()
     args = parse_args(argv if argv is not None else sys.argv[1:])
     thresholds = {
         name: getattr(args, f"min_{name}") for name in DEFAULT_THRESHOLDS

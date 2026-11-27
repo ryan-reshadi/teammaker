@@ -239,156 +239,207 @@ export function Roster({
                 key={player.id}
                 className={`player-row${player.sittingOut ? ' benched' : ''}`}
               >
-                {editing?.id === player.id ? (
-                  <div className="player-details-editor">
-                    <input
-                      className="player-name-input"
-                      autoFocus
-                      maxLength={40}
-                      value={editing.name}
-                      placeholder="Name"
-                      aria-label={`Name for ${player.name}`}
-                      onChange={(event) =>
-                        setEditing({ ...editing, name: event.target.value })
-                      }
-                      onKeyDown={editorKeyDown(player)}
-                    />
-                    <input
-                      className="player-name-input"
-                      maxLength={32}
-                      value={editing.username}
-                      placeholder="Username (optional)"
-                      aria-label={`Username for ${player.name}`}
-                      onChange={(event) =>
-                        setEditing({ ...editing, username: event.target.value })
-                      }
-                      onKeyDown={editorKeyDown(player)}
-                    />
-                    <div className="player-details-actions">
-                      <button
-                        type="button"
-                        className="primary"
-                        disabled={!editing.name.trim()}
-                        onClick={() => commitDetails(player)}
-                      >
-                        Save
-                      </button>
-                      <button
-                        type="button"
-                        className="quiet"
-                        onClick={() => setEditing(null)}
-                      >
-                        Cancel
-                      </button>
-                    </div>
-                  </div>
-                ) : (
-                  <button
-                    type="button"
-                    className="player-name"
-                    title="Edit name and username"
-                    onClick={() =>
-                      setEditing({
-                        id: player.id,
-                        name: player.name,
-                        username: player.username ?? '',
-                      })
-                    }
-                  >
-                    <span className="player-name-text">{player.name}</span>
-                    {player.username && (
-                      <span className="player-username">{player.username}</span>
-                    )}
-                    {suggestions.includes(player.id) && (
-                      <span className="suggest-badge">bench?</span>
-                    )}
-                  </button>
-                )}
-                <div className="elo-actions">
-                  {eloEditor === player.id ? (
-                    <input
-                      className="elo-input"
-                      type="number"
-                      min={100}
-                      max={1000}
-                      step={1}
-                      autoFocus
-                      value={eloDraft}
-                      aria-label={`Elo for ${player.name}`}
-                      onChange={(event) => setEloDraft(event.target.value)}
-                      onBlur={() => commitElo(player)}
-                      onKeyDown={(event) => {
-                        if (event.key === 'Enter') {
-                          event.preventDefault()
-                          event.currentTarget.blur()
+                <div className="player-main">
+                  {editing?.id === player.id ? (
+                    <div className="player-details-editor">
+                      <input
+                        className="player-name-input"
+                        autoFocus
+                        maxLength={40}
+                        value={editing.name}
+                        placeholder="Name"
+                        aria-label={`Name for ${player.name}`}
+                        onChange={(event) =>
+                          setEditing({ ...editing, name: event.target.value })
                         }
-                        if (event.key === 'Escape') setEloEditor(null)
-                      }}
-                    />
+                        onKeyDown={editorKeyDown(player)}
+                      />
+                      <input
+                        className="player-name-input"
+                        maxLength={32}
+                        value={editing.username}
+                        placeholder="Username (optional)"
+                        aria-label={`Username for ${player.name}`}
+                        onChange={(event) =>
+                          setEditing({ ...editing, username: event.target.value })
+                        }
+                        onKeyDown={editorKeyDown(player)}
+                      />
+                      <div className="player-details-actions">
+                        <button
+                          type="button"
+                          className="primary"
+                          disabled={!editing.name.trim()}
+                          onClick={() => commitDetails(player)}
+                        >
+                          Save
+                        </button>
+                        <button
+                          type="button"
+                          className="quiet"
+                          onClick={() => setEditing(null)}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
                   ) : (
                     <button
                       type="button"
-                      className="elo-badge"
-                      aria-label={`Advanced elo for ${player.name}: ${player.elo}`}
-                      title={`Advanced · edit ${player.elo} elo directly`}
-                      onClick={() => openElo(player)}
+                      className="player-name"
+                      title="Edit name and username"
+                      onClick={() =>
+                        setEditing({
+                          id: player.id,
+                          name: player.name,
+                          username: player.username ?? '',
+                        })
+                      }
                     >
-                      {player.elo}
+                      <span className="player-name-line">
+                        <span className="player-name-text">{player.name}</span>
+                        {suggestions.includes(player.id) && (
+                          <span className="suggest-badge">bench?</span>
+                        )}
+                      </span>
+                      {player.username && (
+                        <span className="player-username">{player.username}</span>
+                      )}
                     </button>
                   )}
-                  {matchesPlayed < PROVISIONAL_MATCHES && (
-                    <span
-                      className="provisional-badge"
-                      title={`Provisional: K ${effectiveK} for the first ${PROVISIONAL_MATCHES} rated matches (${PROVISIONAL_MATCHES - matchesPlayed} left)`}
-                    >
-                      P
-                    </span>
-                  )}
-                  <button
-                    type="button"
-                    className="history-button"
-                    aria-label={`Rating history for ${player.name}`}
-                    aria-expanded={historyFor === player.id}
-                    title="Rating history"
-                    onClick={() =>
-                      setHistoryFor(historyFor === player.id ? null : player.id)
-                    }
-                  >
-                    ↗
-                  </button>
                 </div>
-                <SkillPicker
-                  value={band}
-                  onChange={(skill) => {
-                    if (skill !== band) void onUpdate(player.id, { skill })
-                  }}
-                  label={`Rating for ${player.name}`}
-                />
-                <button
-                  type="button"
-                  className="sit-toggle"
-                  aria-pressed={player.sittingOut}
-                  title={
-                    player.sittingOut
-                      ? `${player.name} is sitting out — bring them back in`
-                      : `Sit ${player.name} out of this round`
-                  }
-                  onClick={() =>
-                    void onUpdate(player.id, { sittingOut: !player.sittingOut })
-                  }
-                >
-                  <span className="sit-dot" aria-hidden="true" />
-                  {player.sittingOut ? 'Out' : 'Sit out'}
-                </button>
-                <button
-                  type="button"
-                  className="icon-button"
-                  aria-label={`Remove ${player.name}`}
-                  title={`Remove ${player.name}`}
-                  onClick={() => void onRemove(player.id)}
-                >
-                  ×
-                </button>
+                <div className="player-rating">
+                  <SkillPicker
+                    value={band}
+                    onChange={(skill) => {
+                      if (skill !== band) void onUpdate(player.id, { skill })
+                    }}
+                    label={`Rating for ${player.name}`}
+                  />
+                  <div className="elo-actions">
+                    {eloEditor === player.id ? (
+                      <input
+                        className="elo-input"
+                        type="number"
+                        min={100}
+                        max={1000}
+                        step={1}
+                        autoFocus
+                        value={eloDraft}
+                        aria-label={`Elo for ${player.name}`}
+                        onChange={(event) => setEloDraft(event.target.value)}
+                        onBlur={() => commitElo(player)}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter') {
+                            event.preventDefault()
+                            event.currentTarget.blur()
+                          }
+                          if (event.key === 'Escape') setEloEditor(null)
+                        }}
+                      />
+                    ) : (
+                      <button
+                        type="button"
+                        className="elo-badge"
+                        aria-label={`Advanced elo for ${player.name}: ${player.elo}`}
+                        title={`Advanced · edit ${player.elo} elo directly`}
+                        onClick={() => openElo(player)}
+                      >
+                        {player.elo}
+                      </button>
+                    )}
+                    {matchesPlayed < PROVISIONAL_MATCHES && (
+                      <span
+                        className="provisional-badge"
+                        title={`Provisional: K ${effectiveK} for the first ${PROVISIONAL_MATCHES} rated matches (${PROVISIONAL_MATCHES - matchesPlayed} left)`}
+                      >
+                        P
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      className="history-button"
+                      aria-label={`Rating history for ${player.name}`}
+                      aria-expanded={historyFor === player.id}
+                      title="Rating history"
+                      onClick={() =>
+                        setHistoryFor(historyFor === player.id ? null : player.id)
+                      }
+                    >
+                      ↗
+                    </button>
+                  </div>
+                </div>
+                <div className="player-foot">
+                  <div className="player-roles">
+                    {roleEditor === player.id ? (
+                      <div className="role-editor">
+                        <RolePicker
+                          value={player.tags}
+                          onChange={(tags) => void onUpdate(player.id, { tags })}
+                          label={`Roles for ${player.name}`}
+                        />
+                        <button
+                          type="button"
+                          className="quiet"
+                          onClick={() => setRoleEditor(null)}
+                        >
+                          Done
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        className="role-summary"
+                        aria-label={`Roles for ${player.name}: ${
+                          player.tags.length
+                            ? player.tags.map(roleLabel).join(', ')
+                            : 'none yet'
+                        }`}
+                        onClick={() => setRoleEditor(player.id)}
+                      >
+                        {player.tags.length ? (
+                          player.tags.map((tag) => (
+                            <span key={tag} className="role-chip">
+                              {roleLabel(tag)}
+                            </span>
+                          ))
+                        ) : (
+                          <span className="role-empty">+ roles</span>
+                        )}
+                      </button>
+                    )}
+                  </div>
+                  <div className="player-actions">
+                    <button
+                      type="button"
+                      className="sit-toggle"
+                      aria-pressed={player.sittingOut}
+                      title={
+                        player.sittingOut
+                          ? `${player.name} is sitting out — bring them back in`
+                          : `Sit ${player.name} out of this round`
+                      }
+                      onClick={() =>
+                        void onUpdate(player.id, {
+                          sittingOut: !player.sittingOut,
+                        })
+                      }
+                    >
+                      <span className="sit-dot" aria-hidden="true" />
+                      {player.sittingOut ? 'Out' : 'Sit out'}
+                    </button>
+                    <button
+                      type="button"
+                      className="icon-button"
+                      aria-label={`Remove ${player.name}`}
+                      title={`Remove ${player.name}`}
+                      onClick={() => void onRemove(player.id)}
+                    >
+                      ×
+                    </button>
+                  </div>
+                </div>
                 {historyFor === player.id && (
                   <div className="player-history">
                     <div className="player-history-head">
@@ -454,45 +505,6 @@ export function Roster({
                     )}
                   </div>
                 )}
-                <div className="player-roles">
-                  {roleEditor === player.id ? (
-                    <div className="role-editor">
-                      <RolePicker
-                        value={player.tags}
-                        onChange={(tags) => void onUpdate(player.id, { tags })}
-                        label={`Roles for ${player.name}`}
-                      />
-                      <button
-                        type="button"
-                        className="quiet"
-                        onClick={() => setRoleEditor(null)}
-                      >
-                        Done
-                      </button>
-                    </div>
-                  ) : (
-                    <button
-                      type="button"
-                      className="role-summary"
-                      aria-label={`Roles for ${player.name}: ${
-                        player.tags.length
-                          ? player.tags.map(roleLabel).join(', ')
-                          : 'none yet'
-                      }`}
-                      onClick={() => setRoleEditor(player.id)}
-                    >
-                      {player.tags.length ? (
-                        player.tags.map((tag) => (
-                          <span key={tag} className="role-chip">
-                            {roleLabel(tag)}
-                          </span>
-                        ))
-                      ) : (
-                        <span className="role-empty">+ roles</span>
-                      )}
-                    </button>
-                  )}
-                </div>
               </li>
             )
           })}

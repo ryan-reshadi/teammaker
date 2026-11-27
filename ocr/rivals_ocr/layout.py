@@ -114,6 +114,25 @@ def _merge(runs: list[tuple[int, int]], gap: int) -> list[tuple[int, int]]:
     return merged
 
 
+def _column_spans(columns: np.ndarray, gap: int) -> list[tuple[int, int]]:
+    """Groups coloured columns, tolerating gaps of up to `gap` pixels."""
+    spans: list[tuple[int, int]] = []
+    start: int | None = None
+    last = 0
+    for value in columns:
+        index = int(value)
+        if start is None:
+            start = last = index
+        elif index - last <= gap:
+            last = index
+        else:
+            spans.append((start, last + 1))
+            start = last = index
+    if start is not None:
+        spans.append((start, last + 1))
+    return spans
+
+
 def _bands(combined: np.ndarray, width: int, height: int) -> list[tuple[int, int, int, int]]:
     counts = combined.sum(axis=1) / 255.0
     # A player row is a wide stripe; stray coloured pixels are not.
@@ -130,6 +149,11 @@ def _bands(combined: np.ndarray, width: int, height: int) -> list[tuple[int, int
             continue
         x0, x1 = int(xs[0]), int(xs[-1]) + 1
         if x1 - x0 < width * 0.25:
+            continue
+        # A player row is one continuous stripe. The HUD score boxes sit on the
+        # same line but far apart, so a band made of separated blobs is not a row.
+        widest = max(end - start for start, end in _column_spans(xs, max(2, int(round(width * 0.01)))))
+        if widest < (x1 - x0) * 0.8:
             continue
         bands.append((y0, y1, x0, x1))
     return bands
@@ -158,6 +182,73 @@ def _split_tall(
     return out
 
 
+def _color_runs(
+    gold: np.ndarray, purple: np.ndarray, band: tuple[int, int, int, int]
+) -> list[tuple[int, int]]:
+    """Splits a striped band where the team colour changes.
+
+    Two adjacent rows of different teams share no visible gap, so the colour
+    itself is the boundary between them. A band with no clear colour (a row
+    painted in both) is not split and stays one unclassified row.
+    """
+    y0, y1, x0, x1 = band
+    gold_counts = gold[y0:y1, x0:x1].sum(axis=1) / 255.0
+    purple_counts = purple[y0:y1, x0:x1].sum(axis=1) / 255.0
+    join_gap = max(2, int(round((y1 - y0) * 0.04)))
+    runs: list[list[int]] = []
+    for offset, (gold_count, purple_count) in enumerate(zip(gold_counts, purple_counts)):
+        if gold_count > 0 and gold_count >= purple_count * 1.6:
+            label = 0
+        elif purple_count > 0 and purple_count >= gold_count * 1.6:
+            label = 1
+        else:
+            continue
+        top = y0 + offset
+        if runs and runs[-1][2] == label and top - runs[-1][1] <= join_gap:
+            runs[-1][1] = top + 1
+        else:
+            runs.append([top, top + 1, label])
+    return [(start, end) for start, end, _label in runs if end - start >= 6]
+
+
+def _score_hud(
+    gold: np.ndarray, purple: np.ndarray, table_top: int, width: int
+) -> tuple[int, int, int, int] | None:
+    """The coloured score strip above the table, when the screenshot has one.
+
+    The game puts the two team scores in coloured boxes at the top of the screen,
+    far from the table and mixed with other HUD numbers (the timer, coin badges).
+    Reading those boxes on their own keeps that clutter out of the score crop.
+    """
+    if table_top < 8:
+        return None
+    combined = cv2.bitwise_or(gold[:table_top], purple[:table_top])
+    counts = combined.sum(axis=1) / 255.0
+    runs = _merge(_runs(counts >= max(6.0, width * 0.06)), max(1, int(round(table_top * 0.02))))
+    best: tuple[int, tuple[int, int, int, int]] | None = None
+    for y0, y1 in runs:
+        if y1 - y0 < max(8, int(round(table_top * 0.04))):
+            continue
+        columns = combined[y0:y1].sum(axis=0) / 255.0 >= max(2.0, (y1 - y0) * 0.2)
+        xs = np.flatnonzero(columns)
+        if xs.size == 0:
+            continue
+        box = (int(xs[0]), y0, int(xs[-1]) + 1, y1)
+        area = (box[2] - box[0]) * (box[3] - box[1])
+        if best is None or area > best[0]:
+            best = (area, box)
+    if best is None:
+        return None
+    x0, y0, x1, y1 = best[1]
+    pad = max(4, int(round((y1 - y0) * 0.15)))
+    return (
+        max(0, x0 - pad),
+        max(0, y0 - pad),
+        min(width, x1 + pad),
+        min(int(gold.shape[0]), y1 + pad),
+    )
+
+
 def _classify(
     gold: np.ndarray, purple: np.ndarray, y0: int, y1: int, x0: int, x1: int
 ) -> tuple[str | None, float]:
@@ -183,21 +274,31 @@ def analyze(hsv: np.ndarray) -> Layout:
         raise ScoreboardError("No RIVALS scoreboard was found in that screenshot.")
 
     rows: list[Row] = []
-    for index, (y0, y1, x0, x1) in enumerate(bands):
-        color, confidence = _classify(gold, purple, y0, y1, x0, x1)
-        rows.append(Row(index, y0, y1, x0, x1, color, confidence))
+    for y0, y1, x0, x1 in bands:
+        for run_y0, run_y1 in _color_runs(gold, purple, (y0, y1, x0, x1)) or [(y0, y1)]:
+            color, confidence = _classify(gold, purple, run_y0, run_y1, x0, x1)
+            rows.append(Row(len(rows), run_y0, run_y1, x0, x1, color, confidence))
+
+    # Every row crop starts at the same x, so the DMG column located in the
+    # header lines up with the numbers in a row crop.
+    x0 = min(row.x0 for row in rows)
+    x1 = max(row.x1 for row in rows)
+    for row in rows:
+        row.x0, row.x1 = x0, x1
 
     heights = sorted(row.y1 - row.y0 for row in rows)
     row_height = max(1, int(round(heights[len(heights) // 2])))
-    x0 = min(row.x0 for row in rows)
-    x1 = max(row.x1 for row in rows)
 
     first = rows[0]
     header_top = max(0, first.y0 - row_height)
     header = (x0, header_top, x1, first.y0) if first.y0 - header_top >= 8 else None
-    header_bottom = header[1] if header else header_top
-    score_top = max(0, header_bottom - int(round(2.5 * row_height)))
-    score = (x0, score_top, x1, header_bottom) if header_bottom - score_top >= 8 else None
+    # The score HUD sits above the header, sometimes at the very top of the
+    # screenshot; without a coloured strip there, everything above the table is
+    # all the room the scores have.
+    score_top = header[1] if header else header_top
+    score = _score_hud(gold, purple, score_top, width)
+    if score is None:
+        score = (x0, 0, x1, score_top) if score_top >= 8 else None
 
     return Layout(
         rows=rows,
@@ -276,11 +377,20 @@ def parse_row(lines, column: DamageColumn | None, row_height: int) -> RowText:
     if not left:
         left = [line for line in tokens if _clean_number(line.text) is None]
 
+    # The board prints the display name above an @handle. The name is the
+    # username; the smaller handle line is dropped rather than concatenated.
+    named = [line for line in left if not line.text.strip().startswith("@")]
+    left = named or left
+
     username: str | None = None
     username_confidence = 0.0
     if left:
-        group = _cluster(left, max(row_height * 0.6, 8))[-1]
-        username = " ".join(line.text.strip() for line in group).strip() or None
+        tallest = max(line.box[3] - line.box[1] for line in left)
+        primary = [
+            line for line in left if (line.box[3] - line.box[1]) >= tallest * 0.75
+        ]
+        group = _cluster(primary or left, max(row_height * 0.6, 8))[-1]
+        username = _join(group) or None
         username_confidence = sum(line.confidence for line in group) / len(group)
 
     return RowText(
@@ -291,6 +401,21 @@ def parse_row(lines, column: DamageColumn | None, row_height: int) -> RowText:
         raw,
         False,
     )
+
+
+def _join(lines) -> str:
+    """Joins the tokens of one name, spacing them only at a real word gap."""
+    parts: list[str] = []
+    previous = None
+    for line in lines:
+        if previous is not None:
+            gap = line.box[0] - previous.box[2]
+            height = max(1.0, previous.box[3] - previous.box[1])
+            if gap > height * 0.5:
+                parts.append(" ")
+        parts.append(line.text.strip())
+        previous = line
+    return "".join(parts).strip()
 
 
 def _mask_center(mask: np.ndarray) -> float | None:
@@ -307,15 +432,15 @@ def _line_center(line) -> float:
 def parse_scores(
     lines, gold_mask: np.ndarray, purple_mask: np.ndarray
 ) -> ScoreRead:
-    numbers: list[tuple[object, int]] = []
+    numbers: list[tuple[object, int, float]] = []
     for line in lines:
         digits = _digits(line.text)
         if digits is None or not SCORE_NUMBER.match(digits):
             continue
         if line.confidence < 0.4:
             continue
-        numbers.append((line, int(digits)))
-    if len(numbers) != 2:
+        numbers.append((line, int(digits), line.box[3] - line.box[1]))
+    if not numbers:
         return ScoreRead(
             None,
             None,
@@ -337,14 +462,23 @@ def parse_scores(
                 "The team colours could not be matched to the scores — choose the winner by hand.",
             ),
         )
-    first, second = numbers
-    first_gold = abs(_line_center(first[0]) - gold_center) <= abs(
-        _line_center(first[0]) - purple_center
-    )
-    second_gold = abs(_line_center(second[0]) - gold_center) <= abs(
-        _line_center(second[0]) - purple_center
-    )
-    if first_gold == second_gold:
+
+    def pick(center: float, other: float):
+        nearest = [
+            entry
+            for entry in numbers
+            if abs(_line_center(entry[0]) - center) <= abs(_line_center(entry[0]) - other)
+        ]
+        if not nearest:
+            return None
+        # The score is the large numeral in a team's colour; a small badge in the
+        # same box (a coin count) is lower and would otherwise win on proximity.
+        nearest.sort(key=lambda entry: (entry[2], entry[0].confidence), reverse=True)
+        return nearest[0]
+
+    gold_entry = pick(gold_center, purple_center)
+    purple_entry = pick(purple_center, gold_center)
+    if gold_entry is None or purple_entry is None or gold_entry[0] is purple_entry[0]:
         return ScoreRead(
             None,
             None,
@@ -354,9 +488,7 @@ def parse_scores(
                 "Each score could not be tied to a team — choose the winner by hand.",
             ),
         )
-    gold_line = first[0] if first_gold else second[0]
-    purple_line = second[0] if first_gold else first[0]
-    gold_score = first[1] if first_gold else second[1]
-    purple_score = second[1] if first_gold else first[1]
-    confidence = (gold_line.confidence + purple_line.confidence) / 2.0
-    return ScoreRead(gold_score, purple_score, min(1.0, max(0.0, confidence)), None)
+    confidence = (gold_entry[0].confidence + purple_entry[0].confidence) / 2.0
+    return ScoreRead(
+        gold_entry[1], purple_entry[1], min(1.0, max(0.0, confidence)), None
+    )

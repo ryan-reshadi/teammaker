@@ -43,6 +43,35 @@ def scan_image(
     return analyze_image(image, reader)
 
 
+#: The score strip is small and each numeral sits beside an avatar and a coin
+#: badge; rendered at 2x the two are separate detections, at 1x the numeral can
+#: merge into the avatar and be lost.
+SCORE_UPSCALE = 2
+
+
+def _read_scores(box, reader, image: np.ndarray, gold: np.ndarray, purple: np.ndarray):
+    region = crop(image, box)
+    gold_region = crop(gold, box)
+    purple_region = crop(purple, box)
+    if SCORE_UPSCALE != 1 and region.size:
+        region = cv2.resize(
+            region, None, fx=SCORE_UPSCALE, fy=SCORE_UPSCALE, interpolation=cv2.INTER_CUBIC
+        )
+        gold_region = cv2.resize(
+            gold_region, None, fx=SCORE_UPSCALE, fy=SCORE_UPSCALE, interpolation=cv2.INTER_NEAREST
+        )
+        purple_region = cv2.resize(
+            purple_region,
+            None,
+            fx=SCORE_UPSCALE,
+            fy=SCORE_UPSCALE,
+            interpolation=cv2.INTER_NEAREST,
+        )
+    return parse_scores(
+        reader.read(region, "score"), gold_region, purple_region
+    )
+
+
 def analyze_image(image: np.ndarray, reader) -> dict:
     height, width = image.shape[:2]
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
@@ -147,12 +176,7 @@ def analyze_image(image: np.ndarray, reader) -> dict:
             ),
         )
     else:
-        box = layout.score
-        scores = parse_scores(
-            reader.read(crop(image, box), "score"),
-            crop(gold, box),
-            crop(purple, box),
-        )
+        scores = _read_scores(layout.score, reader, image, gold, purple)
     if scores.issue is not None:
         issues.append(_issue(scores.issue[0], scores.issue[1], field="score"))
 
