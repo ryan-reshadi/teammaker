@@ -300,20 +300,40 @@ both sides cap size (8 MB) and pixel dimensions (4096). The route has its own
 8 MB body limit, so the 64 KB limit every other data route depends on is
 unchanged.
 
-The service lives in `ocr/` and is optional at runtime: without
-`OCR_SERVICE_URL` and `OCR_SERVICE_TOKEN` the UI says import is not configured and
-everything else works as before. Run it locally with:
+The OCR call itself is bounded at **28 s**, which leaves 2 s for the rest of the
+function under Vercel's 30 s `maxDuration`. The slowest real capture takes about
+24 s warm, so a scan that arrives while the service is still settling can reach
+the limit; that is answered with a retryable 502 and never records anything.
+Recognition cost is dominated by the table pass (one call, every text line), not
+by image size, so keep that budget in mind before shrinking the container.
+
+The service lives in `ocr/` and is optional at runtime: when it is not running,
+the import panel says exactly what is wrong and every other feature works as
+before. Create its virtualenv once, then use the npm scripts — they run that
+interpreter, and stop with the install command if the venv, or PaddleOCR inside
+it, is missing:
 
 ```sh
 python -m venv ocr/.venv
 ocr/.venv/Scripts/python.exe -m pip install -r ocr/requirements.txt   # Windows
 # python3 -m venv ocr/.venv && ocr/.venv/bin/pip install -r ocr/requirements.txt
-OCR_SERVICE_TOKEN=dev-secret ocr/.venv/Scripts/python.exe ocr/serve.py
+
+bun run ocr:serve      # the service on 127.0.0.1:8000
+bun run ocr:test       # the Python suite, same interpreter
+bun run ocr:captures   # measure the real screenshots in ocr/tests/captures
 ```
 
-Then copy `.dev.vars.example` to `.dev.vars` (the token must match) and run
-`bun run dev`. `ocr/README.md` documents the request/response contract, the
-pipeline stages, the Docker image and the hosting constraints.
+Then copy `.dev.vars.example` to `.dev.vars` (the token must match the one the
+service was started with) and start `bun run dev` — Vite reads `.dev.vars` once,
+at startup, so restart it after editing the file.
+
+`GET /api/rivals/config` is what the import panel renders: it probes the
+service's `/health` once and reports `ready`, `unconfigured` (with `missing`
+naming `OCR_SERVICE_URL` and/or `OCR_SERVICE_TOKEN`), `invalid_url`,
+`unreachable`, `timeout` or `error`, plus a `message` the UI shows verbatim. The
+original `configured`, `maxBytes` and `acceptedTypes` fields are unchanged, so an
+older client keeps working. `ocr/README.md` documents the request/response
+contract, the pipeline stages, the Docker image and the hosting constraints.
 
 ### Measuring real screenshots
 
@@ -571,11 +591,25 @@ missing env var. The environment names are the same everywhere:
 
 The OCR service is the one piece that cannot live on Sites or in the Vercel
 function: Workers cannot run OpenCV/PaddlePaddle native code, and the Python
-function bundle limit is a poor fit for Paddle's wheels and models. Run it as the
-container in `ocr/Dockerfile` on any host that allows a small long-running
-service, expose it over HTTPS, then set `OCR_SERVICE_URL` and
-`OCR_SERVICE_TOKEN` for the app. Until both are set, the import mode reports that
-it is not configured and no other feature changes.
+function bundle limit is a poor fit for Paddle's wheels and models. Until the two
+variables below are set *and* the service behind them answers, the import mode
+reports the specific reason and no other feature changes.
+
+1. Run the container in `ocr/Dockerfile` on an always-on public **CPU** host:
+   at least 1 GB RAM and **no scale-to-zero**. The first request loads the
+   Paddle models, which outlasts the Worker's 28 s budget, so a cold container
+   looks like a broken service.
+2. Give it `OCR_HOST=0.0.0.0`, `OCR_PORT=8000` and a long random
+   `OCR_SERVICE_TOKEN`. It speaks plain HTTP, so terminate TLS in front of it
+   (the host's ingress or a reverse proxy) and confirm `https://<host>/health`
+   answers `{"ok":true,…}` from outside your network.
+3. In Vercel, set `OCR_SERVICE_URL=https://<host>` (the base URL only — the
+   Worker appends `/scan` and `/health`) and the same `OCR_SERVICE_TOKEN`, for
+   the Production environment.
+4. **Redeploy.** Vercel applies environment variables only to new deployments,
+   so an existing one keeps reporting the old state until it is rebuilt.
+
+A different port is fine as long as `OCR_SERVICE_URL` includes it.
 
 `bun run serve:node` starts the same handler on `127.0.0.1:5174` under Bun
 against a SQLite file. To exercise the **actual Vercel runtime path** — plain

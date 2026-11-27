@@ -17,3 +17,12 @@ Port 5175 is in use, trying another one...
 [vite] hot updated: virtual:cloudflare/worker-entry
 [2m12:13:44 AM[22m [36m[1m[vite][22m[39m [90m[2m(teammaker)[22m[39m [32mhmr update [39m[2mvirtual:cloudflare/worker-entry[22m
 [vite] hot updated: virtual:cloudflare/worker-entry
+[2m1:40:13 AM[22m [36m[1m[vite][22m[39m [90m[2m(teammaker)[22m[39m [32mhmr update [39m[2mvirtual:cloudflare/worker-entry[22m
+[vite] hot updated: virtual:cloudflare/worker-entry
+[2m1:40:13 AM[22m [36m[1m[vite][22m[39m [90m[2m(teammaker)[22m[39m [32mhmr update [39m[2mvirtual:cloudflare/worker-entry[22m
+[vite] hot updated: virtual:cloudflare/worker-entry
+Teammaker: OCR health probe failed Network connection lost.
+Teammaker: OCR health probe timed out The operation was aborted due to timeout
+Teammaker: OCR service timed out The operation was aborted due to timeout
+[2m1:58:08 AM[22m [36m[1m[vite][22m[39m [90m[2m(teammaker)[22m[39m [32mhmr update [39m[2mvirtual:cloudflare/worker-entry[22m
+[vite] hot updated: virtual:cloudflare/worker-entry

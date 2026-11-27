@@ -23,6 +23,13 @@ OCR_SERVICE_TOKEN=dev-secret .venv/Scripts/python.exe serve.py
 The first start downloads the PP-OCR models (cached by PaddleX) and warms the
 engine once, so the first upload is not the slow one.
 
+From the repository root, `bun run ocr:serve` starts the same thing through this
+directory's `.venv` interpreter (bare `python` does not have PaddleOCR), and
+stops with the exact install commands if that virtualenv or PaddleOCR is
+missing. `bun run ocr:test` and `bun run ocr:captures` go through it too. A
+second instance on a busy port exits at once, naming the address it could not
+bind, instead of loading the models first.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `OCR_SERVICE_TOKEN` | *(required)* | Shared bearer token. The service exits without it. |

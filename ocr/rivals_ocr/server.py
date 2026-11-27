@@ -145,12 +145,23 @@ def run() -> None:
     max_bytes = int(os.environ.get("OCR_MAX_BYTES", str(DEFAULT_MAX_BYTES)))
     max_dimension = int(os.environ.get("OCR_MAX_DIMENSION", str(DEFAULT_MAX_DIMENSION)))
     reader = PaddleTextReader(lang=os.environ.get("OCR_LANG", "en"))
+    # Bind before loading the models: a second instance on a busy port should
+    # fail in a second with the reason, not after a minute of model loading.
+    try:
+        server = create_server(reader, token, host, port, max_bytes, max_dimension)
+    except OSError as error:
+        print(
+            f"rivals-ocr: cannot listen on {host}:{port} ({error}). "
+            "Another instance may already be running; stop it or set OCR_PORT.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from error
     try:
         reader.warmup()
     except EngineUnavailable as error:
+        server.server_close()
         print(f"rivals-ocr: {error}", file=sys.stderr)
         raise SystemExit(2)
-    server = create_server(reader, token, host, port, max_bytes, max_dimension)
     print(
         f"rivals-ocr: listening on http://{host}:{port} (engine={reader.name})",
         flush=True,

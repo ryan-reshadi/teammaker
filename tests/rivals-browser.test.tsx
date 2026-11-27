@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test'
 import { Window } from 'happy-dom'
 import { Miniflare } from 'miniflare'
-import type { RivalsScan } from '../src/shared/rivals'
+import type { RivalsConfig, RivalsScan } from '../src/shared/rivals'
 import type { Env } from '../src/worker/auth'
 import type { createApp as createAppFactory } from '../src/worker/app'
 
@@ -324,6 +324,67 @@ test('the Matches screen switches between manual entry and screenshot import', a
   )
   expect(document.querySelector('.rivals-drop')).toBeNull()
 })
+
+test('the import panel renders the server’s exact reason and re-checks on demand', async () => {
+  const { RivalsImport } = await import('../src/client/components/RivalsImport')
+  const host = win.document.createElement('div')
+  win.document.body.append(host)
+  const localRoot = createRoot(host as unknown as HTMLElement)
+
+  const unavailable: RivalsConfig = {
+    configured: false,
+    status: 'unconfigured',
+    missing: ['OCR_SERVICE_TOKEN'],
+    message:
+      'Screenshot import is not configured: set OCR_SERVICE_TOKEN (the bearer token the OCR service was started with), then redeploy.',
+    maxBytes: 8 * 1024 * 1024,
+    acceptedTypes: ['image/png'],
+  }
+  const ready: RivalsConfig = {
+    ...unavailable,
+    configured: true,
+    status: 'ready',
+    missing: [],
+    message: 'Screenshot import is ready.',
+  }
+  let state: RivalsConfig = unavailable
+
+  await act(async () => {
+    localRoot.render(
+      React.createElement(RivalsImport, {
+        players: [],
+        onConfig: async () => state,
+        onScan: async () => {
+          throw new Error('not used')
+        },
+        onSave: async () => undefined,
+        onRefresh: async () => undefined,
+      }),
+    )
+  })
+
+  const panel = () => host.textContent ?? ''
+  const fileInput = () =>
+    host.querySelector('input[type="file"]') as unknown as HTMLInputElement | null
+  await waitFor(() => panel().includes('OCR_SERVICE_TOKEN'), 'the reason')
+  expect(fileInput()?.disabled).toBe(true)
+
+  // Starting the service and pressing the button is enough — no page reload.
+  state = ready
+  const buttons = Array.from(
+    host.querySelectorAll('button') as unknown as HTMLButtonElement[],
+  )
+  const again = buttons.find((entry) => (entry.textContent ?? '').trim() === 'Check again')
+  if (!again) throw new Error(`No “Check again” button — body: ${panel().slice(0, 400)}`)
+  await click(again)
+  await waitFor(() => !panel().includes('OCR_SERVICE_TOKEN'), 'the healthy state')
+  expect(fileInput()?.disabled).toBe(false)
+
+  await act(async () => {
+    localRoot.unmount()
+  })
+  host.remove()
+}, 20_000)
 
 test('an unreachable OCR service is shown as a visible error, not a silent no-op', async () => {
   await openImport()

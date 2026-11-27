@@ -51,6 +51,10 @@ const STATUS_TONE: Record<RosterMatchStatus, string> = {
 
 const percent = (value: number) => `${Math.round(Math.max(0, Math.min(1, value)) * 100)}%`
 
+/** An older Worker sends only `configured`; that deployment still reads fine. */
+const FALLBACK_CONFIG =
+  'Screenshot import needs an OCR service. Set OCR_SERVICE_URL and OCR_SERVICE_TOKEN for this deployment, then try again.'
+
 /**
  * Upload → OCR → review → the existing match form. Nothing here records a
  * match itself: a confirmed review becomes a plain `MatchInput` and goes
@@ -69,6 +73,7 @@ export function RivalsImport({
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [config, setConfig] = useState<RivalsConfig | null>(null)
+  const [checking, setChecking] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
   const busy = useRef(false)
   const previewRef = useRef('')
@@ -86,6 +91,18 @@ export function RivalsImport({
       live = false
     }
   }, [onConfig])
+
+  /** The service may have been started (or fixed) while this panel was open. */
+  const recheck = async () => {
+    setChecking(true)
+    try {
+      setConfig(await onConfig())
+    } catch {
+      setConfig(null)
+    } finally {
+      setChecking(false)
+    }
+  }
 
   useEffect(
     () => () => {
@@ -210,10 +227,20 @@ export function RivalsImport({
     return (
       <div className="match-form rivals-import">
         {config && !config.configured && (
-          <p className="notice">
-            Screenshot import needs an OCR service. Set OCR_SERVICE_URL and
-            OCR_SERVICE_TOKEN for this deployment, then try again.
-          </p>
+          <div
+            className="rivals-config"
+            data-status={config.status ?? 'unconfigured'}
+          >
+            <p className="notice">{config.message ?? FALLBACK_CONFIG}</p>
+            <button
+              type="button"
+              className="quiet"
+              disabled={checking}
+              onClick={() => void recheck()}
+            >
+              {checking ? 'Checking…' : 'Check again'}
+            </button>
+          </div>
         )}
         <div className="rivals-upload">
           <label className="rivals-drop" htmlFor="rivals-file">

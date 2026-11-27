@@ -20,6 +20,42 @@ export const RIVALS_DEFAULT_LABEL = 'RIVALS Screenshot Import'
 export const RIVALS_FUZZY_THRESHOLD = 0.82
 export const RIVALS_ACCEPTED_TYPES = ['image/png', 'image/jpeg', 'image/webp'] as const
 
+/**
+ * Why screenshot import is or is not available. `ready` is the only state an
+ * upload can succeed in; every other state names the thing to fix, so the UI
+ * never has to guess between "not configured" and "configured but down".
+ */
+export const RIVALS_CONFIG_STATUSES = [
+  'ready',
+  'unconfigured',
+  'invalid_url',
+  'unreachable',
+  'timeout',
+  'error',
+] as const
+
+export type RivalsConfigStatus = (typeof RIVALS_CONFIG_STATUSES)[number]
+export type RivalsEnvVar = 'OCR_SERVICE_URL' | 'OCR_SERVICE_TOKEN'
+
+/**
+ * `GET /api/rivals/config`. The first three fields are the original contract, so
+ * an older client still renders; `status`, `missing` and `message` are additive
+ * detail for the import panel.
+ */
+export type RivalsConfig = {
+  /** True only when both variables are set and the service answered a probe. */
+  configured: boolean
+  maxBytes: number
+  acceptedTypes: readonly string[]
+  status?: RivalsConfigStatus
+  /** Which variables are absent; empty when both are set. */
+  missing?: RivalsEnvVar[]
+  /** Shown verbatim by the import UI. Never contains the token. */
+  message?: string
+  /** The engine's own name, from the service's health response. */
+  engine?: string
+}
+
 export type RivalsImageType = (typeof RIVALS_ACCEPTED_TYPES)[number]
 export type RivalsTeamColor = 'gold' | 'purple'
 

@@ -10,6 +10,7 @@ import { normalizeTags } from '../shared/roles'
 import {
   RIVALS_ACCEPTED_TYPES,
   RIVALS_MAX_BYTES,
+  type RivalsConfig,
   type RivalsScan,
 } from '../shared/rivals'
 import type { Player, Round, RoundConfig } from '../shared/types'
@@ -24,11 +25,7 @@ export type PlayerPatch = Partial<
   Pick<Player, 'name' | 'username' | 'skill' | 'elo' | 'tags' | 'sittingOut'>
 >
 
-export type RivalsConfig = {
-  configured: boolean
-  maxBytes: number
-  acceptedTypes: readonly string[]
-}
+export type { RivalsConfig }
 
 export type Store = {
   players: () => Promise<Player[]>
@@ -163,8 +160,12 @@ function localStore(): Store {
       )
     },
     async rivalsConfig() {
+      // Guests never reach the Worker, so there is no service to probe here.
       return {
         configured: false,
+        status: 'unconfigured' as const,
+        missing: [],
+        message: 'Sign in to import matches from a screenshot.',
         maxBytes: RIVALS_MAX_BYTES,
         acceptedTypes: [...RIVALS_ACCEPTED_TYPES],
       }

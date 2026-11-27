@@ -2,7 +2,7 @@ import { afterAll, beforeAll, expect, test } from 'bun:test'
 import { Miniflare } from 'miniflare'
 import { createApp } from '../src/worker/app'
 import type { Env } from '../src/worker/auth'
-import type { RivalsScan } from '../src/shared/rivals'
+import type { RivalsConfig, RivalsScan } from '../src/shared/rivals'
 
 const runtime = new Miniflare({
   workers: [
@@ -164,19 +164,99 @@ test('screenshot routes require a session and a same-origin mutation', async () 
   expect(foreign.status).toBe(403)
 })
 
-test('config reports availability without leaking the service credentials', async () => {
-  const response = await jsonRequest('/api/rivals/config')
+const health = () => Response.json({ ok: true, version: 1, engine: 'paddleocr' })
+
+const configWith = async (environment: Env): Promise<RivalsConfig> => {
+  const response = await jsonRequest('/api/rivals/config', { environment })
   expect(response.status).toBe(200)
-  const body = (await response.json()) as Record<string, unknown>
-  expect(body).toEqual({
+  return (await response.json()) as RivalsConfig
+}
+
+test('config reports a healthy service without leaking the credential', async () => {
+  responder = health
+  calls = []
+  const body = await configWith(configured())
+  // The original three fields are untouched, so an older client still renders.
+  expect(body).toMatchObject({
     configured: true,
+    status: 'ready',
+    missing: [],
+    engine: 'paddleocr',
     maxBytes: 8 * 1024 * 1024,
     acceptedTypes: ['image/png', 'image/jpeg', 'image/webp'],
   })
   expect(JSON.stringify(body)).not.toContain('ocr.test')
+  expect(JSON.stringify(body)).not.toContain('service-secret')
+  // The probe is a plain GET /health and does not carry the bearer token.
+  expect(calls).toHaveLength(1)
+  expect(calls[0]?.url).toBe('http://ocr.test:8000/health')
+  expect(calls[0]?.init?.method).toBe('GET')
+  const headers = calls[0]?.init?.headers as Record<string, string> | undefined
+  expect(headers?.Authorization).toBeUndefined()
+})
 
-  const unconfigured = await jsonRequest('/api/rivals/config', { environment: env })
-  expect(((await unconfigured.json()) as { configured: boolean }).configured).toBe(false)
+test('config names which variable is missing instead of one generic message', async () => {
+  responder = health
+  calls = []
+
+  const none = await configWith(env)
+  expect(none.configured).toBe(false)
+  expect(none.status).toBe('unconfigured')
+  expect(none.missing).toEqual(['OCR_SERVICE_URL', 'OCR_SERVICE_TOKEN'])
+  expect(none.message).toContain('OCR_SERVICE_URL')
+  expect(none.message).toContain('OCR_SERVICE_TOKEN')
+
+  const noToken = await configWith({ ...env, OCR_SERVICE_URL: 'http://ocr.test:8000' })
+  expect(noToken.missing).toEqual(['OCR_SERVICE_TOKEN'])
+  expect(noToken.message).toContain('OCR_SERVICE_TOKEN')
+  expect(noToken.message).not.toContain('OCR_SERVICE_URL')
+
+  const noUrl = await configWith({ ...env, OCR_SERVICE_TOKEN: 'service-secret' })
+  expect(noUrl.missing).toEqual(['OCR_SERVICE_URL'])
+  expect(noUrl.message).toContain('OCR_SERVICE_URL')
+  expect(noUrl.message).not.toContain('OCR_SERVICE_TOKEN')
+
+  // Nothing to probe when the configuration is incomplete.
+  expect(calls).toHaveLength(0)
+})
+
+test('config separates a stopped service from one that timed out', async () => {
+  responder = () => {
+    throw new TypeError('fetch failed')
+  }
+  const down = await configWith(configured())
+  expect(down.configured).toBe(false)
+  expect(down.status).toBe('unreachable')
+  expect(down.message).toContain('could not be reached')
+  expect(down.message).toContain('ocr:serve')
+
+  responder = () => {
+    const error = new Error('The operation timed out.')
+    error.name = 'TimeoutError'
+    throw error
+  }
+  const slow = await configWith(configured())
+  expect(slow.configured).toBe(false)
+  expect(slow.status).toBe('timeout')
+  expect(slow.message).toContain('did not answer')
+})
+
+test('config reports a service that answers badly and an unusable URL', async () => {
+  responder = () => new Response('nope', { status: 503 })
+  const unhealthy = await configWith(configured())
+  expect(unhealthy.status).toBe('error')
+  expect(unhealthy.message).toContain('503')
+
+  responder = () => new Response('not json', { status: 200 })
+  const garbage = await configWith(configured())
+  expect(garbage.status).toBe('error')
+
+  responder = health
+  calls = []
+  const badUrl = await configWith({ ...configured(), OCR_SERVICE_URL: 'not a url' })
+  expect(badUrl.status).toBe('invalid_url')
+  expect(badUrl.configured).toBe(false)
+  expect(calls).toHaveLength(0)
 })
 
 test('scan is unavailable when the OCR service is not configured', async () => {

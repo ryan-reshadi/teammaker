@@ -13,9 +13,9 @@
     "preview:replay": "bun run scripts/preview-replay.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.worker.json && tsc --noEmit -p tsconfig.browser-test.json",
     "test": "bun test",
-    "ocr:serve": "python ocr/serve.py",
-    "ocr:test": "python ocr/tests/run_tests.py",
-    "ocr:captures": "python ocr/tools/measure_captures.py"
+    "ocr:serve": "bun scripts/ocr.mjs serve",
+    "ocr:test": "bun scripts/ocr.mjs test",
+    "ocr:captures": "bun scripts/ocr.mjs captures"
   },
   "dependencies": {
     "@freebuff/auth": "0.1.0",
