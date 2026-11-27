@@ -25,6 +25,8 @@ type Props = {
   kFactor: number
   squashed: SquashInfo | null
   remote: boolean
+  /** Viewers can read the log but cannot log, edit or re-rate anything. */
+  canEdit: boolean
   onSave: (input: MatchInput, id?: string) => Promise<void>
   onDelete: (id: string) => Promise<void>
   onMove: (id: string, position: number) => Promise<void>
@@ -59,6 +61,7 @@ export function Matches({
   kFactor,
   squashed,
   remote,
+  canEdit,
   onSave,
   onDelete,
   onMove,
@@ -304,7 +307,7 @@ export function Matches({
               : 'Log damage after a match; elo follows.'}
           </p>
         </div>
-        {remote && (
+        {remote && canEdit && (
           <div className="k-control">
             <label htmlFor="k-factor" title="Past ratings stay frozen">
               K for new matches
@@ -330,6 +333,12 @@ export function Matches({
         <p className="empty-state">
           Sign in to log matches, tune elo and keep a rating history. Ratings on
           this device still work.
+        </p>
+      ) : !canEdit ? (
+        <p className="empty-state view-only">
+          You have view-only access to this group. Mark who is sitting out and
+          generate teams as much as you like — the log updates here as editors
+          record matches.
         </p>
       ) : (
         <>
@@ -577,6 +586,8 @@ export function Matches({
                       </div>
                     ))}
                     <div className="match-row-actions">
+                      {canEdit && (
+                        <>
                       <button
                         type="button"
                         className="quiet"
@@ -615,11 +626,13 @@ export function Matches({
                       </button>
                       <button
                         type="button"
-                        className="quiet danger"
+                        className="quiet"
                         onClick={() => void run(() => onDelete(event.id))}
                       >
                         Delete
                       </button>
+                        </>
+                      )}
                     </div>
                   </div>
                 </details>

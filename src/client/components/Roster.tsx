@@ -5,8 +5,8 @@ import {
   type RatingEventView,
 } from '../../shared/elo'
 import { playerHistory, sparklinePoints } from '../../shared/history'
-import { roleLabel } from '../../shared/roles'
-import type { Player } from '../../shared/types'
+import { tagLabel } from '../../shared/roles'
+import type { GroupTag, Player } from '../../shared/types'
 import type { PlayerDraft, PlayerPatch } from '../store'
 import { RolePicker } from './RolePicker'
 import { SkillPicker } from './SkillPicker'
@@ -15,11 +15,15 @@ type Props = {
   players: Player[]
   events: RatingEventView[]
   kFactor: number
+  tags: GroupTag[]
+  /** The device's local sit-out set for this group. */
+  sitOutIds: string[]
   suggestions: string[]
-  disabled?: boolean
+  canEdit: boolean
   onAdd: (drafts: PlayerDraft[]) => Promise<void>
   onUpdate: (id: string, patch: PlayerPatch) => Promise<void>
   onRemove: (id: string) => Promise<void>
+  onToggleSit: (id: string) => void
 }
 
 const parseNames = (text: string) =>
@@ -33,11 +37,14 @@ export function Roster({
   players,
   events,
   kFactor,
+  tags,
+  sitOutIds,
   suggestions,
-  disabled,
+  canEdit,
   onAdd,
   onUpdate,
   onRemove,
+  onToggleSit,
 }: Props) {
   const [draftName, setDraftName] = useState('')
   const [draftUsername, setDraftUsername] = useState('')
@@ -55,24 +62,27 @@ export function Roster({
   } | null>(null)
   const [historyFor, setHistoryFor] = useState<string | null>(null)
 
+  const sitting = new Set(sitOutIds)
   const total = players.reduce((sum, player) => sum + player.elo, 0)
-  const benched = players.filter((player) => player.sittingOut).length
+  const benched = players.filter((player) => sitting.has(player.id)).length
   const average = players.length ? Math.round(total / players.length) : 0
 
   const add = async (event: React.FormEvent) => {
     event.preventDefault()
+    if (!canEdit) return
     const name = draftName.trim()
     if (!name) return
     const username = draftUsername.trim()
     setDraftName('')
     setDraftUsername('')
-    const tags = draftTags
+    const nextTags = draftTags
     setDraftTags([])
-    await onAdd([{ name, username, skill: draftSkill, tags }])
+    await onAdd([{ name, username, skill: draftSkill, tags: nextTags }])
   }
 
   const addBulk = async (event: React.FormEvent) => {
     event.preventDefault()
+    if (!canEdit) return
     const names = parseNames(bulkText)
     if (!names.length) return
     setBulkText('')
@@ -82,7 +92,7 @@ export function Roster({
 
   /** Details only: the patch carries no rating, so elo and the log stay put. */
   const commitDetails = (player: Player) => {
-    if (editing?.id !== player.id) return
+    if (editing?.id !== player.id || !canEdit) return
     const name = editing.name.trim()
     const username = editing.username.trim()
     setEditing(null)
@@ -102,11 +112,13 @@ export function Roster({
   }
 
   const openElo = (player: Player) => {
+    if (!canEdit) return
     setEloDraft(String(player.elo))
     setEloEditor(player.id)
   }
 
   const commitElo = (player: Player) => {
+    if (!canEdit) return
     const parsed = Number(eloDraft)
     setEloEditor(null)
     if (!Number.isFinite(parsed)) return
@@ -125,88 +137,94 @@ export function Roster({
             {benched > 0 && <> · {benched} sitting out</>}
           </p>
         </div>
+        {!canEdit && <span className="chip">View only</span>}
       </div>
 
-      <form className="add-form" onSubmit={add}>
-        <input
-          className="input"
-          value={draftName}
-          maxLength={40}
-          placeholder="Add a player…"
-          aria-label="New player name"
-          disabled={disabled}
-          onChange={(event) => setDraftName(event.target.value)}
-        />
-        <input
-          className="input"
-          value={draftUsername}
-          maxLength={32}
-          placeholder="Username (optional)…"
-          aria-label="New player username"
-          disabled={disabled}
-          onChange={(event) => setDraftUsername(event.target.value)}
-        />
-        <div className="add-row">
-          <SkillPicker
-            value={draftSkill}
-            onChange={setDraftSkill}
-            label="Starting rating for the new player"
-          />
-          <button
-            className="primary"
-            disabled={disabled || !draftName.trim() || players.length >= 200}
-          >
-            Add
-          </button>
-        </div>
-        <div className="draft-roles">
-          <span className="draft-roles-label">Roles for the new player</span>
-          <RolePicker
-            value={draftTags}
-            onChange={setDraftTags}
-            label="Roles for the new player"
-          />
-        </div>
-      </form>
+      {canEdit && (
+        <>
+          <form className="add-form" onSubmit={add}>
+            <input
+              className="input"
+              value={draftName}
+              maxLength={40}
+              placeholder="Add a player…"
+              aria-label="New player name"
+              onChange={(event) => setDraftName(event.target.value)}
+            />
+            <input
+              className="input"
+              value={draftUsername}
+              maxLength={32}
+              placeholder="Username (optional)…"
+              aria-label="New player username"
+              onChange={(event) => setDraftUsername(event.target.value)}
+            />
+            <div className="add-row">
+              <SkillPicker
+                value={draftSkill}
+                onChange={setDraftSkill}
+                label="Starting rating for the new player"
+              />
+              <button
+                className="primary"
+                disabled={!draftName.trim() || players.length >= 200}
+              >
+                Add
+              </button>
+            </div>
+            {tags.length > 0 && (
+              <div className="draft-roles">
+                <span className="draft-roles-label">Tags for the new player</span>
+                <RolePicker
+                  tags={tags}
+                  value={draftTags}
+                  onChange={setDraftTags}
+                  label="Tags for the new player"
+                />
+              </div>
+            )}
+          </form>
 
-      {bulk ? (
-        <form className="bulk-form" onSubmit={addBulk}>
-          <label htmlFor="bulk-names">
-            One name per line or separated by commas — everyone joins at 5.
-          </label>
-          <textarea
-            id="bulk-names"
-            rows={4}
-            value={bulkText}
-            disabled={disabled}
-            onChange={(event) => setBulkText(event.target.value)}
-          />
-          <div className="bulk-actions">
-            <button className="primary" disabled={disabled || !parseNames(bulkText).length}>
-              Add {parseNames(bulkText).length || ''} players
+          {bulk ? (
+            <form className="bulk-form" onSubmit={addBulk}>
+              <label htmlFor="bulk-names">
+                One name per line or separated by commas — everyone joins at 5.
+              </label>
+              <textarea
+                id="bulk-names"
+                rows={4}
+                value={bulkText}
+                onChange={(event) => setBulkText(event.target.value)}
+              />
+              <div className="bulk-actions">
+                <button className="primary" disabled={!parseNames(bulkText).length}>
+                  Add {parseNames(bulkText).length || ''} players
+                </button>
+                <button
+                  type="button"
+                  className="quiet"
+                  onClick={() => {
+                    setBulk(false)
+                    setBulkText('')
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </form>
+          ) : (
+            <button type="button" className="buried-link" onClick={() => setBulk(true)}>
+              Add several at once
             </button>
-            <button
-              type="button"
-              className="quiet"
-              onClick={() => {
-                setBulk(false)
-                setBulkText('')
-              }}
-            >
-              Cancel
-            </button>
-          </div>
-        </form>
-      ) : (
-        <button type="button" className="buried-link" onClick={() => setBulk(true)}>
-          Add several at once
-        </button>
+          )}
+        </>
       )}
 
       {players.length === 0 ? (
         <p className="empty-state">
-          Add your players and rate each one from 1 to 10. That rating seeds their
-          elo (100 points a point); matches tune it from there.
+          {canEdit
+            ? 'Add your players and rate each one from 1 to 10. That rating seeds their elo (100 points a point); matches tune it from there.'
+            : 'This group has no players yet. Someone with edit access can add them.'}
         </p>
       ) : (
         <ul className="player-list">
@@ -217,13 +235,11 @@ export function Roster({
               history.length > 0
                 ? [history[0]!.eloBefore, ...history.map((entry) => entry.eloAfter)]
                 : [player.elo]
+            const isSitting = sitting.has(player.id)
             return (
-              <li
-                key={player.id}
-                className={`player-row${player.sittingOut ? ' benched' : ''}`}
-              >
+              <li key={player.id} className={`player-row${isSitting ? ' benched' : ''}`}>
                 <div className="player-main">
-                  {editing?.id === player.id ? (
+                  {editing?.id === player.id && canEdit ? (
                     <div className="player-details-editor">
                       <input
                         className="player-name-input"
@@ -270,7 +286,8 @@ export function Roster({
                     <button
                       type="button"
                       className="player-name"
-                      title="Edit name and username"
+                      title={canEdit ? 'Edit name and username' : player.name}
+                      disabled={!canEdit}
                       onClick={() =>
                         setEditing({
                           id: player.id,
@@ -295,12 +312,13 @@ export function Roster({
                   <SkillPicker
                     value={band}
                     onChange={(skill) => {
+                      if (!canEdit) return
                       if (skill !== band) void onUpdate(player.id, { skill })
                     }}
                     label={`Rating for ${player.name}`}
                   />
                   <div className="elo-actions">
-                    {eloEditor === player.id ? (
+                    {eloEditor === player.id && canEdit ? (
                       <input
                         className="elo-input"
                         type="number"
@@ -324,8 +342,13 @@ export function Roster({
                       <button
                         type="button"
                         className="elo-badge"
+                        disabled={!canEdit}
                         aria-label={`Advanced elo for ${player.name}: ${player.elo}`}
-                        title={`Advanced · edit ${player.elo} elo directly`}
+                        title={
+                          canEdit
+                            ? `Advanced · edit ${player.elo} elo directly`
+                            : `${player.name} has ${player.elo} elo`
+                        }
                         onClick={() => openElo(player)}
                       >
                         {player.elo}
@@ -347,12 +370,13 @@ export function Roster({
                 </div>
                 <div className="player-foot">
                   <div className="player-roles">
-                    {roleEditor === player.id ? (
+                    {roleEditor === player.id && canEdit ? (
                       <div className="role-editor">
                         <RolePicker
+                          tags={tags}
                           value={player.tags}
-                          onChange={(tags) => void onUpdate(player.id, { tags })}
-                          label={`Roles for ${player.name}`}
+                          onChange={(next) => void onUpdate(player.id, { tags: next })}
+                          label={`Tags for ${player.name}`}
                         />
                         <button
                           type="button"
@@ -366,9 +390,10 @@ export function Roster({
                       <button
                         type="button"
                         className="role-summary"
-                        aria-label={`Roles for ${player.name}: ${
+                        disabled={!canEdit}
+                        aria-label={`Tags for ${player.name}: ${
                           player.tags.length
-                            ? player.tags.map(roleLabel).join(', ')
+                            ? player.tags.map((tag) => tagLabel(tags, tag)).join(', ')
                             : 'none yet'
                         }`}
                         onClick={() => setRoleEditor(player.id)}
@@ -376,11 +401,13 @@ export function Roster({
                         {player.tags.length ? (
                           player.tags.map((tag) => (
                             <span key={tag} className="role-chip">
-                              {roleLabel(tag)}
+                              {tagLabel(tags, tag)}
                             </span>
                           ))
                         ) : (
-                          <span className="role-empty">+ roles</span>
+                          <span className="role-empty">
+                            {tags.length ? '+ tags' : 'no tags in this group'}
+                          </span>
                         )}
                       </button>
                     )}
@@ -389,30 +416,28 @@ export function Roster({
                     <button
                       type="button"
                       className="sit-toggle"
-                      aria-pressed={player.sittingOut}
+                      aria-pressed={isSitting}
                       title={
-                        player.sittingOut
-                          ? `${player.name} is sitting out — bring them back in`
-                          : `Sit ${player.name} out of this round`
+                        isSitting
+                          ? `${player.name} is sitting out on this device — bring them back in`
+                          : `Sit ${player.name} out of this round on this device`
                       }
-                      onClick={() =>
-                        void onUpdate(player.id, {
-                          sittingOut: !player.sittingOut,
-                        })
-                      }
+                      onClick={() => onToggleSit(player.id)}
                     >
                       <span className="sit-dot" aria-hidden="true" />
-                      {player.sittingOut ? 'Out' : 'Sit out'}
+                      {isSitting ? 'Out' : 'Sit out'}
                     </button>
-                    <button
-                      type="button"
-                      className="icon-button"
-                      aria-label={`Remove ${player.name}`}
-                      title={`Remove ${player.name}`}
-                      onClick={() => void onRemove(player.id)}
-                    >
-                      ×
-                    </button>
+                    {canEdit && (
+                      <button
+                        type="button"
+                        className="icon-button"
+                        aria-label={`Remove ${player.name}`}
+                        title={`Remove ${player.name}`}
+                        onClick={() => void onRemove(player.id)}
+                      >
+                        ×
+                      </button>
+                    )}
                   </div>
                 </div>
                 {historyFor === player.id && (
@@ -464,9 +489,7 @@ export function Roster({
                             <span className="history-elo">
                               {entry.eloBefore} → {entry.eloAfter}
                             </span>
-                            <span
-                              className={entry.delta >= 0 ? 'good' : 'bad'}
-                            >
+                            <span className={entry.delta >= 0 ? 'good' : 'bad'}>
                               {entry.delta > 0 ? '+' : ''}
                               {entry.delta}
                             </span>

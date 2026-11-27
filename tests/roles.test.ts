@@ -126,6 +126,35 @@ test('turning role spreading off leaves the balance ranking intact', () => {
   expect(roleCoverage(withRoles.arrangements[0]!.teams).missing).toHaveLength(2)
 })
 
+test('coverage follows a group\'s own tag ids, not a fixed catalogue', () => {
+  const tagIds = ['awper', 'anchor']
+  const teams = [
+    { players: [player('a', ['awper']), player('b', [])] },
+    { players: [player('c', ['anchor']), player('d', ['anchor'])] },
+  ]
+  // "awper" is held by only one player, so the group cannot cover it on every
+  // team and it is a specialist rather than a gap. "anchor" is shared, and one
+  // team has none.
+  expect(roleCoverage(teams, tagIds).missing).toEqual([
+    { teamIndex: 0, role: 'anchor' },
+  ])
+
+  const solved = solve(
+    [
+      player('w', ['awper'], 900),
+      player('x', ['awper'], 500),
+      player('y', ['anchor'], 500),
+      player('z', ['anchor'], 100),
+    ],
+    { teamCount: 2, tolerance: 1000, tagIds },
+  )
+  expect(solved.arrangements.length).toBeGreaterThan(0)
+  expect(roleCoverage(solved.arrangements[0]!.teams, tagIds).totals).toMatchObject({
+    awper: 2,
+    anchor: 2,
+  })
+})
+
 test('a player can hold several roles at once and counts for each', () => {
   const result = solve(
     [

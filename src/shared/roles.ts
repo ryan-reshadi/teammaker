@@ -1,8 +1,11 @@
 /**
- * The tag framework: a fixed catalogue of shooter roles. Players may hold any
- * number of them (a sniper who also calls the round), and the solver uses them
- * to rank splits that are equally balanced on skill.
+ * Skill tags. Groups define their own (see `group_tags`); the original eight
+ * shooter roles remain here as the labels used when an existing roster is
+ * migrated into its first group, and as the backward-compatible default for
+ * helpers that are called without an explicit tag list.
  */
+
+import type { GroupTag } from './types'
 
 export type Role = {
   id: string
@@ -73,24 +76,35 @@ export const roleShort = (id: string): string => byId.get(id)?.short ?? id.slice
 
 export const roleHint = (id: string): string => byId.get(id)?.hint ?? ''
 
-/** Drops unknown ids and duplicates, keeping catalogue order. */
-export function normalizeTags(value: unknown): string[] {
+/**
+ * Drops unknown ids and duplicates, keeping the order of `allowed`. Callers
+ * pass a group's tag ids; without one the legacy role catalogue is used.
+ */
+export function normalizeTags(
+  value: unknown,
+  allowed: readonly string[] = ROLE_IDS,
+): string[] {
   if (!Array.isArray(value)) return []
   const chosen = new Set<string>()
   for (const item of value) if (typeof item === 'string') chosen.add(item)
-  return ROLE_IDS.filter((id) => chosen.has(id))
+  return allowed.filter((id) => chosen.has(id))
 }
 
-const ROLE_BITS = new Map(ROLE_IDS.map((id, index) => [id, 1 << index]))
-
-/** Roles as a bitmask, so the solver can count coverage cheaply. */
-export function roleMask(tags?: string[]): number {
+/** Tags as a bitmask over `ids`, so the solver can count coverage cheaply. */
+export function roleMask(
+  tags?: string[],
+  ids: readonly string[] = ROLE_IDS,
+): number {
   if (!tags?.length) return 0
   let mask = 0
-  for (const tag of tags) mask |= ROLE_BITS.get(tag) ?? 0
+  tags.forEach((tag) => {
+    const bit = ids.indexOf(tag)
+    if (bit >= 0) mask |= 1 << bit
+  })
   return mask
 }
 
+/** The legacy catalogue size. Group tags are indexed per solve instead. */
 export const ROLE_COUNT = ROLE_IDS.length
 
 export type RoleCoverage = {
@@ -108,11 +122,13 @@ export type RoleCoverage = {
 
 export function roleCoverage(
   teams: { players: { tags?: string[] }[] }[],
+  tagIds: readonly string[] = ROLE_IDS,
 ): RoleCoverage {
+  const allowed = tagIds
   const counts = teams.map((team) => {
     const result: Record<string, number> = {}
     for (const player of team.players)
-      for (const tag of normalizeTags(player.tags))
+      for (const tag of normalizeTags(player.tags, allowed))
         result[tag] = (result[tag] ?? 0) + 1
     return result
   })
@@ -121,7 +137,7 @@ export function roleCoverage(
     for (const [role, count] of Object.entries(team))
       totals[role] = (totals[role] ?? 0) + count
   const missing: { teamIndex: number; role: string }[] = []
-  for (const role of ROLE_IDS) {
+  for (const role of allowed) {
     if ((totals[role] ?? 0) < teams.length) continue
     counts.forEach((team, teamIndex) => {
       if (!team[role]) missing.push({ teamIndex, role })
@@ -131,6 +147,27 @@ export function roleCoverage(
 }
 
 /** How many teams are missing a role they could have had. Lower is better. */
-export function roleGapScore(teams: { players: { tags?: string[] }[] }[]): number {
-  return roleCoverage(teams).missing.length
+export function roleGapScore(
+  teams: { players: { tags?: string[] }[] }[],
+  tagIds: readonly string[] = ROLE_IDS,
+): number {
+  return roleCoverage(teams, tagIds).missing.length
+}
+
+/** Label lookup for a group's tags, with the terse legacy names as fallback. */
+export function tagLabel(tags: readonly GroupTag[], id: string): string {
+  return tags.find((tag) => tag.id === id)?.label ?? roleLabel(id)
+}
+
+export function tagShort(tags: readonly GroupTag[], id: string): string {
+  const tag = tags.find((entry) => entry.id === id)
+  if (tag) return tag.short || tag.label.slice(0, 2).toUpperCase()
+  return roleShort(id)
+}
+
+/** Two-letter-ish chip text for a tag id, from its label when it has no short. */
+export function tagShortFromLabel(label: string): string {
+  const words = label.trim().split(/\s+/)
+  if (words.length >= 2) return (words[0]![0]! + words[1]![0]!).toUpperCase()
+  return label.slice(0, 2).toUpperCase()
 }

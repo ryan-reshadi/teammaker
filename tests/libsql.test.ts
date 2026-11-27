@@ -14,16 +14,58 @@ const app = createApp(async (request) => {
   return sub ? { sub } : null
 })
 
-const call = (
+const groupByEnv = new WeakMap<Env, Map<string, string>>()
+
+/** Resolves (and creates) the user's group, running the legacy migration first. */
+async function groupFor(env: Env, user: string): Promise<string | null> {
+  let cache = groupByEnv.get(env)
+  if (!cache) {
+    cache = new Map()
+    groupByEnv.set(env, cache)
+  }
+  const known = cache.get(user)
+  if (known) return known
+  const headers = { 'test-user': user, Origin: ORIGIN, 'Content-Type': 'application/json' }
+  const listed = await app.request(`${ORIGIN}/api/groups`, { headers }, env)
+  if (!listed.ok) return null
+  const body = (await listed.json()) as { groups: { id: string }[] }
+  if (body.groups[0]) {
+    cache.set(user, body.groups[0].id)
+    return body.groups[0].id
+  }
+  const created = await app.request(
+    `${ORIGIN}/api/groups`,
+    { method: 'POST', headers, body: JSON.stringify({ name: 'Test' }) },
+    env,
+  )
+  if (!created.ok) return null
+  const { group } = (await created.json()) as { group: { id: string } }
+  cache.set(user, group.id)
+  return group.id
+}
+
+const groupPath = async (env: Env, user: string, sub: string) => {
+  const id = await groupFor(env, user)
+  return id ? `/api/groups/${id}${sub}` : sub
+}
+
+const DATA_ROUTES = ['/api/players', '/api/matches', '/api/settings', '/api/rounds']
+
+async function call(
   env: Env,
   path: string,
   user?: string,
   method = 'GET',
   body?: unknown,
   origin: string | null = ORIGIN,
-) =>
-  app.request(
-    `${ORIGIN}${path}`,
+): Promise<Response> {
+  let scopedPath = path
+  if (user && DATA_ROUTES.some((route) => path === route || path.startsWith(`${route}/`))) {
+    const id = await groupFor(env, user)
+    if (id) scopedPath = `/api/groups/${id}${path.slice('/api'.length)}`
+  }
+  return app.request(
+    `${ORIGIN}${scopedPath}`,
     {
       method,
       headers: {
@@ -35,6 +77,7 @@ const call = (
     },
     env,
   )
+}
 
 describe('libSQL adapter', () => {
   let env: Env
@@ -70,10 +113,24 @@ describe('libSQL adapter', () => {
     await ensureSchema(db)
   })
 
-  test('players, roles and rounds round-trip through the adapter', async () => {
+  test('players and a group\'s own tags round-trip through the adapter', async () => {
+    const tag = async (label: string, short: string) => {
+      const response = await call(
+        env,
+        await groupPath(env, 'alice', '/tags'),
+        'alice',
+        'POST',
+        { label, short },
+      )
+      expect(response.status).toBe(201)
+      return ((await response.json()) as { tag: { id: string } }).tag.id
+    }
+    const sniper = await tag('Sniper', 'SN')
+    const igl = await tag('IGL', 'IG')
+
     const created = await call(env, '/api/players', 'alice', 'POST', {
       players: [
-        { name: 'Ada', skill: 9, tags: ['sniper', 'igl'] },
+        { name: 'Ada', skill: 9, tags: [sniper, igl] },
         { name: 'Bo', skill: 4 },
       ],
     })
@@ -83,47 +140,27 @@ describe('libSQL adapter', () => {
     }).players
     expect(players[0]!.elo).toBe(900)
     expect(players[1]!.elo).toBe(400)
-    expect(players[0]!.tags).toEqual(['sniper', 'igl'])
+    expect(players[0]!.tags).toEqual([sniper, igl])
     expect(players[1]!.tags).toEqual([])
 
     const renamed = await call(env, `/api/players/${players[0]!.id}`, 'alice', 'PATCH', {
       name: 'Ada L',
-      sittingOut: true,
-      tags: ['sniper'],
+      tags: [sniper],
     })
     expect(renamed.status).toBe(200)
     const patched = (await renamed.json()) as {
-      player: { name: string; sittingOut: boolean; tags: string[] }
+      player: { name: string; tags: string[] }
     }
-    expect(patched.player).toMatchObject({
-      name: 'Ada L',
-      sittingOut: true,
-      tags: ['sniper'],
-    })
+    expect(patched.player).toMatchObject({ name: 'Ada L', tags: [sniper] })
 
-    const round = await call(env, '/api/rounds', 'alice', 'POST', {
-      config: {
-        version: 2,
-        teamCount: 1,
-        tolerance: 300,
-        spread: 0,
-        benchedIds: [],
-        teams: [
-          {
-            sum: 900,
-            players: [{ id: players[0]!.id, name: 'Ada L', elo: 900, tags: ['sniper'] }],
-          },
-        ],
-      },
-    })
-    expect(round.status).toBe(201)
-
-    const listed = await call(env, '/api/rounds', 'alice')
-    const rounds = (await listed.json()) as {
-      rounds: { config: { teams: { players: { tags: string[] }[] }[] } }[]
-    }
-    expect(rounds.rounds).toHaveLength(1)
-    expect(rounds.rounds[0]!.config.teams[0]!.players[0]!.tags).toEqual(['sniper'])
+    // Sitting out is device-local now: the group API refuses it.
+    expect(
+      (
+        await call(env, `/api/players/${players[0]!.id}`, 'alice', 'PATCH', {
+          sittingOut: true,
+        })
+      ).status,
+    ).toBe(400)
 
     const removed = await call(env, `/api/players/${players[1]!.id}`, 'alice', 'DELETE')
     expect(removed.status).toBe(200)
@@ -134,7 +171,7 @@ describe('libSQL adapter', () => {
   })
 
   test('keeps accounts apart, refuses strangers and foreign origins', async () => {
-    expect((await call(env, '/api/players')).status).toBe(401)
+    expect((await call(env, '/api/groups/anything/players')).status).toBe(401)
     expect((await call(env, '/api/health')).status).toBe(200)
 
     await call(env, '/api/players', 'alice', 'POST', { name: 'Ada', skill: 9 })
@@ -160,7 +197,10 @@ describe('libSQL adapter', () => {
     const session = await call({ APP_ORIGIN: ORIGIN }, '/api/session')
     const body = (await session.json()) as { mode: string; database: boolean }
     expect(body).toMatchObject({ mode: 'setup', database: false })
-    expect((await call({ APP_ORIGIN: ORIGIN }, '/api/players', 'alice')).status).toBe(503)
+    expect(
+      (await call({ APP_ORIGIN: ORIGIN }, '/api/groups/anything/players', 'alice'))
+        .status,
+    ).toBe(503)
     expect(
       await (await call({ APP_ORIGIN: ORIGIN }, '/api/health')).json(),
     ).toMatchObject({ ok: true, database: 'unconfigured' })
@@ -398,8 +438,8 @@ describe('libSQL adapter', () => {
     expect(await results()).toEqual(startResults)
     expect(
       await db
-        .prepare('SELECT legacy_k FROM rating_meta WHERE owner_sub = ?')
-        .bind('legacy')
+        .prepare('SELECT legacy_k FROM group_rating_meta WHERE group_id = ?')
+        .bind(await groupFor(env, 'legacy'))
         .first(),
     ).toEqual({ legacy_k: 32 })
 
@@ -421,6 +461,8 @@ describe('libSQL adapter', () => {
 
   test('a squash folds the anchor into base_elo and drops the oldest events', async () => {
     const db = env.DB!
+    const groupId = await groupFor(env, 'squash')
+    expect(groupId).not.toBeNull()
     const created = await call(env, '/api/players', 'squash', 'POST', {
       players: [{ name: 'Ada', skill: 5 }],
     })
@@ -431,11 +473,12 @@ describe('libSQL adapter', () => {
     for (let position = 0; position < 5; position += 1) {
       await db
         .prepare(
-          'INSERT INTO rating_events (id, owner_sub, position, kind, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          'INSERT INTO rating_events (id, owner_sub, group_id, position, kind, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
         )
         .bind(
           `evt-${position}`,
           'squash',
+          groupId,
           position,
           'adjust',
           JSON.stringify({ playerId: id, elo: 600 + position * 10, reason: 'seed' }),
@@ -445,11 +488,12 @@ describe('libSQL adapter', () => {
         .run()
       await db
         .prepare(
-          'INSERT INTO rating_results (event_id, owner_sub, slot, player_id, name, elo_before, elo_after, delta) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          'INSERT INTO rating_results (event_id, owner_sub, group_id, slot, player_id, name, elo_before, elo_after, delta) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
         )
         .bind(
           `evt-${position}`,
           'squash',
+          groupId,
           '0',
           id,
           'Ada',
@@ -461,7 +505,7 @@ describe('libSQL adapter', () => {
     }
     await db.prepare('UPDATE players SET elo = 640 WHERE id = ?').bind(id).run()
 
-    expect(await compactLog(db, 'squash', 2)).toEqual({ removed: 3, kept: 2 })
+    expect(await compactLog(db, groupId!, 2)).toEqual({ removed: 3, kept: 2 })
     expect(
       await db
         .prepare('SELECT elo, base_elo FROM players WHERE id = ?')

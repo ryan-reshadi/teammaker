@@ -1,16 +1,14 @@
 # Teammaker
 
-Balanced teams from an elo-rated roster. Rate everyone once from 1 to 10 to seed
-their elo (100 points a point, 100–1000), log the damage from real matches, and
-the ratings tune themselves from there. Choose how many teams you need and how
-close their elo totals must be, and Teammaker searches for splits that fit —
-ranked by tightness and deliberately different from each other. Each result
-shows the teams' pre-match win odds, and pair rules can keep players together or
-apart. Players can sit out a round, and the app suggests who should sit next so
-the bench stays fair.
+Balanced teams from an elo-rated roster — now a shared team tracker. Each
+**group** is one roster with its own elo history and its own skill tags: make
+one per game or friend circle, invite people with a link, and choose who can
+edit. Editors record matches and change ratings; viewers read everything and
+build teams on their own device. Who is sitting out and the teams you generate
+never leave your browser.
 
 A single-page React app served by a Hono Worker on Freebuff Sites, with a D1
-database for signed-in rosters and a device-local fallback that works without an
+database for shared groups and a device-local fallback that works without an
 account.
 
 ## Run it
@@ -19,53 +17,79 @@ account.
 bun install
 bun run dev        # http://127.0.0.1:5173
 bun run typecheck  # client and Worker TypeScript
-bun test           # solver + API suites
+bun test           # solver, API, libSQL and browser suites
 bun run build      # dist/client assets and the dist/teammaker Worker
 ```
 
-The dev server runs the real Worker against a local D1 database, so roster and
-round persistence work without provisioning anything. With no auth configuration
-on a loopback origin the server reports a clearly labelled `Local preview`
-identity; that fallback never applies on a hosted origin or to incomplete
-sign-in configuration.
+The dev server runs the real Worker against a local D1 database, so groups,
+sharing and ratings work without provisioning anything. With no auth
+configuration on a loopback origin the server reports a clearly labelled
+`Local preview` identity; that fallback never applies on a hosted origin or to
+incomplete sign-in configuration.
 
 ## What it does
 
+- **Groups** — the header switches between your groups and creates new ones.
+  Each group has its own players, elos, match log, K and tags. Groups you own
+  and groups shared with you appear in one list; the chip beside the switcher
+  says whether you are the owner, can edit, or are view-only.
+- **Sharing** — the owner opens **Share** and creates a viewer or editor invite
+  link. Anyone signed in who opens the link joins with that role. The same panel
+  lists everyone with access: change a role or remove somebody at any time.
+  Links can be revoked and are stored only as hashes. There is no email lookup
+  or delivery, by design.
 - **Roster** — add a player with a name and a rating. The ten-tick control shows
   the elo band and seeds a new player at rating × 100; the badge beside it shows
   the exact elo and opens an advanced field that edits it directly. Names rename
   inline, and "Add several at once" pastes a newline- or comma-separated list
   (everyone joins at 5 / 500). The header tracks player count, total elo, average
-  and how many are sitting out.
-- **Roles** — every player can carry any number of shooter roles (sniper, push,
-  anti-push, entry, support, flank, IGL, flex). They persist with the player and
-  are used to give each team a working composition, not just equal totals.
+  and how many are sitting out on this device.
+- **Skill tags** — each group defines its own tags (up to 16) in the **Tags**
+  dialog. Any player can carry any number of them. Tags are used to give each
+  team a working composition, not just equal totals, and editors can rename,
+  reorder or delete them; deleting a tag removes it from its players.
 - **Build** — pick 2–8 teams and an elo tolerance from 0 to 2000, then generate.
-  Each result is a set of colour-coded team columns with per-team elo sums, a
-  proportional balance bar, that team's elo-only win odds and a spread chip,
-  paged with next/previous through up to 12 arrangements. A collapsed **Pair
-  rules** editor keeps chosen players together or apart as hard constraints, and
-  **Role preference** can trade up to 50 or 100 extra spread for fuller role
-  coverage.
-- **Sit out** — a per-player toggle removes someone from generation and dims their
-  row. When the available players do not divide evenly, the helper names who
-  should sit (fewest logged matches sat, then lowest skill) and can apply it in
-  one click. Logged matches are the source; saved rounds are the fallback until
-  the first match exists.
+  Each result is colour-coded team columns with per-team elo sums, a proportional
+  balance bar, that team's elo-only win odds and a spread chip, paged through up
+  to 12 arrangements. **Pair rules** keep chosen players together or apart as
+  hard constraints, and **Tag preference** can trade up to 50 or 100 extra spread
+  for fuller tag coverage.
+- **Sit out** — a per-player toggle. It is stored in this browser only, separately
+  for each group, and never written to the shared roster. When the available
+  players do not divide evenly, the helper names who should sit (fewest logged
+  matches sat, then lowest skill) and can apply it in one click. Logged matches
+  are the source; saved rounds on this device are the fallback.
 - **Matches** — log a played match with two to eight teams: pick roster players
   or add unnamed randoms, enter each player's damage, add or remove teams, and
   pick the winning team. Every match is kept in an editable, reorderable log;
-  editing or deleting one replays the ratings that follow it.   The account K
-  applies to every match, a player's first one included. A K control tunes
-  future matches only. **Rematch** refills the form with the same
-  line-ups and blank damage, and the elo badge opens a per-player sparkline and
-  before/after history. **Import from RIVALS Screenshot** reads a Tab scoreboard
-  into the same form for review — see below.
-- **Saved rounds** — save a result to keep a snapshot of the teams, tolerance,
-  spread and bench. The snapshot is a memory aid; bench fairness prefers logged
-  matches and falls back to these rounds before the first match exists.
-- **Accounts** — works immediately on this device; signing in with Freebuff syncs
-  the roster and saved rounds to D1.
+  editing or deleting one replays the ratings that follow it. The group K applies
+  to every new match. **Rematch** refills the form with the same line-ups and
+  blank damage, and the elo badge opens a per-player sparkline and before/after
+  history. **Import from RIVALS Screenshot** reads a Tab scoreboard into the same
+  form for review.
+- **Saved rounds** — saving a round keeps a snapshot of the teams, tolerance,
+  spread and bench in this browser, for this group. It is never synced. Existing
+  account rounds are offered once for import into the browser.
+- **Live updates** — while a group is open, a small revision poll notices when
+  someone else edits the roster, tags, log or K, and reloads the authoritative
+  data. Open forms keep their draft; the new data lands behind them. If the
+  owner removes you from the group, the next poll drops its shared data and
+  tells you access was removed instead of leaving a stale roster on screen.
+
+### Permissions
+
+| Capability | Owner | Editor | Viewer |
+|---|---|---|---|
+| Read roster, tags, elo, match log | yes | yes | yes |
+| Add/rename/remove players, edit elo, tags, log/edit matches | yes | yes | — |
+| Rename group, change K | yes | yes | — |
+| Invite links, member roles, remove members, delete group | yes | — | — |
+| Sit-outs, generated teams, saved rounds (this device) | yes | yes | yes |
+
+The server is the authority. Every `/api/groups/:id/*` route resolves membership
+from `group_members`; non-members get 404 (no existence leak) and viewers get 403
+on any mutation. Client role state is display only. All mutations are
+same-origin checked, and responses are `Cache-Control: private, no-store`.
 
 ## How the balancing works
 
@@ -76,555 +100,283 @@ server.
 1. **Even team sizes.** With `P` available players and `N` teams,
    `base = floor(P/N)` and exactly `P % N` teams hold one extra player.
 2. **A global bound.** For total elo `S` and tolerance `t`, any valid split must
-   keep every team sum inside
-
-   ```
-   (S - (N-1)t) / N  <=  team sum  <=  (S + (N-1)t) / N
-   ```
-
-   because `max - min <= t` forces both extremes close to the mean. Bounds are
-   rounded to integers, and the search prunes the moment a partial team sum
-   passes the upper bound, or a full team falls short of the lower bound. With a
-   tight tolerance this removes whole subtrees.
-3. **Canonical enumeration.** Players are visited strongest first. A team is
-   opened only in order — no empty team before a filled one — so each partition
-   of the roster into labelled teams appears exactly once and team-permutation
-   duplicates never occur. A final canonical key guards against twins.
+   keep every team sum inside `(S - (N-1)t)/N <= sum <= (S + (N-1)t)/N`.
+   Bounds are rounded to integers, and the search prunes the moment a partial
+   team sum passes the upper bound, or a full team falls short of the lower
+   bound.
+3. **Canonical enumeration.** Players are visited strongest first, teams open in
+   order, and a final canonical key guards against twins, so each partition is
+   produced exactly once.
 4. **Caps.** The search stops after 300 ms, 500,000 nodes or 200 valid results.
-   `exhaustive: true` means the whole tree was visited: `validCount` is exact
-   and nothing was missed. When it is false, the count is a **lower bound** and
-   the interface says so.
-5. **Variety.** Candidates are sorted by spread, then role gaps, then squared
-   deviation from the mean, then greedily thinned: each new arrangement is the
-   one furthest (in players moved) from everything already chosen. The page
-   shows up to 12.
-6. **Fallback.** When the search finds no valid split, a greedy assignment
-   refined by best-swap hill climbing returns a **best-effort** split. It is not
-   guaranteed to be the true closest, so it is never presented as one. The
-   presentation distinguishes three cases:
-   - **Fits, complete:** a split found by an exhaustive search is a normal
-     result with no best-effort label.
-   - **Fits, early-stopped:** a fallback that happens to fit is labelled
-     **Best effort** and explained as an incomplete search, never shown like a
-     normal complete arrangement.
-   - **Over tolerance:** a fallback outside the tolerance is labelled
-     **Best effort** with a warning giving its spread; "no split fits" is only
-     claimed when the search was exhaustive.
+   `exhaustive: true` means the whole tree was visited; otherwise the count is a
+   lower bound and the interface says so.
+5. **Variety.** Candidates are sorted by spread, then tag gaps, then squared
+   deviation from the mean, then greedily thinned so each new arrangement is the
+   one furthest from everything already chosen. Up to 12 are shown.
+6. **Fallback.** When no valid split fits, a greedy assignment refined by
+   best-swap hill climbing returns a **best effort** split, labelled as such and
+   never presented as the true closest.
 
-### Guarantees
+Tag coverage means: for every tag held by at least `N` players (enough for one
+per team), count the teams with none of it. Lower is better. A tag held by fewer
+players than there are teams is a specialist, never a "gap". The solver indexes
+coverage against the group's own tag ids, so custom tags work exactly like the
+original roles.
 
-- Every returned arrangement uses each available player exactly once, with team
-  sizes as even as possible.
-- With `exhaustive: true`, the count covers every valid split of that roster
-  at that tolerance (and pair rules, when set); up to 12 of them are shown. When
-  it is false, the count is a lower bound.
+### Guarantees and limits
+
+- Every arrangement uses each available player exactly once, with team sizes as
+  even as possible.
+- With `exhaustive: true`, the count covers every valid split at that tolerance
+  (and pair rules, when set). When false, it is a lower bound.
 - Win odds come from the same `expectationsFromStrengths` helper as the rating
-  engine, so the builder and the match result cannot disagree. They are
-  elo-only: roles and damage are not part of the estimate.
-- Elos are integers 100–1000, so sums and spreads are exact — no floating point
-  drift.
-
-### Limits
-
+  engine. They are elo-only: tags and damage are not part of the estimate.
+- Team sums are the primary balance; tags break ties or trade within the chosen
+  allowance. There is still no notion of individual matchups.
 - The search is bounded, not exhaustive by construction. Large rosters with a
   loose tolerance can hit the result or time cap; the caption then reports a
-  lower bound rather than claiming completeness, and "no split fits" is only
-  said after an exhaustive search. The fallback split is best effort, not a
-  proven optimum.
-- Team sums are the primary balance. Roles only break ties or trade within the
-  chosen role allowance, and there is still no notion of individual matchups (a
-  10 and a 1 can be paired with two 5s and look identical in total).
-- At most 12 arrangements are returned and at most 200 are collected, so a very
-  permissive tolerance shows a varied sample rather than every combination.
-- Pair rules and role preference are session-only. A saved round records the
-  teams and bench it produced, not the builder controls that found them.
-- Win odds are elo-only and pre-match. A data-driven calibration study is
-  deferred until the log has enough matches; recalibrating later is a new formula
-  version, never a silent rewrite of old events.
-- Rolling back is clean only until the first v4 match is logged. Older builds
-  ignore the `formula`/`k` marker, so after that keep this build or delete the v4
-  events before rolling back; the v1 history itself is unaffected.
-- Saved rounds are capped at the newest 100 per account; new saves prune older
-  ones.
-- The event log is squashed, not archived: at 1000 events the oldest 500 are
-  folded into each player's `base_elo` and deleted. Ratings never move, but that
-  history is gone — the match list, per-player history and bench counts only
-  cover the kept window, and the match list notes how much was squashed and
-  when. D1 Time Travel (7 days free, 30 paid) is the only way back.
+  lower bound rather than claiming completeness.
+- Pair rules and tag preference are session-only. Saved rounds record the teams
+  and bench they produced, not the builder controls that found them.
 
 ## How the ratings work
 
 `src/shared/elo.ts` is pure and deterministic, like the solver.
 
 - **Scale.** 100–1000, where 100 points is one point on the 1–10 control. Creating
-a player at 1–10 sets their elo to rating × 100; the control always mirrors the
-current band, and changing it snaps the elo to the new band's anchor. The
-advanced field sets any elo in 100–1000.
-- **One match, two terms.** The result term is ordinary Elo on the weighted rating
-sums, so a five-stack is favoured over a four-stack. The performance term is
-centred on zero and compares each player's share of the match's size-normalized
-damage with the share their rating predicts. It carries 0.6 of K while the
-result carries the full K, which is what makes a top-damage player on a losing
-team land at roughly zero; the rest of the losing team still pays. Damage is also
-compared with the entire lobby: beating more than half of everyone in the match
-is a floor on the performance term, so a winning team's bottom fragger who still
-out-damaged most of the field gains rating rather than losing it, while a
-team-mate whose damage sits under the field's middle still pays.
+  a player at 1–10 sets their elo to rating × 100; the control mirrors the current
+  band, and changing it snaps the elo to the new band's anchor.
+- **One match, two terms.** The result term is ordinary Elo on the weighted
+  rating sums, so a five-stack is favoured over a four-stack. The performance
+  term is centred on zero and compares each player's share of the match's
+  size-normalized damage with the share their rating predicts. It carries 0.6 of
+  K while the result carries the full K. Damage is also compared with the whole
+  lobby; beating more than half of everyone is a floor on the term.
 - **More than two teams.** Each team is rated against every other team and the
-head-to-head expectations are normalized to share out one win, so a settled
-  three-way lobby is zero-sum like a duel. A win over a bigger field pays more than
-  a duel at the same ratings.
-- **Uneven teams.** Damage is divided by the number of enemies the player faced
-(everyone outside their own team) before shares are compared, so a smaller
-team's extra targets do not inflate their rating.
-- **Randoms.** An unnamed player records damage but has no rating row. Their
-rating is inferred from the lobby's known elo, shifted by their relative damage,
-clamped to the scale, and counted at half a player's weight in both the
-expectation and the damage pool. They are never updated.
-- **No provisional window.** Every rated match uses the account K, including a
-  player's first one. Matches logged under the older formulas (2 and 3) doubled K
-  for a player's first five rated matches; they keep the deltas they were rated
-  with, so no stored rating moves when the window was retired. New events are
-  stamped formula 4, which reads no prior-match count at all.
-- **K.** An account setting from 8 to 64, default 32. It applies to new matches
+  head-to-head expectations are normalized to share out one win, so a settled
+  three-way lobby is zero-sum like a duel.
+- **Uneven teams.** Damage is divided by the number of enemies faced before
+  shares are compared.
+- **Randoms.** An unnamed player records damage but has no rating row; their
+  rating is inferred from the lobby and weighted at half a player. They are
+  never updated.
+- **K.** A per-group setting from 8 to 64, default 32, applying to new matches
   only. Changing it freezes the K that produced existing ratings and never
   replays the log.
-- **Win odds.** Each arrangement shows a pre-match win share from the weighted
-  team elo sums. Two teams reduce to ordinary Elo; with more teams every pair is
-  measured and the shares still add to 100%. The 400-point divisor calibrates a
-  300-point gap to about 85/15 and a 500-point gap to about 95/5; those anchors
-  are pinned in `tests/elo.test.ts`. A data-driven recalibration waits until
-  enough matches exist and would be a new formula version, not a rewrite.
-- **Replay.** Ratings start at each player's anchor and are recomputed from the
-  ordered event log. Every match and every manual elo edit stores each player's
-  before/after elo, so editing, reordering or deleting an event restores exactly
-  the ratings history would have produced. When the log reaches 1000 events the
-  next write squashes it: the oldest 500 are replayed once, their result becomes
-  each player's new `base_elo`, and the events are deleted. The kept half then
-  replays forward to the same ratings, so a squash is invisible in the
-  scoreboard and only ever removes history.
-- **Formula versions.** New events are stamped with formula 4 and the K used for
-  them. Events written before versioning existed have no marker and are formula
-  1; those from the provisional era carry 2 or 3. Unmarked events replay with the
-  frozen legacy K stored in `rating_meta`, so replaying old history is
-  byte-identical. Editing never upgrades or re-rates an event; a v1 match stays v1
-  and a marked match keeps the formula and K it was rated with, even after the
-  account K changes. To inspect a proposed K without changing
-  anything, run `bun run preview:replay [dbPath] [owner] [proposedK]`: it opens
-  the local D1 file read-only and prints per-player current and proposed elo.
-  There is no apply path.
+- **Replay.** Ratings start at each player's creation elo (`base_elo`) and are
+  recomputed from the ordered event log. Editing, reordering or deleting an event
+  restores exactly the ratings history would have produced. At 1000 events the
+  oldest 500 are folded into each anchor and deleted; ratings never move, but that
+  history is gone.
 - **Deleting players.** Removing a player archives them (`players.deleted_at`)
-rather than erasing the row. They leave the roster, match pickers and sit-out
-counts, and every match they played keeps its recorded result — editing an old
-match that names them still works. Because the row keeps its creation elo, the
-replay that rebuilds every rating seeds them exactly as before, so no other
-player's elo moves when someone is removed, now or on a later replay.
+  rather than erasing the row, so every replay seeds them as before and nobody
+  else's elo moves.
 
-## Roles (the tag framework)
+## Migrating an existing workspace
 
-`src/shared/roles.ts` holds one fixed catalogue, so the client, the Worker and the
-solver cannot drift apart:
+On the first `GET /api/groups`, an account that still has pre-groups rows gets a
+deterministic group (`g:<sub>`) named **My roster**. Its K comes from the old
+account setting, the roles the roster actually used become that group's tags
+(keeping their ids), and players, events, results and legacy rounds are attached
+in one batch. Running it twice cannot create a second group. A brand-new account
+starts with no groups and a **Create your first group** panel.
 
-| id | label | what it means |
-|---|---|---|
-| `sniper` | Sniper | long-range picks and sightlines |
-| `push` | Push | takes space, forces the pace |
-| `antipush` | Anti-push | holds a lane, stops the other side |
-| `entry` | Entry | first through the door |
-| `support` | Support | utility, smokes, heals, trades |
-| `flank` | Flank | off-angles, lurk pressure |
-| `igl` | IGL | calls the round |
-| `flex` | Flex | fills whatever is missing |
-
-A player holds any subset — a sniper who also calls the round is
-`['sniper', 'igl']`. Tags are normalised on the server (unknown ids rejected,
-duplicates dropped, catalogue order kept) and stored as a JSON array in
-`players.tags`.
-
-**How roles affect team making.** When two splits are equally close on skill, the
-tighter role coverage wins, and the pager keeps the most different splits so the
-choices genuinely vary. Coverage is defined as: for every role that at least
-`N` players share (enough for one per team), count the teams with none of it.
-Lower is better, and the tie-break order is
-`spread → role gaps → squared deviation → canonical key`.
-
-A role held by fewer players than there are teams is a specialist, never a "gap"
-— one IGL on a twelve-player roster is not expected on all three teams. Each team
-column shows its roles as compact chips, and the arrangement reports
-"Role gaps: Team 2 has no Sniper" when the sums force a hole.
-
-Turn the behaviour off with the **Spread roles** switch; the results are then
-ranked purely on skill balance, and the toggle is part of the "roster changed"
-signature like any other input. With roles on, **Role preference** can allow a
-split up to 50 or 100 elo looser than the tightest if it closes role gaps; the
-spread chip always shows the real spread, and the ranking is session-only.
-
-Pair rules are hard, not preferences: every returned arrangement keeps a
-"together" pair on one team and an "apart" pair on different teams. If no split
-within the tolerance satisfies them, the result says so and offers to clear the
-rules or widen the tolerance — a violating best-effort split is never shown.
-Pair rules are also session-only and join the "roster changed" signature. If a
-player sits out or leaves the roster, rules that mention them are dropped and a
-notice says how many were removed.
-
-## Importing a RIVALS screenshot
-
-The match form has a second entry mode: **Import from RIVALS Screenshot**. Upload
-a screenshot of the in-game Tab scoreboard and the app reads the player rows,
-each player's DMG value, which team their row belongs to (gold or purple) and the
-two team scores at the top — then asks you to review everything before submitting
-an ordinary match.
-
-- **Paste or upload.** A capture that is already on the clipboard — Print Screen
-  and every snipping tool put it there — is pasted straight into the panel with
-  Ctrl+V, and goes through the same type and size checks as a picked file. The
-  paste is accepted only while the panel is waiting for a screenshot, so it can
-  never replace a scan in progress or a review being edited.
-- **Handles, not display names.** Each row's username is the Roblox handle
-  printed under the display name (the `@name` line), so a roster player is
-  matched by `destruction_lord9` rather than by `PVPDreadlord`. A row that shows
-  no handle line falls back to its display name and is left for review.
-- **Only what is on screen.** Rows are read where they are; a player whose row
-  is scrolled off the bottom edge is not counted rather than imported with
-  missing damage. All four team members in a 4v4 are read even though several
-  share one continuous colour stripe.
-- **Review first.** Nothing is submitted until every row has a username, a
-  whole-number damage value and a team, at least one row is matched to a roster
-  player, and the winner is chosen. A genuine `0` damage stays valid; damage that
-  could not be read stays **blank** rather than becoming zero.
-- **Roster matching.** `players.username` is the Roblox handle and is what gets
-  compared. An exact, case-insensitive match is assigned automatically. A similar
-  handle is only a **suggestion** (82% similarity or better) and needs a click;
-  anything else can be kept as an untracked random. Two roster players with the
-  same handle, or the same player twice, are marked **Needs review**. The importer
-  never creates roster players.
-- **Corrections.** Every detected username, damage, team and the winner can be
-  edited, rows can be removed or moved between teams, the two teams can be
-  swapped, and the whole screenshot can be rejected.
-- **Submission.** A confirmed review becomes the same `MatchInput` the manual form
-  sends (`label`, `teams`, `winner` only) through the same authenticated
-  `POST /api/matches`. No OCR confidence, image data or extra properties are sent,
-  and the elo engine is untouched: replay stays the only source of ratings.
-- **No silent retries.** A failed or timed-out submission is never retried
-  automatically, because the endpoint has no idempotency key. The review stays on
-  screen, the match log is refreshed, and saving becomes possible again only after
-  you have checked the log.
-
-### Reading a screenshot
-
-The scan runs in the browser, on the user's own machine. The Worker has no
-screenshot route and holds no OCR credential, and the image is never uploaded:
-the client decodes it (PNG/JPEG/WebP, 8 MB, 4096 px), runs the ported geometry
-and PaddleOCR through `onnxruntime-web`, and hands the review UI the same shape
-it always consumed. The engine is a lazy chunk, so a visitor who never imports a
-screenshot downloads none of it. Screenshots stay in memory and are never
-stored.
-
-The Python implementation in `ocr/` is kept as the reference the browser port was
-checked against, capture by capture. Create its virtualenv once, then use the npm
-scripts — they run that interpreter, and stop with the install command if the
-venv, or PaddleOCR inside it, is missing:
-
-```sh
-python -m venv ocr/.venv
-ocr/.venv/Scripts/python.exe -m pip install -r ocr/requirements.txt   # Windows
-# python3 -m venv ocr/.venv && ocr/.venv/bin/pip install -r ocr/requirements.txt
-
-bun run ocr:serve      # the service on 127.0.0.1:8000
-bun run ocr:test       # the Python suite, same interpreter
-bun run ocr:captures   # measure the real screenshots in ocr/tests/captures
-```
-
-`bun run dev` serves the whole app; importing a screenshot needs nothing else
-running. `ocr/README.md` documents the reference service's request/response
-contract, pipeline stages and Docker image.
-
-### Measuring real screenshots
-
-The pipeline's geometry is checked by generated fixtures in every test run, and
-the real PaddleOCR engine is exercised by `ocr/tests/test_engine.py` against the
-same fixture, so the reader adapter is known to match the installed engine. What
-the fixtures cannot show is accuracy on the actual game UI.
-
-To measure that, drop real Tab scoreboard screenshots in
-`ocr/tests/captures/` — one image plus a `<name>.truth.json` sidecar holding what
-the screenshot really says — and run:
-
-```sh
-bun run ocr:captures
-```
-
-It scans each capture with the real engine and prints, row by row, the expected
-and read username, damage and team, then the two team scores and the winner,
-followed by per-field accuracy (`username`, `damage`, `team`, `score`, `winner`)
-with a `RESULT: PASS/FAIL` line and a non-zero exit when any field is below its
-threshold — 100% by default, overridable with `--min-damage 0.95` and friends.
-The captures directory is git-ignored, so screenshots stay on your machine;
-`ocr/tests/captures/README.md` documents the sidecar format and how to read a
-failure. `bun run ocr:test` runs the same measurement as a test and skips it
-while the directory is empty.
-
-Known limits: the layout is verified against synthetic fixtures and any captures
-you add, not against the live game; only two teams and the vertical Tab
-scoreboard are supported; the DMG column needs a readable header; a row without
-a visible colour stripe is reported rather than guessed; and a handle is only as
-reliable as 12–14 px text allows — `I`/`l`/`i`, `0`/`O` and double underscores
-can be misread, and the review step is where you fix them.
+Legacy saved rounds are readable once through `GET .../rounds`; the owner's
+browser imports them into localStorage one time and marks the group as checked,
+so later loads never duplicate them. Nothing writes saved rounds to the server
+any more.
 
 ## Data model
 
 ```sql
-players(id TEXT PRIMARY KEY, owner_sub TEXT, name TEXT, skill INTEGER,
-        elo INTEGER, base_elo INTEGER, tags TEXT, sitting_out INTEGER,
+groups(id TEXT PRIMARY KEY, owner_sub TEXT, owner_name TEXT, name TEXT,
+       k_factor INTEGER, rev INTEGER, created_at INTEGER, updated_at INTEGER,
+       deleted_at INTEGER)
+
+group_members(group_id TEXT, user_sub TEXT, role TEXT, display_name TEXT,
+              created_at INTEGER, updated_at INTEGER,
+              PRIMARY KEY (group_id, user_sub))
+
+group_invites(id TEXT PRIMARY KEY, group_id TEXT, role TEXT,
+              token_hash TEXT UNIQUE, created_by_sub TEXT, created_at INTEGER,
+              revoked_at INTEGER, expires_at INTEGER)
+
+group_tags(group_id TEXT, id TEXT, label TEXT, short TEXT, sort INTEGER,
+           created_at INTEGER, updated_at INTEGER,
+           PRIMARY KEY (group_id, id))
+
+players(id TEXT PRIMARY KEY, owner_sub TEXT, group_id TEXT, name TEXT,
+        username TEXT, skill INTEGER, elo INTEGER, base_elo INTEGER,
+        tags TEXT, sitting_out INTEGER, deleted_at INTEGER,
         created_at INTEGER, updated_at INTEGER)
 
-rounds(id TEXT PRIMARY KEY, owner_sub TEXT, config TEXT, created_at INTEGER)
+rating_events(id TEXT PRIMARY KEY, owner_sub TEXT, group_id TEXT,
+              position INTEGER, kind TEXT, payload TEXT,
+              created_at INTEGER, updated_at INTEGER)
 
-rating_events(id TEXT PRIMARY KEY, owner_sub TEXT, position INTEGER,
-              kind TEXT, payload TEXT, created_at INTEGER, updated_at INTEGER)
+rating_results(event_id TEXT, owner_sub TEXT, group_id TEXT, slot TEXT,
+               player_id TEXT, name TEXT, elo_before INTEGER,
+               elo_after INTEGER, delta INTEGER,
+               PRIMARY KEY (event_id, slot))
 
-rating_results(event_id TEXT, owner_sub TEXT, slot TEXT, player_id TEXT,
-               name TEXT, elo_before INTEGER, elo_after INTEGER, delta INTEGER)
-
-settings(owner_sub TEXT PRIMARY KEY, k_factor INTEGER, updated_at INTEGER)
-
-rating_meta(owner_sub TEXT PRIMARY KEY, legacy_k INTEGER, created_at INTEGER)
-
-log_squashes(owner_sub TEXT PRIMARY KEY, removed INTEGER, squashed_at INTEGER)
+group_rating_meta(group_id TEXT PRIMARY KEY, legacy_k INTEGER, created_at INTEGER)
+group_squashes(group_id TEXT PRIMARY KEY, removed INTEGER, squashed_at INTEGER)
+rounds(id TEXT PRIMARY KEY, owner_sub TEXT, group_id TEXT, config TEXT,
+       created_at INTEGER)
 ```
 
-`players.tags` is a JSON array of role ids (`'["sniper","igl"]'`). `elo` is the
-live rating, `base_elo` is the anchor replay starts from (the creation elo, moved
-forward by a squash), and `skill` is a derived mirror (round(elo / 100)) kept so
-older readers and saved rounds still work. Workspaces created before roles or elo existed are migrated in place:
-`ensureSchema` reads `PRAGMA table_info(players)`, adds the missing columns and
-sets `elo = base_elo = skill × 100` for existing players. No history is invented.
+`players.tags` is a JSON array of that group's tag ids. `elo` is the live
+rating, `base_elo` is the replay anchor, and `skill` is a derived mirror kept for
+older readers and saved rounds. `sitting_out` remains on the table for old rows
+but is no longer read or written; the API rejects it. `owner_sub` is the
+creator/audit column; every route scopes by `group_id` after checking
+membership. The old `settings`, `rating_meta` and `log_squashes` tables are read
+only during migration.
 
-`rating_events.payload` is either a match (label, two to eight teams of players
-with damage, the index of the winner, and — on new events only — `formula: 4`
-and the base `k`) or a manual adjustment (player id, elo, reason). `rating_meta`
-pins the K that produced pre-versioning ratings; it is written lazily, never
-rewrites an event, and has no row until a K change or the first v2 match.
-`log_squashes` accumulates what each squash removed and when it last ran; it is
-read only to explain missing history and never feeds a replay.
-`rating_results` holds the per-player before/after bookkeeping for each event,
-rewritten whenever the affected part of the log is replayed. Rows are scoped by
-`owner_sub = user.sub`.
+## Guest mode vs shared
 
-`rounds.config` is a JSON snapshot (version 2 uses the elo scale; rounds saved
-before elo are scaled ×100 when read):
+`src/client/store.ts` exposes one `Store` interface scoped to a group, with two
+implementations.
 
-```json
-{
-  "version": 2,
-  "teamCount": 3,
-  "tolerance": 300,
-  "spread": 0,
-  "teams": [
-    {
-      "sum": 2500,
-      "players": [{ "id": "…", "name": "Ada", "elo": 900, "tags": ["sniper", "igl"] }]
-    }
-  ],
-  "benchedIds": ["…"]
-}
-```
-
-Team names are snapshotted, so history still reads correctly after a player is
-renamed or deleted. Everything is scoped by `owner_sub = user.sub`; a roster holds
-up to 200 players.
-
-## Guest mode vs synced
-
-`src/client/store.ts` exposes one `Store` interface with two implementations.
-
-| | Local (guest) | Remote (signed in) |
+| | Local (guest) | Shared (signed in) |
 |---|---|---|
-| Storage | `localStorage`: `teammaker.players.v1`, `teammaker.rounds.v1` | D1 through the Worker API |
+| Storage | `localStorage`: one device-local group | D1 through the group API |
 | Header chip | "This device only" | "Synced" |
+| Sharing | — | invite links with owner/editor/viewer |
 | Survives reload | yes, on this browser | yes, on any device |
 
-The UI is identical either way. When a signed-in account has no players and this
-device holds a guest roster, an import prompt offers to copy it into the account.
-If the server cannot be reached at all, the app says so and keeps working on the
-device.
+When a signed-in account has an empty group and this device holds a guest
+roster, an import prompt copies the players in, creating any missing tags by
+label first. The guest workspace keeps its own tags in localStorage; a device
+that already had role tags starts with exactly those, and a fresh one starts
+with none.
+
+Sitting out, generated teams and saved rounds are always device-local. The active
+group is remembered per device too.
 
 ## API
 
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/api/session` | current user, auth mode, database availability |
-| GET | `/api/health` | liveness |
-| GET | `/api/players` | oldest first |
-| POST | `/api/players` | `{ name, username?, skill, tags? }` or `{ players: [...] }` (max 50) |
-| PATCH | `/api/players/:id` | any of `name`, `username`, `skill`, `elo`, `tags`, `sittingOut` |
-| POST | `/api/players/:id/elo` | `{ elo, reason? }`, logs a manual adjustment |
-| DELETE | `/api/players/:id` | archives the player; their match history is kept |
-| GET | `/api/matches` | the ordered rating log, with before/after elo |
-| POST | `/api/matches` | `{ label?, teams: [team, …], winner }`, 2–8 teams; a full log is squashed first |
-| PATCH | `/api/matches/:id` | `{ input }` and/or `{ position }`, then replays |
-| DELETE | `/api/matches/:id` | removes the event and replays the rest |
-| GET | `/api/settings` | `{ kFactor }` |
-| PUT | `/api/settings` | `{ kFactor }` 8–64; applies to new matches, never replays |
-| GET | `/api/rounds` | newest 60 snapshots |
-| POST | `/api/rounds` | `{ config }`, validated and pruned to 100 |
-| DELETE | `/api/rounds/:id` | |
+| GET | `/api/health` | liveness and schema state |
+| GET | `/api/groups` | groups you own or belong to, with your role |
+| POST | `/api/groups` | `{ name }`; 25 owned groups per account |
+| GET | `/api/groups/:id` | group, tags, members and your role |
+| PATCH | `/api/groups/:id` | `{ name?, kFactor? }`; editor |
+| DELETE | `/api/groups/:id` | archives the group; owner |
+| GET | `/api/groups/:id/rev` | revision for the live poll |
+| GET | `/api/groups/:id/players` | oldest first |
+| POST | `/api/groups/:id/players` | `{ name, username?, skill, tags? }` or `{ players: [...] }` |
+| PATCH | `/api/groups/:id/players/:pid` | `name`, `username`, `skill`, `elo`, `tags`; never `sittingOut` |
+| POST | `/api/groups/:id/players/:pid/elo` | `{ elo, reason? }`, logs an adjustment |
+| DELETE | `/api/groups/:id/players/:pid` | archives the player; their history stays |
+| GET | `/api/groups/:id/matches` | the ordered rating log |
+| POST | `/api/groups/:id/matches` | `{ label?, teams, winner }`, 2–8 teams |
+| PATCH | `/api/groups/:id/matches/:mid` | `{ input }` and/or `{ position }` |
+| DELETE | `/api/groups/:id/matches/:mid` | removes the event and replays |
+| GET/PUT | `/api/groups/:id/settings` | `{ kFactor }` per group, 8–64 |
+| POST | `/api/groups/:id/tags` | `{ label, short? }`; up to 16 tags |
+| PATCH/DELETE | `/api/groups/:id/tags/:tagId` | rename/reorder, or delete and strip |
+| POST/GET | `/api/groups/:id/invites` | owner creates `{ role }` → link; lists active links |
+| DELETE | `/api/groups/:id/invites/:inviteId` | revoke; owner |
+| GET | `/api/groups/:id/members` | people with access |
+| PATCH/DELETE | `/api/groups/:id/members/:userId` | role or removal; owner |
+| GET | `/api/invites/:token` | preview before joining |
+| POST | `/api/invites/:token/accept` | joins with the link's role |
+| GET | `/api/groups/:id/rounds` | legacy snapshots for one-time import |
 
-Data routes answer 401 when signed out, 403 for cross-origin mutations, 400 for
-invalid input, 413 above 64 KB and 503 when no database is bound. Responses are
-`Cache-Control: private, no-store` and every query binds parameters.
+Data routes answer 401 when signed out, 404 for a group you cannot see, 403 for
+a write your role does not allow (or a foreign origin), 400 for invalid input,
+413 above 64 KB and 503 when no database is bound.
 
 ## Tests
 
-`bun test` runs these suites:
+`bun test` runs these suites (162 tests):
 
-- `tests/elo.test.ts` — the 100-point scale, even and uneven matches, loss
-  protection, random inference and half weight, clamping, manual adjustments,
-  deterministic replay, edit/delete/reorder, K changes, win-odds calibration,
-  flat K, the retired provisional K for older events, and v1/v2/v4 replay
-  compatibility.
-- `tests/balance.test.ts` — team sizes, a known perfect split, all 15 partitions
-  of six equal players, **brute-force cross-checks** for equal and unequal team
-  sizes, the strong-player-singleton case that a per-index size vector would
-  miss, the over-tolerance fallback (including a fallback that fits), capped
-  searches, uneven rosters, pair rules, role-allowance ranking and sit-out
-  suggestions.
-- `tests/presentation.test.ts` — component-level rendering of the result header
-  and warning: a complete in-tolerance split has no best-effort marker, an
-  early-stopped fallback that happens to fit still renders **Best effort** and
-  the incomplete-search explanation, an over-tolerance fallback keeps its
-  warning and widening action, and an impossible pair rule reports the failure
-  instead of rendering a violating split.
-- `tests/app.test.ts` — the real API against a Miniflare D1 database: CRUD, bulk
-  add, two-user isolation, round snapshots, role tags round-tripping through
-  create and patch (with unknown ids rejected), signed-out refusals, foreign and
-  absent origins, malformed input, oversized bodies, the missing-database path,
-  and editing a v4 match keeping its stamped formula and K after the account K
-  changes.
-- `tests/roles.test.ts` — the catalogue, tag normalisation and bitmasks, coverage
-  gaps (including specialists being ignored), role ranking breaking ties between
-  equally balanced splits, and a multi-role player counting for every role.
-- `tests/libsql.test.ts` — the production libSQL adapter running against Bun's
-  built-in SQLite: schema creation, the roles migration on a pre-roles table,
-  CRUD with tags, round snapshots, two-account isolation, 401s, foreign-origin
-  403s, the no-database path, and a legacy event that stays byte-identical through
-  a K change, an edit and a new v2 match. This is the suite that covers the
-  Vercel deployment; `tests/app.test.ts` keeps covering D1.
-- `tests/history.test.ts` — per-player match/adjustment history and sparkline
-  geometry.
-- `tests/bench.test.ts` — sit-out counts from real matches, late joiners,
-  adjustments and the saved-round fallback.
-- `tests/rematch.test.ts` — line-up copying, fresh random keys, blank damage and
-  missing-player refusal.
-- `tests/rivals.test.ts` — the screenshot extraction contract, exact and
-  case-insensitive roster matching, look-alike handles settled by the roster,
-  fuzzy suggestions that are never applied automatically, duplicate usernames
-  and duplicate players, team swaps, zero damage, invalid damage and winner
-  values, untracked randoms, and the exact `MatchInput` payload.
-- `tests/rivals-browser.test.tsx` — the real import panel in a DOM, with only the
-  OCR engine stubbed: the File reaches the scanner, the panel needs no service
-  configured, an engine that cannot start shows an error, and a confirmed review
-  submits through the actual Worker app.
-- `tests/rivals-layout.test.ts` — the scoreboard geometry a 5v5 capture broke:
-  the DMG window is one player row tall, so a merged team band cannot reach the
-  kill count beside it, and a handle the recogniser split at a highlight band is
-  joined back into one username.
-- `tests/body-limit.test.ts` — the 64 KB JSON cap still refuses a 70 KB body now
-  that no route carries a larger limit of its own.
+- `tests/groups.test.ts` — group CRUD, invite join/preview/revoke, viewer refusal
+  on every mutating route, non-member 404s, cross-group isolation, owner-only
+  sharing, tag scoping and stripping, device-local sit-outs, read-only legacy
+  rounds, and idempotent migration of a pre-groups workspace.
+- `tests/elo.test.ts` — the scale, even and uneven matches, random inference,
+  deterministic replay, edit/delete/reorder, K changes, squash behaviour and
+  formula compatibility.
+- `tests/balance.test.ts` — team sizes, known splits, brute-force cross-checks,
+  capped searches, pair rules, tag coverage ranking and sit-out suggestions.
+- `tests/roles.test.ts` — the legacy catalogue, tag normalization, coverage
+  (including a group's own tag ids) and custom-tag ranking.
+- `tests/app.test.ts` — the real API against Miniflare D1: group-scoped CRUD,
+  tags, match replay, squash, archived players, isolation and refusals.
+- `tests/libsql.test.ts` — the production libSQL adapter against Bun SQLite:
+  schema up/down migration, groups, tags, legacy events and squash.
+- `tests/rivals-browser.test.tsx` — the real import panel in a DOM, submitting
+  through the actual Worker into a group.
+- Plus `tests/history.test.ts`, `bench.test.ts`, `rematch.test.ts`,
+  `rivals.test.ts`, `rivals-layout.test.ts`, `presentation.test.ts`,
+  `pairRules.test.ts`, `store.test.ts` and `body-limit.test.ts`.
 
-`python ocr/tests/run_tests.py` runs the OCR service's own suite against
-synthetic scoreboard fixtures: username, damage, zero damage, team colours
-(including swapped order), winners, ties, obscured rows, missing damage, an
-unreadable header or score, ambiguous team colour, upload limits and the HTTP
-interface's authentication. It needs only the packages in
-`ocr/requirements.txt`; the PaddleOCR engine is not required for these tests.
+`bun run typecheck`, `bun test` and `bun run build` are the pre-deploy checks.
+`bun run build:api` regenerates the committed `api/index.js` Vercel bundle.
 
 ## Deploying to Vercel
 
-The app deploys to two hosts from one codebase. Nothing about the data layer is
-vendor-specific: `src/worker/db.ts` defines the small `Database` interface the
-routes use, Cloudflare D1 satisfies it directly, and `src/server/libsql.ts`
-implements it over [libSQL/Turso](https://turso.tech) for Node hosts.
+The app deploys to two hosts from one codebase. `src/worker/db.ts` defines the
+small `Database` interface the routes use; Cloudflare D1 satisfies it directly,
+and `src/server/libsql.ts` implements it over libSQL/Turso for Node hosts.
 
 | Piece | Cloudflare (Sites) | Vercel |
 |---|---|---|
 | Browser bundle | `dist/client` | `dist-client` (`bun run build:vercel`) |
 | Server | `dist/teammaker/index.js` | `api/index.ts` → a Node function |
 | Database | D1 binding `DB` | libSQL over HTTP |
-| Static files | Worker `ASSETS` binding | Vercel's own CDN |
 
 The Vercel function is a **committed bundle**: `bun run build:api` compiles
-`server/vercel.ts` into the single self-contained `api/index.js`. Vercel's Node
-builder transpiles an `api/*.ts` entry without bundling it, so relative imports
-into `src/` break at runtime with `ERR_MODULE_NOT_FOUND`; one file with only
-package imports cannot fail that way. `bun run build:vercel` runs the client
-build and this bundle together, so the deployed copy is always regenerated —
-run `bun run build:api` and commit `api/index.js` after changing anything under
+`server/vercel.ts` into the self-contained `api/index.js`. Vercel's Node builder
+transpiles an `api/*.ts` entry without bundling it, so relative imports into
+`src/` break at runtime; one file with only package imports cannot fail that way.
+Run `bun run build:api` and commit `api/index.js` after changing anything under
 `src/worker`, `src/server` or `server/`.
 
-`vercel.json` rewrites `/api/*` and `/auth/freebuff/*` to the function, then
-falls back to `index.html` for deep links; `api/index.ts` binds the same Hono
-app with `@hono/node-server` and wraps it in `auth.wrap` exactly like the
-Worker entry, so sign-in, CSRF checks and `Cache-Control: private, no-store`
-behave identically.
-
-### Steps
-
-1. **Project settings** — in the Vercel dashboard set Framework Preset to
-   **Other**, Build Command `bun run build:vercel`, Output Directory
-   `dist-client`, Install Command `bun install`, Node **22.x**. Dashboard values
-   win over `vercel.json`, so they must match.
+1. **Project settings** — Framework Preset **Other**, Build Command
+   `bun run build:vercel`, Output Directory `dist-client`, Install Command
+   `bun install`, Node **22.x**. Dashboard values win over `vercel.json`.
 2. **Database** — Vercel Marketplace → Turso → install, then copy
    `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`. No migration step: the first
-   request runs `CREATE TABLE IF NOT EXISTS` plus the roles-column guard.
-3. **Sign-in** — register the exact production origin:
-   `npx @freebuff/auth register --project teammaker --environment production
-   --redirect-uri https://<your-domain>/auth/freebuff/callback`, then set
-   `APP_ORIGIN`, `FREEBUFF_CLIENT_ID` and `FREEBUFF_ISSUER` in **Production**
-   only. Preview deployments rotate their domain, so leaving auth out of Preview
-   keeps them in a clean guest mode instead of a sign-in link that cannot
-   complete.
-4. **Check** — `/` must return HTML (not Vercel's 404), `/api/session` must
-   report `database: true`, and a signed-out `/api/players` must be 401.
+   request runs `CREATE TABLE IF NOT EXISTS` plus the column guards, including
+   the group tables and `group_id` columns.
+3. **Sign-in** — register the exact production origin with
+   `npx @freebuff/auth register`, then set `APP_ORIGIN`, `FREEBUFF_CLIENT_ID` and
+   `FREEBUFF_ISSUER` in **Production** only. Preview deployments rotate their
+   domain, so leaving auth out of Preview keeps them in guest mode.
+4. **Check** — `/` returns HTML, `/api/session` reports `database: true`, and a
+   signed-out group route is 401.
 
-Without `TURSO_DATABASE_URL` the function reports `database: false` and the
-client stays in guest mode with a notice, so a deploy is never broken by a
-missing env var. The environment names are the same everywhere:
+Environment names are the same everywhere:
 
 | Variable | Where | Purpose |
 |---|---|---|
 | `TURSO_DATABASE_URL` | Vercel | libSQL connection |
 | `TURSO_AUTH_TOKEN` | Vercel | libSQL token |
-| `APP_ORIGIN` | Vercel / Sites | canonical origin for cookies and CSRF |
+| `APP_ORIGIN` | Vercel / Sites | canonical origin for cookies, CSRF and invite links |
 | `FREEBUFF_CLIENT_ID` / `FREEBUFF_ISSUER` | Vercel / Sites | public OIDC client |
-
-Screenshot import needs no extra deployment: scanning runs in the browser, so
-there is no OCR service to host and no credential to configure. The reference
-implementation in `ocr/` (see `ocr/README.md`) is for local comparison only.
-
-`bun run serve:node` starts the same handler on `127.0.0.1:5174` under Bun
-against a SQLite file. To exercise the **actual Vercel runtime path** — plain
-Node, `@hono/node-server`'s `(req, res)` plumbing and the real libSQL driver —
-build the function and run it:
-
-```sh
-bun run build:api    # bundles api/index.ts for Node into .tmp-api/api.mjs
-bun run serve:api    # serves it on 127.0.0.1:5175 over .tmp-api/teammaker.db
-```
-
-It prints the port it actually bound (PORT overrides the default).
-
-That harness is a loopback origin with no auth config, so it answers as the
-local-preview identity and every route is reachable with curl. Point
-`TURSO_DATABASE_URL` at a real database to test the hosted driver instead of a
-file; set `APP_ORIGIN` and `FREEBUFF_CLIENT_ID` to exercise the sign-in redirect
-(it returns a 303 to the issuer's authorize endpoint without a session).
 
 ## Publishing
 
 Only when asked. Create or inspect the site, run `sites_add_storage` for `DB`,
 run `sites_enable_auth` with the local Worker origin so sign-in works in
 development, then build and deploy with `deploy.json`. Sites injects
-`FREEBUFF_CLIENT_ID`, `FREEBUFF_ISSUER` and `APP_ORIGIN`; no application secret is
-stored in this project. Read `node_modules/@freebuff/auth/AGENTS.md` before
+`FREEBUFF_CLIENT_ID`, `FREEBUFF_ISSUER` and `APP_ORIGIN`; no application secret
+is stored in this project. Read `node_modules/@freebuff/auth/AGENTS.md` before
 changing anything about sign-in.
+
+## Current limits
+
+- Saved rounds are capped at the newest 60 per group, per device.
+- The server keeps the newest 1000 rating events per group; older ones are
+  squashed into the anchors as described above, and a group's match list only
+  covers the kept window.
+- At most 200 players, 16 tags, 25 owned groups and 100 members per group.
+- Live updates are revision-polled (~2.5 s while the tab is visible). There is
+  no presence indicator, and simultaneous edits are last-write-wins.
+- Invite links are multi-use until revoked; there is no expiry UI yet.
+- Screenshot import runs entirely in the browser and needs no extra deployment.

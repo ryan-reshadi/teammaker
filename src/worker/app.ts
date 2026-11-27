@@ -24,25 +24,46 @@ import {
   type ReplayResult,
 } from '../shared/elo'
 import { normalizeTags, ROLE_IDS } from '../shared/roles'
-import type { Player, RoundConfig } from '../shared/types'
-import { currentUser, isLocalPreview } from './auth'
+import type { GroupRole, Player } from '../shared/types'
+import { appOrigin, currentUser, isLocalPreview } from './auth'
 import {
+  ensureSchema,
   mapPlayer,
   mapRound,
+  REQUIRED_TABLES,
   type Database,
   type PlayerRow,
   type RoundRow,
   type Statement,
 } from './db'
-import { sessionGuard, type AppContext, type Authenticate } from './guard'
+import {
+  MAX_GROUPS,
+  MAX_MEMBERS,
+  MAX_TAGS,
+  bumpRev,
+  countOwnedGroups,
+  createGroup,
+  ensureGroupForUser,
+  hashInviteToken,
+  isGroupRole,
+  listGroups,
+  loadGroupDetail,
+  loadTags,
+  newInviteToken,
+  readGroupName,
+  readTagLabel,
+  readTagShort,
+  roleFor,
+  type MemberRow,
+} from './groups'
+import { groupGuard, sessionGuard, type AppContext, type Authenticate } from './guard'
 
 const ROSTER_LIMIT = 200
 const MAX_BATCH = 50
-const MAX_ROUNDS = 100
-/** Events a squash removes from the front and keeps at the back. */
-export const SQUASH_KEEP = 500
 const MAX_LABEL = 60
 const MAX_REASON = 80
+/** Events a squash removes from the front and keeps at the back. */
+export const SQUASH_KEEP = 500
 const MATCH_ERROR =
   'A match needs two to eight teams, damage for every player, a winner and at least one player from your roster.'
 
@@ -73,18 +94,24 @@ const readElo = (value: unknown): number | null =>
     ? value
     : null
 
-/** Absent tags mean none; unknown or duplicate ids are rejected rather than dropped. */
-const readTags = (value: unknown): string[] | null => {
+/** Absent tags mean none; unknown ids are rejected rather than dropped. */
+const readTags = (
+  value: unknown,
+  allowed: readonly string[],
+): string[] | null => {
   if (value === undefined) return []
-  if (!Array.isArray(value) || value.length > ROLE_IDS.length) return null
+  if (!Array.isArray(value) || value.length > MAX_TAGS) return null
   for (const item of value)
-    if (typeof item !== 'string' || !ROLE_IDS.includes(item)) return null
-  return normalizeTags(value)
+    if (typeof item !== 'string' || !allowed.includes(item)) return null
+  return normalizeTags(value, allowed)
 }
+
+const readRole = (value: unknown): 'editor' | 'viewer' | null =>
+  value === 'editor' || value === 'viewer' ? value : null
 
 type Draft = { name: string; username: string; skill: number; tags: string[] }
 
-function readDrafts(body: unknown): Draft[] | null {
+function readDrafts(body: unknown, allowedTags: readonly string[]): Draft[] | null {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return null
   const record = body as Record<string, unknown>
   const list = 'players' in record ? record.players : [record]
@@ -105,7 +132,7 @@ function readDrafts(body: unknown): Draft[] | null {
     const username =
       entry.username === undefined ? '' : readUsername(entry.username)
     const skill = readSkill(entry.skill)
-    const tags = readTags(entry.tags)
+    const tags = readTags(entry.tags, allowedTags)
     if (!name || username === null || skill === null || !tags) return null
     drafts.push({ name, username, skill, tags })
   }
@@ -205,79 +232,6 @@ function readMatchInput(value: unknown): MatchInput | null {
   return { label, teams, winner: record.winner }
 }
 
-function readTeams(value: unknown): RoundConfig['teams'] | null {
-  if (!Array.isArray(value) || value.length === 0 || value.length > 8) return null
-  const teams: RoundConfig['teams'] = []
-  let total = 0
-  for (const item of value) {
-    if (!item || typeof item !== 'object' || Array.isArray(item)) return null
-    const team = item as Record<string, unknown>
-    if (!Array.isArray(team.players) || team.players.length > ROSTER_LIMIT)
-      return null
-    if (typeof team.sum !== 'number' || !Number.isFinite(team.sum)) return null
-    const players: RoundConfig['teams'][number]['players'] = []
-    for (const raw of team.players) {
-      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
-      const player = raw as Record<string, unknown>
-      if (typeof player.id !== 'string' || player.id.length > 64) return null
-      const name = readName(player.name)
-      const elo = readElo(player.elo)
-      const tags = readTags(player.tags)
-      if (!name || elo === null || !tags) return null
-      players.push({ id: player.id, name, elo, tags })
-    }
-    total += players.length
-    if (total > ROSTER_LIMIT * 2) return null
-    teams.push({ players, sum: team.sum })
-  }
-  return teams
-}
-
-function readRoundConfig(value: unknown): RoundConfig | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
-  const config = value as Record<string, unknown>
-  if (
-    Object.keys(config).some(
-      (key) =>
-        !['version', 'teamCount', 'tolerance', 'spread', 'teams', 'benchedIds'].includes(
-          key,
-        ),
-    )
-  )
-    return null
-  if (config.version !== 2) return null
-  const { teamCount, tolerance, spread } = config
-  if (
-    typeof teamCount !== 'number' ||
-    !Number.isInteger(teamCount) ||
-    teamCount < 1 ||
-    teamCount > 8
-  )
-    return null
-  if (
-    typeof tolerance !== 'number' ||
-    !Number.isFinite(tolerance) ||
-    tolerance < 0 ||
-    tolerance > 5000
-  )
-    return null
-  if (
-    typeof spread !== 'number' ||
-    !Number.isFinite(spread) ||
-    spread < 0 ||
-    spread > 10000
-  )
-    return null
-  const teams = readTeams(config.teams)
-  if (!teams || teams.length !== teamCount) return null
-  const benchedIds = Array.isArray(config.benchedIds)
-    ? config.benchedIds
-        .filter((id): id is string => typeof id === 'string' && id.length <= 64)
-        .slice(0, ROSTER_LIMIT)
-    : []
-  return { version: 2, teamCount, tolerance, spread, teams, benchedIds }
-}
-
 type EventRow = {
   id: string
   position: number
@@ -299,12 +253,12 @@ type ResultRow = {
 
 type BaseRow = PlayerRow & { base_elo: number }
 
-async function loadEvents(db: Database, owner: string): Promise<RatingEvent[]> {
+async function loadEvents(db: Database, groupId: string): Promise<RatingEvent[]> {
   const rows = await db
     .prepare(
-      'SELECT id, position, kind, payload, created_at, updated_at FROM rating_events WHERE owner_sub = ? ORDER BY position ASC, created_at ASC, id ASC',
+      'SELECT id, position, kind, payload, created_at, updated_at FROM rating_events WHERE group_id = ? ORDER BY position ASC, created_at ASC, id ASC',
     )
-    .bind(owner)
+    .bind(groupId)
     .all<EventRow>()
   const events: RatingEvent[] = []
   for (const row of rows.results) {
@@ -336,27 +290,26 @@ async function loadEvents(db: Database, owner: string): Promise<RatingEvent[]> {
   return events
 }
 
-async function getKFactor(db: Database, owner: string): Promise<number> {
+async function getKFactor(db: Database, groupId: string): Promise<number> {
   const row = await db
-    .prepare('SELECT k_factor FROM settings WHERE owner_sub = ?')
-    .bind(owner)
+    .prepare('SELECT k_factor FROM groups WHERE id = ? AND deleted_at IS NULL')
+    .bind(groupId)
     .first<{ k_factor: number }>()
   return row && isKFactor(row.k_factor) ? row.k_factor : DEFAULT_K_FACTOR
 }
 
 /**
  * The K that produced ratings written before versioning. Until a K change or
- * the first v2 match pins it, the current setting is still exactly that K: the
- * old code replayed every event with it.
+ * the first v2 match pins it, the group's current setting is still that K.
  */
 async function getLegacyK(
   db: Database,
-  owner: string,
+  groupId: string,
   currentK: number,
 ): Promise<number> {
   const row = await db
-    .prepare('SELECT legacy_k FROM rating_meta WHERE owner_sub = ?')
-    .bind(owner)
+    .prepare('SELECT legacy_k FROM group_rating_meta WHERE group_id = ?')
+    .bind(groupId)
     .first<{ legacy_k: number }>()
   return row && isKFactor(row.legacy_k) ? row.legacy_k : currentK
 }
@@ -364,76 +317,82 @@ async function getLegacyK(
 /** One additive row; it never rewrites an existing event or result. */
 async function pinLegacyK(
   db: Database,
-  owner: string,
+  groupId: string,
   legacyK: number,
 ): Promise<void> {
   await db
     .prepare(
-      'INSERT INTO rating_meta (owner_sub, legacy_k, created_at) VALUES (?, ?, ?) ON CONFLICT(owner_sub) DO NOTHING',
+      'INSERT INTO group_rating_meta (group_id, legacy_k, created_at) VALUES (?, ?, ?) ON CONFLICT(group_id) DO NOTHING',
     )
-    .bind(owner, legacyK, Date.now())
+    .bind(groupId, legacyK, Date.now())
     .run()
 }
 
-async function loadPlayers(db: Database, owner: string): Promise<Player[]> {
+async function loadPlayers(
+  db: Database,
+  groupId: string,
+  allowedTags: readonly string[],
+): Promise<Player[]> {
   const result = await db
     .prepare(
-      'SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE owner_sub = ? AND deleted_at IS NULL ORDER BY created_at ASC, id ASC',
+      'SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE group_id = ? AND deleted_at IS NULL ORDER BY created_at ASC, id ASC',
     )
-    .bind(owner)
+    .bind(groupId)
     .all<PlayerRow>()
-  return result.results.map(mapPlayer)
+  return result.results.map((row) => mapPlayer(row, allowedTags))
 }
 
-async function nextPosition(db: Database, owner: string): Promise<number> {
+async function nextPosition(db: Database, groupId: string): Promise<number> {
   const row = await db
     .prepare(
-      'SELECT COALESCE(MAX(position), -1) + 1 AS next FROM rating_events WHERE owner_sub = ?',
+      'SELECT COALESCE(MAX(position), -1) + 1 AS next FROM rating_events WHERE group_id = ?',
     )
-    .bind(owner)
+    .bind(groupId)
     .first<{ next: number }>()
   return row?.next ?? 0
 }
 
 async function findEvent(
   db: Database,
-  owner: string,
+  groupId: string,
   id: string,
 ): Promise<EventRow | null> {
   return db
     .prepare(
-      'SELECT id, position, kind, payload, created_at, updated_at FROM rating_events WHERE id = ? AND owner_sub = ?',
+      'SELECT id, position, kind, payload, created_at, updated_at FROM rating_events WHERE id = ? AND group_id = ?',
     )
-    .bind(id, owner)
+    .bind(id, groupId)
     .first<EventRow>()
 }
 
 const insertResultSql =
-  'INSERT INTO rating_results (event_id, owner_sub, slot, player_id, name, elo_before, elo_after, delta) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+  'INSERT INTO rating_results (event_id, owner_sub, group_id, slot, player_id, name, elo_before, elo_after, delta) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
 
 /**
- * Rebuilds every rating from the log (a player's creation elo plus each event in
- * order), then writes the affected bookkeeping rows. `from` is the earliest
- * position whose outcome can have changed: an appended event needs one row set,
- * while a K change replays the whole history.
+ * Rebuilds every rating from the log, then writes the affected bookkeeping
+ * rows. `from` is the earliest position whose outcome can have changed.
  */
 async function recompute(
   db: Database,
-  owner: string,
+  groupId: string,
   from: number,
 ): Promise<Player[]> {
-  // Archived players stay in this query: they are part of the replay roster, so
-  // keeping their base elo and their event outcomes makes a removal invisible to
-  // every later rating. The response filters them out instead.
   const players = await db
     .prepare(
-      'SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at, base_elo, deleted_at FROM players WHERE owner_sub = ? ORDER BY created_at ASC, id ASC',
+      'SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at, base_elo, deleted_at FROM players WHERE group_id = ? ORDER BY created_at ASC, id ASC',
     )
-    .bind(owner)
+    .bind(groupId)
     .all<BaseRow>()
-  const events = await loadEvents(db, owner)
-  const kFactor = await getKFactor(db, owner)
-  const legacyK = await getLegacyK(db, owner, kFactor)
+  const events = await loadEvents(db, groupId)
+  const kFactor = await getKFactor(db, groupId)
+  const legacyK = await getLegacyK(db, groupId, kFactor)
+  // `owner_sub` stays the group's creator for older readers and the existing
+  // test queries; every route scopes by `group_id`.
+  const owner = await db
+    .prepare('SELECT owner_sub FROM groups WHERE id = ?')
+    .bind(groupId)
+    .first<{ owner_sub: string }>()
+  const ownerSub = owner?.owner_sub ?? groupId
   const roster: MatchRoster[] = players.results.map((player) => ({
     id: player.id,
     name: player.name,
@@ -448,17 +407,17 @@ async function recompute(
     if (elo !== player.elo || skill !== player.skill)
       statements.push(
         db
-          .prepare('UPDATE players SET elo = ?, skill = ? WHERE id = ? AND owner_sub = ?')
-          .bind(elo, skill, player.id, owner),
+          .prepare('UPDATE players SET elo = ?, skill = ? WHERE id = ? AND group_id = ?')
+          .bind(elo, skill, player.id, groupId),
       )
   }
 
   statements.push(
     db
       .prepare(
-        'DELETE FROM rating_results WHERE owner_sub = ? AND event_id IN (SELECT id FROM rating_events WHERE owner_sub = ? AND position >= ?)',
+        'DELETE FROM rating_results WHERE group_id = ? AND event_id IN (SELECT id FROM rating_events WHERE group_id = ? AND position >= ?)',
       )
-      .bind(owner, owner, from),
+      .bind(groupId, groupId, from),
   )
 
   const names = new Map(players.results.map((player) => [player.id, player.name]))
@@ -474,7 +433,8 @@ async function recompute(
               .prepare(insertResultSql)
               .bind(
                 event.id,
-                owner,
+                ownerSub,
+                groupId,
                 `${teamIndex}:${slot}`,
                 player.id,
                 player.name,
@@ -493,7 +453,8 @@ async function recompute(
         .prepare(insertResultSql)
         .bind(
           event.id,
-          owner,
+          ownerSub,
+          groupId,
           '0',
           playerId,
           names.get(playerId) ?? '',
@@ -506,47 +467,45 @@ async function recompute(
 
   if (statements.length > 0) await db.batch(statements)
 
+  const tags = await loadTags(db, groupId)
+  const allowed = tags.map((tag) => tag.id)
   return players.results
     .filter((player) => !player.deleted_at)
     .map((player) =>
-      mapPlayer({
-        ...player,
-        elo: elos.get(player.id) ?? player.elo,
-        skill: skillFromElo(elos.get(player.id) ?? player.elo),
-      }),
+      mapPlayer(
+        {
+          ...player,
+          elo: elos.get(player.id) ?? player.elo,
+          skill: skillFromElo(elos.get(player.id) ?? player.elo),
+        },
+        allowed,
+      ),
     )
 }
 
-async function countEvents(db: Database, owner: string): Promise<number> {
+async function countEvents(db: Database, groupId: string): Promise<number> {
   const row = await db
-    .prepare('SELECT COUNT(*) AS total FROM rating_events WHERE owner_sub = ?')
-    .bind(owner)
+    .prepare('SELECT COUNT(*) AS total FROM rating_events WHERE group_id = ?')
+    .bind(groupId)
     .first<{ total: number }>()
   return row?.total ?? 0
 }
 
 /**
  * Folds the oldest events into each player's replay anchor, then deletes them.
- *
  * `base_elo` becomes the elo at the cut, so the kept log replays forward to
  * exactly the ratings it produced before: no `elo` moves and every kept
  * `rating_results` row stays valid. Only the history is lost.
- *
- * A formula 2 or 3 event is never kept behind a deleted prefix: its K comes from
- * the number of rated matches before it, which only the deleted events hold.
  */
 export async function compactLog(
   db: Database,
-  owner: string,
+  groupId: string,
   keep = SQUASH_KEEP,
 ): Promise<{ removed: number; kept: number }> {
-  const events = await loadEvents(db, owner)
+  const events = await loadEvents(db, groupId)
   if (events.length <= keep) return { removed: 0, kept: events.length }
 
   let cut = events.length - keep
-  // The kept window must start after the newest count-dependent event: its K
-  // reads how many rated matches precede it, and only the deleted events hold
-  // that. Formulas 1 and 4 do not care, so they are safe to keep.
   for (let index = events.length - 1; index >= cut; index -= 1) {
     const event = events[index]!
     if (event.kind === 'match' && usesProvisionalK(eventFormula(event.payload))) {
@@ -554,20 +513,16 @@ export async function compactLog(
       break
     }
   }
-  // Only reachable when the newest event itself is count-dependent. This build
-  // never writes one, so it means there is nothing safe to cut.
   if (cut >= events.length) return { removed: 0, kept: events.length }
 
-  // Archived players stay in this query: they seed the replay just like the
-  // roster does, so their anchor has to move with everyone else's.
   const players = await db
     .prepare(
-      'SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at, base_elo, deleted_at FROM players WHERE owner_sub = ? ORDER BY created_at ASC, id ASC',
+      'SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at, base_elo, deleted_at FROM players WHERE group_id = ? ORDER BY created_at ASC, id ASC',
     )
-    .bind(owner)
+    .bind(groupId)
     .all<BaseRow>()
-  const kFactor = await getKFactor(db, owner)
-  const legacyK = await getLegacyK(db, owner, kFactor)
+  const kFactor = await getKFactor(db, groupId)
+  const legacyK = await getLegacyK(db, groupId, kFactor)
   const roster: MatchRoster[] = players.results.map((player) => ({
     id: player.id,
     name: player.name,
@@ -575,30 +530,28 @@ export async function compactLog(
   }))
   const { elos } = replay(events.slice(0, cut), roster, kFactor, legacyK)
 
-  const oldest = `(SELECT id FROM rating_events WHERE owner_sub = ? ORDER BY position ASC, created_at ASC, id ASC LIMIT ${cut})`
+  const oldest = `(SELECT id FROM rating_events WHERE group_id = ? ORDER BY position ASC, created_at ASC, id ASC LIMIT ${cut})`
   const statements: Statement[] = []
   for (const player of players.results) {
     const anchor = clampElo(elos.get(player.id) ?? player.base_elo)
     if (anchor === player.base_elo) continue
     statements.push(
       db
-        .prepare('UPDATE players SET base_elo = ? WHERE id = ? AND owner_sub = ?')
-        .bind(anchor, player.id, owner),
+        .prepare('UPDATE players SET base_elo = ? WHERE id = ? AND group_id = ?')
+        .bind(anchor, player.id, groupId),
     )
   }
-  // Results first, then the events they belong to; both resolve the same
-  // oldest rows because the second subquery still sees the full event table.
   statements.push(
     db
-      .prepare(`DELETE FROM rating_results WHERE owner_sub = ? AND event_id IN ${oldest}`)
-      .bind(owner, owner),
-    db.prepare(`DELETE FROM rating_events WHERE id IN ${oldest}`).bind(owner),
-    // Recorded in the same transaction, so the note never disagrees with the log.
+      .prepare(`DELETE FROM rating_results WHERE group_id = ? AND event_id IN ${oldest}`)
+      .bind(groupId, groupId),
+    db.prepare(`DELETE FROM rating_events WHERE id IN ${oldest}`).bind(groupId),
     db
       .prepare(
-        'INSERT INTO log_squashes (owner_sub, removed, squashed_at) VALUES (?, ?, ?) ON CONFLICT(owner_sub) DO UPDATE SET removed = log_squashes.removed + excluded.removed, squashed_at = excluded.squashed_at',
+        'INSERT INTO group_squashes (group_id, removed, squashed_at) VALUES (?, ?, ?) ON CONFLICT(group_id) DO UPDATE SET removed = group_squashes.removed + excluded.removed, squashed_at = excluded.squashed_at',
       )
-      .bind(owner, cut, Date.now()),
+      .bind(groupId, cut, Date.now()),
+    bumpRev(db, groupId),
   )
   await db.batch(statements)
   return { removed: cut, kept: events.length - cut }
@@ -606,25 +559,24 @@ export async function compactLog(
 
 /**
  * Makes room for one more event, compacting a full log. `false` means the log is
- * at the cap and nothing could safely be cut: a match refuses the write, while
- * an adjustment compacts quietly and goes ahead anyway.
+ * at the cap and nothing could safely be cut.
  */
-async function makeRoom(db: Database, owner: string): Promise<boolean> {
-  if ((await countEvents(db, owner)) < MAX_EVENTS) return true
-  const { removed } = await compactLog(db, owner)
+async function makeRoom(db: Database, groupId: string): Promise<boolean> {
+  if ((await countEvents(db, groupId)) < MAX_EVENTS) return true
+  const { removed } = await compactLog(db, groupId)
   return removed > 0
 }
 
 async function matchViews(
   db: Database,
-  owner: string,
+  groupId: string,
 ): Promise<RatingEventView[]> {
-  const events = await loadEvents(db, owner)
+  const events = await loadEvents(db, groupId)
   const rows = await db
     .prepare(
-      'SELECT event_id, slot, player_id, name, elo_before, elo_after, delta FROM rating_results WHERE owner_sub = ?',
+      'SELECT event_id, slot, player_id, name, elo_before, elo_after, delta FROM rating_results WHERE group_id = ?',
     )
-    .bind(owner)
+    .bind(groupId)
     .all<ResultRow>()
   const results = new Map(
     rows.results.map((row) => [`${row.event_id}|${row.slot}`, row]),
@@ -676,22 +628,22 @@ async function matchViews(
 }
 
 /**
- * New matches may only name players on the roster. An edit passes
+ * New matches may only name players on the group's roster. An edit passes
  * `includeArchived`, because a lineup logged before a removal must stay
  * editable and the archived row still has a real rating in the replay.
  */
 async function trackedIdsExist(
   db: Database,
-  owner: string,
+  groupId: string,
   ids: string[],
   includeArchived = false,
 ): Promise<boolean> {
   if (ids.length === 0) return true
   const rows = await db
     .prepare(
-      `SELECT id FROM players WHERE owner_sub = ?${includeArchived ? '' : ' AND deleted_at IS NULL'} AND id IN (${ids.map(() => '?').join(', ')})`,
+      `SELECT id FROM players WHERE group_id = ?${includeArchived ? '' : ' AND deleted_at IS NULL'} AND id IN (${ids.map(() => '?').join(', ')})`,
     )
-    .bind(owner, ...ids)
+    .bind(groupId, ...ids)
     .all<{ id: string }>()
   return rows.results.length === new Set(ids).size
 }
@@ -699,35 +651,7 @@ async function trackedIdsExist(
 /** Tests inject identities; production uses the SDK. */
 export function createApp(authenticate: Authenticate = currentUser) {
   const app = new Hono<AppContext>()
-  // Reachability probe: one real round trip, no authentication, no rows written.
-  // It answers the question the session flag cannot — `session.database` only
-  // says a URL was configured, not that the database answers.
-  app.get('/api/health', async (c) => {
-    c.header('Cache-Control', 'private, no-store')
-    const db = c.env.DB
-    if (!db) return c.json({ ok: true, database: 'unconfigured' })
-    try {
-      await db.prepare('SELECT 1 AS ok').first<{ ok: number }>()
-      const tables = await db
-        .prepare(
-          "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('players', 'rounds', 'rating_events', 'rating_results', 'settings', 'rating_meta', 'log_squashes')",
-        )
-        .all<{ name: string }>()
-      return c.json({
-        ok: true,
-        database: 'ok',
-        schema: tables.results.length === 7 ? 'ready' : 'missing',
-      })
-    } catch (error) {
-      // The driver's message can name the host; it is not a secret, but keep it
-      // in the function logs rather than the public response.
-      console.error(
-        'Teammaker: database health check failed',
-        error instanceof Error ? error.message : error,
-      )
-      return c.json({ ok: false, database: 'unreachable' }, 503)
-    }
-  })
+
   app.use('/api/*', async (c, next) => {
     c.header('Cache-Control', 'private, no-store')
     await next()
@@ -739,6 +663,35 @@ export function createApp(authenticate: Authenticate = currentUser) {
       onError: (c) => c.json({ error: 'Request is too large.' }, 413),
     }),
   )
+
+  // Reachability probe: one real round trip, no authentication, no rows written.
+  app.get('/api/health', async (c) => {
+    c.header('Cache-Control', 'private, no-store')
+    const db = c.env.DB
+    if (!db) return c.json({ ok: true, database: 'unconfigured' })
+    try {
+      await db.prepare('SELECT 1 AS ok').first<{ ok: number }>()
+      const tables = await db
+        .prepare(
+          `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (${REQUIRED_TABLES.map(
+            (table) => `'${table}'`,
+          ).join(', ')})`,
+        )
+        .all<{ name: string }>()
+      return c.json({
+        ok: true,
+        database: 'ok',
+        schema: tables.results.length === REQUIRED_TABLES.length ? 'ready' : 'missing',
+      })
+    } catch (error) {
+      console.error(
+        'Teammaker: database health check failed',
+        error instanceof Error ? error.message : error,
+      )
+      return c.json({ ok: false, database: 'unreachable' }, 503)
+    }
+  })
+
   app.get('/api/session', async (c) =>
     c.json({
       user: await authenticate(c.req.raw, c.env),
@@ -751,35 +704,426 @@ export function createApp(authenticate: Authenticate = currentUser) {
     }),
   )
 
-  // Every data route needs a signed-in user, a same-origin mutation and a database.
-  const guard = sessionGuard(authenticate)
-  app.use('/api/*', async (c, next) => {
-    if (c.req.path === '/api/health' || c.req.path === '/api/session')
-      return next()
-    // Returning the guard's response is what finalizes a refusal; awaiting and
-    // discarding it would leave the context unfinished.
-    return guard(c, next)
+  const guard = groupGuard(authenticate)
+
+  // A token holder may see which group and role a link is for before signing
+  // in: the 32-byte token is the credential. Accepting still needs an account.
+  app.get('/api/invites/:token', async (c) => {
+    if (!c.env.DB)
+      return c.json(
+        { error: 'This app is still being set up. Please try again later.' },
+        503,
+      )
+    await ensureSchema(c.env.DB)
+    const invite = await loadInvite(c.env.DB, c.req.param('token'))
+    return invite
+      ? c.json({ invite })
+      : c.json({ error: 'That invite link is no longer valid.' }, 404)
   })
 
-  app.get('/api/players', async (c) =>
-    c.json({ players: await loadPlayers(c.get('db'), c.get('user').sub) }),
-  )
+  // The group list and accepting an invite are account-level routes; everything
+  // inside a group goes through `guard`, which decides read/editor/owner.
+  app.use('/api/groups', sessionGuard(authenticate))
+  app.use('/api/invites/:token/accept', sessionGuard(authenticate))
+  app.use('/api/groups/:groupId', guard)
+  app.use('/api/groups/:groupId/*', guard)
 
-  app.post('/api/players', async (c) => {
+  app.get('/api/groups', async (c) => {
+    const db = c.get('db')
+    const user = c.get('user')
+    await ensureGroupForUser(db, { sub: user.sub, name: user.name })
+    if (user.name)
+      await db
+        .prepare(
+          'UPDATE group_members SET display_name = ?, updated_at = ? WHERE user_sub = ? AND display_name <> ?',
+        )
+        .bind(user.name, Date.now(), user.sub, user.name)
+        .run()
+    return c.json({ groups: await listGroups(db, user.sub) })
+  })
+
+  app.post('/api/groups', async (c) => {
     const body: unknown = await c.req.json().catch(() => null)
-    const drafts = readDrafts(body)
+    const name =
+      body && typeof body === 'object' && !Array.isArray(body)
+        ? readGroupName((body as Record<string, unknown>).name)
+        : null
+    if (!name) return c.json({ error: 'Group names are 1 to 40 characters.' }, 400)
+    const db = c.get('db')
+    const user = c.get('user')
+    if ((await countOwnedGroups(db, user.sub)) >= MAX_GROUPS)
+      return c.json({ error: `You can own up to ${MAX_GROUPS} groups.` }, 400)
+    return c.json(
+      { group: await createGroup(db, { sub: user.sub, name: user.name }, name) },
+      201,
+    )
+  })
+
+  app.get('/api/groups/:groupId', async (c) => {
+    const detail = await loadGroupDetail(
+      c.get('db'),
+      c.get('groupId'),
+      c.get('user').sub,
+    )
+    return detail ? c.json({ group: detail }) : c.json({ error: 'Group not found.' }, 404)
+  })
+
+  app.patch('/api/groups/:groupId', async (c) => {
+    const body: unknown = await c.req.json().catch(() => null)
+    if (!body || typeof body !== 'object' || Array.isArray(body))
+      return c.json({ error: 'Nothing to update.' }, 400)
+    const patch = body as Record<string, unknown>
+    if (
+      Object.keys(patch).some((key) => key !== 'name' && key !== 'kFactor') ||
+      Object.keys(patch).length === 0
+    )
+      return c.json({ error: 'Nothing to update.' }, 400)
+    const sets: string[] = []
+    const values: unknown[] = []
+    if ('name' in patch) {
+      const name = readGroupName(patch.name)
+      if (!name) return c.json({ error: 'Group names are 1 to 40 characters.' }, 400)
+      sets.push('name = ?')
+      values.push(name)
+    }
+    if ('kFactor' in patch) {
+      if (!isKFactor(patch.kFactor))
+        return c.json({ error: 'K must be a whole number from 8 to 64.' }, 400)
+      sets.push('k_factor = ?')
+      values.push(patch.kFactor)
+    }
+    const db = c.get('db')
+    const groupId = c.get('groupId')
+    sets.push('updated_at = ?', 'rev = rev + 1')
+    values.push(Date.now(), groupId)
+    await db
+      .prepare(`UPDATE groups SET ${sets.join(', ')} WHERE id = ?`)
+      .bind(...values)
+      .run()
+    const detail = await loadGroupDetail(db, groupId, c.get('user').sub)
+    return detail ? c.json({ group: detail }) : c.json({ error: 'Group not found.' }, 404)
+  })
+
+  app.delete('/api/groups/:groupId', async (c) => {
+    const now = Date.now()
+    await c
+      .get('db')
+      .prepare(
+        'UPDATE groups SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL',
+      )
+      .bind(now, now, c.get('groupId'))
+      .run()
+    return c.json({ ok: true })
+  })
+
+  app.get('/api/groups/:groupId/rev', async (c) => {
+    const row = await c
+      .get('db')
+      .prepare('SELECT rev FROM groups WHERE id = ? AND deleted_at IS NULL')
+      .bind(c.get('groupId'))
+      .first<{ rev: number }>()
+    return row ? c.json({ rev: row.rev }) : c.json({ error: 'Group not found.' }, 404)
+  })
+
+  // ---- tags ---------------------------------------------------------------
+
+  app.post('/api/groups/:groupId/tags', async (c) => {
+    const body: unknown = await c.req.json().catch(() => null)
+    if (!body || typeof body !== 'object' || Array.isArray(body))
+      return c.json({ error: 'A tag needs a label.' }, 400)
+    const record = body as Record<string, unknown>
+    if (Object.keys(record).some((key) => key !== 'label' && key !== 'short'))
+      return c.json({ error: 'A tag needs a label.' }, 400)
+    const label = readTagLabel(record.label)
+    const short = readTagShort(record.short)
+    if (!label || short === null)
+      return c.json({ error: 'Labels are 1 to 24 characters, short forms up to 3.' }, 400)
+    const db = c.get('db')
+    const groupId = c.get('groupId')
+    const tags = await loadTags(db, groupId)
+    if (tags.length >= MAX_TAGS)
+      return c.json({ error: `A group holds up to ${MAX_TAGS} tags.` }, 400)
+    const id = crypto.randomUUID()
+    const sort = tags.length
+    const now = Date.now()
+    await db.batch([
+      db
+        .prepare(
+          'INSERT INTO group_tags (group_id, id, label, short, sort, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        )
+        .bind(groupId, id, label, short, sort, now, now),
+      bumpRev(db, groupId, now),
+    ])
+    return c.json({ tag: { id, label, short, sort } }, 201)
+  })
+
+  app.patch('/api/groups/:groupId/tags/:tagId', async (c) => {
+    const body: unknown = await c.req.json().catch(() => null)
+    if (!body || typeof body !== 'object' || Array.isArray(body))
+      return c.json({ error: 'Nothing to update.' }, 400)
+    const patch = body as Record<string, unknown>
+    if (
+      Object.keys(patch).some(
+        (key) => key !== 'label' && key !== 'short' && key !== 'sort',
+      ) ||
+      Object.keys(patch).length === 0
+    )
+      return c.json({ error: 'Nothing to update.' }, 400)
+    const db = c.get('db')
+    const groupId = c.get('groupId')
+    const tagId = c.req.param('tagId')
+    const current = await db
+      .prepare('SELECT id FROM group_tags WHERE group_id = ? AND id = ?')
+      .bind(groupId, tagId)
+      .first<{ id: string }>()
+    if (!current) return c.json({ error: 'Tag not found.' }, 404)
+    const sets: string[] = []
+    const values: unknown[] = []
+    if ('label' in patch) {
+      const label = readTagLabel(patch.label)
+      if (!label) return c.json({ error: 'Labels are 1 to 24 characters.' }, 400)
+      sets.push('label = ?')
+      values.push(label)
+    }
+    if ('short' in patch) {
+      const short = readTagShort(patch.short)
+      if (short === null)
+        return c.json({ error: 'Short forms are up to 3 characters.' }, 400)
+      sets.push('short = ?')
+      values.push(short)
+    }
+    if ('sort' in patch) {
+      if (
+        typeof patch.sort !== 'number' ||
+        !Number.isInteger(patch.sort) ||
+        patch.sort < 0 ||
+        patch.sort > MAX_TAGS
+      )
+        return c.json({ error: 'That order is not valid.' }, 400)
+      sets.push('sort = ?')
+      values.push(patch.sort)
+    }
+    sets.push('updated_at = ?')
+    values.push(Date.now(), groupId, tagId)
+    await db.batch([
+      db
+        .prepare(
+          `UPDATE group_tags SET ${sets.join(', ')} WHERE group_id = ? AND id = ?`,
+        )
+        .bind(...values),
+      bumpRev(db, groupId),
+    ])
+    return c.json({ ok: true })
+  })
+
+  app.delete('/api/groups/:groupId/tags/:tagId', async (c) => {
+    const db = c.get('db')
+    const groupId = c.get('groupId')
+    const tagId = c.req.param('tagId')
+    const current = await db
+      .prepare('SELECT id FROM group_tags WHERE group_id = ? AND id = ?')
+      .bind(groupId, tagId)
+      .first<{ id: string }>()
+    if (!current) return c.json({ error: 'Tag not found.' }, 404)
+    const tags = await loadTags(db, groupId)
+    const remaining = tags.filter((tag) => tag.id !== tagId).map((tag) => tag.id)
+    const players = await db
+      .prepare('SELECT id, tags FROM players WHERE group_id = ?')
+      .bind(groupId)
+      .all<{ id: string; tags: string }>()
+    const statements: Statement[] = []
+    for (const player of players.results) {
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(player.tags)
+      } catch {
+        continue
+      }
+      if (!Array.isArray(parsed) || !parsed.includes(tagId)) continue
+      statements.push(
+        db
+          .prepare('UPDATE players SET tags = ?, updated_at = ? WHERE id = ? AND group_id = ?')
+          .bind(JSON.stringify(normalizeTags(parsed, remaining)), Date.now(), player.id, groupId),
+      )
+    }
+    statements.push(
+      db
+        .prepare('DELETE FROM group_tags WHERE group_id = ? AND id = ?')
+        .bind(groupId, tagId),
+      bumpRev(db, groupId),
+    )
+    await db.batch(statements)
+    return c.json({ ok: true, tags: remaining })
+  })
+
+  // ---- sharing ------------------------------------------------------------
+
+  app.post('/api/groups/:groupId/invites', async (c) => {
+    const body: unknown = await c.req.json().catch(() => null)
+    const role =
+      body && typeof body === 'object' && !Array.isArray(body)
+        ? readRole((body as Record<string, unknown>).role)
+        : null
+    if (!role)
+      return c.json({ error: 'Pick editor or viewer for the invite.' }, 400)
+    const db = c.get('db')
+    const groupId = c.get('groupId')
+    const token = newInviteToken()
+    const id = crypto.randomUUID()
+    const now = Date.now()
+    await db
+      .prepare(
+        'INSERT INTO group_invites (id, group_id, role, token_hash, created_by_sub, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      )
+      .bind(id, groupId, role, await hashInviteToken(token), c.get('user').sub, now)
+      .run()
+    const origin = appOrigin(c.req.raw, c.env) ?? new URL(c.req.url).origin
+    return c.json(
+      { invite: { id, role, createdAt: now, url: `${origin}/join/${token}` } },
+      201,
+    )
+  })
+
+  app.get('/api/groups/:groupId/invites', async (c) => {
+    const rows = await c
+      .get('db')
+      .prepare(
+        'SELECT id, role, created_at FROM group_invites WHERE group_id = ? AND revoked_at IS NULL ORDER BY created_at DESC',
+      )
+      .bind(c.get('groupId'))
+      .all<{ id: string; role: string; created_at: number }>()
+    return c.json({
+      invites: rows.results.map((row) => ({
+        id: row.id,
+        role: row.role === 'editor' ? 'editor' : 'viewer',
+        createdAt: row.created_at,
+      })),
+    })
+  })
+
+  app.delete('/api/groups/:groupId/invites/:inviteId', async (c) => {
+    const row = await c
+      .get('db')
+      .prepare(
+        'UPDATE group_invites SET revoked_at = ? WHERE id = ? AND group_id = ? AND revoked_at IS NULL RETURNING id',
+      )
+      .bind(Date.now(), c.req.param('inviteId'), c.get('groupId'))
+      .first()
+    return row ? c.json({ ok: true }) : c.json({ error: 'Invite not found.' }, 404)
+  })
+
+  app.get('/api/groups/:groupId/members', async (c) => {
+    const detail = await loadGroupDetail(
+      c.get('db'),
+      c.get('groupId'),
+      c.get('user').sub,
+    )
+    return detail ? c.json({ members: detail.members }) : c.json({ error: 'Group not found.' }, 404)
+  })
+
+  app.patch('/api/groups/:groupId/members/:userId', async (c) => {
+    const body: unknown = await c.req.json().catch(() => null)
+    const role =
+      body && typeof body === 'object' && !Array.isArray(body)
+        ? readRole((body as Record<string, unknown>).role)
+        : null
+    if (!role) return c.json({ error: 'Pick editor or viewer.' }, 400)
+    const db = c.get('db')
+    const groupId = c.get('groupId')
+    const userId = c.req.param('userId')
+    const owner = await db
+      .prepare('SELECT owner_sub FROM groups WHERE id = ?')
+      .bind(groupId)
+      .first<{ owner_sub: string }>()
+    if (owner?.owner_sub === userId)
+      return c.json({ error: 'The owner keeps their role.' }, 400)
+    const changed = await db
+      .prepare(
+        'UPDATE group_members SET role = ?, updated_at = ? WHERE group_id = ? AND user_sub = ? RETURNING user_sub',
+      )
+      .bind(role, Date.now(), groupId, userId)
+      .first()
+    if (!changed) return c.json({ error: 'Member not found.' }, 404)
+    await bumpRev(db, groupId).run()
+    return c.json({ ok: true })
+  })
+
+  app.delete('/api/groups/:groupId/members/:userId', async (c) => {
+    const db = c.get('db')
+    const groupId = c.get('groupId')
+    const userId = c.req.param('userId')
+    const owner = await db
+      .prepare('SELECT owner_sub FROM groups WHERE id = ?')
+      .bind(groupId)
+      .first<{ owner_sub: string }>()
+    if (owner?.owner_sub === userId)
+      return c.json({ error: 'The owner cannot be removed.' }, 400)
+    const removed = await db
+      .prepare(
+        'DELETE FROM group_members WHERE group_id = ? AND user_sub = ? RETURNING user_sub',
+      )
+      .bind(groupId, userId)
+      .first()
+    if (!removed) return c.json({ error: 'Member not found.' }, 404)
+    await bumpRev(db, groupId).run()
+    return c.json({ ok: true })
+  })
+
+  app.post('/api/invites/:token/accept', async (c) => {
+    const db = c.get('db')
+    const user = c.get('user')
+    const invite = await loadInvite(db, c.req.param('token'))
+    if (!invite) return c.json({ error: 'That invite link is no longer valid.' }, 404)
+    const now = Date.now()
+    const owner = await db
+      .prepare('SELECT owner_sub FROM groups WHERE id = ?')
+      .bind(invite.groupId)
+      .first<{ owner_sub: string }>()
+    if (owner?.owner_sub !== user.sub) {
+      const members = await db
+        .prepare('SELECT COUNT(*) AS total FROM group_members WHERE group_id = ?')
+        .bind(invite.groupId)
+        .first<{ total: number }>()
+      if ((members?.total ?? 0) + 1 > MAX_MEMBERS)
+        return c.json({ error: 'That group is full.' }, 400)
+      await db
+        .prepare(
+          `INSERT INTO group_members (group_id, user_sub, role, display_name, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(group_id, user_sub) DO NOTHING`,
+        )
+        .bind(invite.groupId, user.sub, invite.role, user.name ?? '', now, now)
+        .run()
+    }
+    await bumpRev(db, invite.groupId).run()
+    return c.json({ group: { id: invite.groupId, name: invite.name, role: invite.role } })
+  })
+
+  // ---- players ------------------------------------------------------------
+
+  app.get('/api/groups/:groupId/players', async (c) => {
+    const db = c.get('db')
+    const groupId = c.get('groupId')
+    const tags = (await loadTags(db, groupId)).map((tag) => tag.id)
+    return c.json({ players: await loadPlayers(db, groupId, tags) })
+  })
+
+  app.post('/api/groups/:groupId/players', async (c) => {
+    const db = c.get('db')
+    const groupId = c.get('groupId')
+    const allowed = (await loadTags(db, groupId)).map((tag) => tag.id)
+    const body: unknown = await c.req.json().catch(() => null)
+    const drafts = readDrafts(body, allowed)
     if (!drafts)
       return c.json(
-        { error: 'Each player needs a name and a skill from 1 to 10.' },
+        { error: 'Each player needs a name, a skill from 1 to 10 and known tags.' },
         400,
       )
-    const db = c.get('db')
-    const owner = c.get('user').sub
     const existing = await db
       .prepare(
-        'SELECT COUNT(*) AS total FROM players WHERE owner_sub = ? AND deleted_at IS NULL',
+        'SELECT COUNT(*) AS total FROM players WHERE group_id = ? AND deleted_at IS NULL',
       )
-      .bind(owner)
+      .bind(groupId)
       .first<{ total: number }>()
     if ((existing?.total ?? 0) + drafts.length > ROSTER_LIMIT)
       return c.json({ error: 'A roster holds up to 200 players.' }, 400)
@@ -791,19 +1135,19 @@ export function createApp(authenticate: Authenticate = currentUser) {
       skill: draft.skill,
       elo: clampElo(draft.skill * 100),
       tags: draft.tags,
-      sittingOut: false,
       createdAt: createdAt + index,
       updatedAt: createdAt + index,
     }))
-    await db.batch(
-      players.map((player) =>
+    await db.batch([
+      ...players.map((player) =>
         db
           .prepare(
-            'INSERT INTO players (id, owner_sub, name, username, skill, elo, base_elo, tags, sitting_out, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)',
+            'INSERT INTO players (id, owner_sub, group_id, name, username, skill, elo, base_elo, tags, sitting_out, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)',
           )
           .bind(
             player.id,
-            owner,
+            c.get('user').sub,
+            groupId,
             player.name,
             player.username ?? '',
             player.skill,
@@ -814,32 +1158,39 @@ export function createApp(authenticate: Authenticate = currentUser) {
             player.updatedAt,
           ),
       ),
-    )
+      bumpRev(db, groupId),
+    ])
     return c.json({ players }, 201)
   })
 
-  app.patch('/api/players/:id', async (c) => {
+  app.patch('/api/groups/:groupId/players/:playerId', async (c) => {
     const body: unknown = await c.req.json().catch(() => null)
     if (!body || typeof body !== 'object' || Array.isArray(body))
       return c.json({ error: 'Nothing to update.' }, 400)
     const patch = body as Record<string, unknown>
     if (
       Object.keys(patch).some(
-        (key) =>
-          !['name', 'username', 'skill', 'elo', 'tags', 'sittingOut'].includes(key),
+        (key) => !['name', 'username', 'skill', 'elo', 'tags'].includes(key),
       )
     )
-      return c.json({ error: 'Nothing to update.' }, 400)
-    const id = c.req.param('id')
+      return c.json(
+        {
+          error:
+            'Nothing to update. Sitting out is saved on each device, not in the group.',
+        },
+        400,
+      )
     const db = c.get('db')
-    const owner = c.get('user').sub
+    const groupId = c.get('groupId')
+    const id = c.req.param('playerId')
     const current = await db
       .prepare(
-        'SELECT id, elo FROM players WHERE id = ? AND owner_sub = ? AND deleted_at IS NULL',
+        'SELECT id, elo FROM players WHERE id = ? AND group_id = ? AND deleted_at IS NULL',
       )
-      .bind(id, owner)
+      .bind(id, groupId)
       .first<{ id: string; elo: number }>()
     if (!current) return c.json({ error: 'Player not found.' }, 404)
+    const allowed = (await loadTags(db, groupId)).map((tag) => tag.id)
 
     const sets: string[] = []
     const values: unknown[] = []
@@ -878,13 +1229,11 @@ export function createApp(authenticate: Authenticate = currentUser) {
     if (targetElo !== null) {
       sets.push('elo = ?', 'skill = ?')
       values.push(targetElo, skillFromElo(targetElo))
-      // Before any match or adjustment exists the 1-10 control is just the
-      // starting point, so move the base rating instead of logging an edit.
       const history = await db
         .prepare(
-          'SELECT COUNT(*) AS total FROM rating_results WHERE owner_sub = ? AND player_id = ?',
+          'SELECT COUNT(*) AS total FROM rating_results WHERE group_id = ? AND player_id = ?',
         )
-        .bind(owner, id)
+        .bind(groupId, id)
         .first<{ total: number }>()
       logAdjustment = (history?.total ?? 0) > 0
       if (!logAdjustment) {
@@ -893,39 +1242,33 @@ export function createApp(authenticate: Authenticate = currentUser) {
       }
     }
     if ('tags' in patch) {
-      const tags = readTags(patch.tags)
-      if (!tags)
-        return c.json({ error: 'Those roles are not recognised.' }, 400)
+      const tags = readTags(patch.tags, allowed)
+      if (!tags) return c.json({ error: 'Those tags are not in this group.' }, 400)
       sets.push('tags = ?')
       values.push(JSON.stringify(tags))
     }
-    if ('sittingOut' in patch) {
-      if (typeof patch.sittingOut !== 'boolean')
-        return c.json({ error: 'Sitting out must be true or false.' }, 400)
-      sets.push('sitting_out = ?')
-      values.push(patch.sittingOut ? 1 : 0)
-    }
     if (sets.length === 0) return c.json({ error: 'Nothing to update.' }, 400)
     sets.push('updated_at = ?')
-    values.push(Date.now(), id, owner)
-    await db
-      .prepare(
-        `UPDATE players SET ${sets.join(', ')} WHERE id = ? AND owner_sub = ?`,
-      )
-      .bind(...values)
-      .run()
+    values.push(Date.now(), id, groupId)
+    await db.batch([
+      db
+        .prepare(`UPDATE players SET ${sets.join(', ')} WHERE id = ? AND group_id = ?`)
+        .bind(...values),
+      bumpRev(db, groupId),
+    ])
 
     if (targetElo !== null && logAdjustment && targetElo !== current.elo) {
-      await makeRoom(db, owner)
-      const position = await nextPosition(db, owner)
+      await makeRoom(db, groupId)
+      const position = await nextPosition(db, groupId)
       const now = Date.now()
       await db
         .prepare(
-          'INSERT INTO rating_events (id, owner_sub, position, kind, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          'INSERT INTO rating_events (id, owner_sub, group_id, position, kind, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
         )
         .bind(
           crypto.randomUUID(),
-          owner,
+          c.get('user').sub,
+          groupId,
           position,
           'adjust',
           JSON.stringify({ playerId: id, elo: targetElo, reason }),
@@ -933,47 +1276,47 @@ export function createApp(authenticate: Authenticate = currentUser) {
           now,
         )
         .run()
-      const players = await recompute(db, owner, position)
+      const players = await recompute(db, groupId, position)
       return c.json({ player: players.find((entry) => entry.id === id) ?? null })
     }
 
     const row = await db
       .prepare(
-        'SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE id = ? AND owner_sub = ? AND deleted_at IS NULL',
+        'SELECT id, name, username, skill, elo, tags, sitting_out, created_at, updated_at FROM players WHERE id = ? AND group_id = ? AND deleted_at IS NULL',
       )
-      .bind(id, owner)
+      .bind(id, groupId)
       .first<PlayerRow>()
     return row
-      ? c.json({ player: mapPlayer(row) })
+      ? c.json({ player: mapPlayer(row, allowed) })
       : c.json({ error: 'Player not found.' }, 404)
   })
 
-  app.delete('/api/players/:id', async (c) => {
+  app.delete('/api/groups/:groupId/players/:playerId', async (c) => {
     const db = c.get('db')
-    const owner = c.get('user').sub
-    const id = c.req.param('id')
+    const groupId = c.get('groupId')
+    const id = c.req.param('playerId')
     const player = await db
       .prepare(
-        'SELECT id FROM players WHERE id = ? AND owner_sub = ? AND deleted_at IS NULL',
+        'SELECT id FROM players WHERE id = ? AND group_id = ? AND deleted_at IS NULL',
       )
-      .bind(id, owner)
+      .bind(id, groupId)
       .first<{ id: string }>()
     if (!player) return c.json({ error: 'Player not found.' }, 404)
-
-    // Archive, do not erase. The row keeps its creation elo, so every replay
-    // seeds this player exactly as before and nobody else's rating moves. No
-    // event or result is touched, which is why no `recompute` is needed.
+    // Archive, do not erase: the row keeps its creation elo, so every replay
+    // seeds this player exactly as before and nobody else's rating moves.
     const now = Date.now()
-    await db
-      .prepare(
-        'UPDATE players SET deleted_at = ?, updated_at = ? WHERE id = ? AND owner_sub = ?',
-      )
-      .bind(now, now, id, owner)
-      .run()
+    await db.batch([
+      db
+        .prepare(
+          'UPDATE players SET deleted_at = ?, updated_at = ? WHERE id = ? AND group_id = ?',
+        )
+        .bind(now, now, id, groupId),
+      bumpRev(db, groupId, now),
+    ])
     return c.json({ ok: true })
   })
 
-  app.post('/api/players/:id/elo', async (c) => {
+  app.post('/api/groups/:groupId/players/:playerId/elo', async (c) => {
     const body: unknown = await c.req.json().catch(() => null)
     if (!body || typeof body !== 'object' || Array.isArray(body))
       return c.json({ error: 'Nothing to update.' }, 400)
@@ -993,26 +1336,27 @@ export function createApp(authenticate: Authenticate = currentUser) {
         ? record.reason.trim()
         : 'Manual elo edit'
     const db = c.get('db')
-    const owner = c.get('user').sub
-    const id = c.req.param('id')
+    const groupId = c.get('groupId')
+    const id = c.req.param('playerId')
     const player = await db
       .prepare(
-        'SELECT id, elo FROM players WHERE id = ? AND owner_sub = ? AND deleted_at IS NULL',
+        'SELECT id, elo FROM players WHERE id = ? AND group_id = ? AND deleted_at IS NULL',
       )
-      .bind(id, owner)
+      .bind(id, groupId)
       .first<{ id: string; elo: number }>()
     if (!player) return c.json({ error: 'Player not found.' }, 404)
 
-    await makeRoom(db, owner)
-    const position = await nextPosition(db, owner)
+    await makeRoom(db, groupId)
+    const position = await nextPosition(db, groupId)
     const now = Date.now()
     await db
       .prepare(
-        'INSERT INTO rating_events (id, owner_sub, position, kind, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO rating_events (id, owner_sub, group_id, position, kind, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .bind(
         crypto.randomUUID(),
-        owner,
+        c.get('user').sub,
+        groupId,
         position,
         'adjust',
         JSON.stringify({ playerId: id, elo, reason }),
@@ -1020,60 +1364,53 @@ export function createApp(authenticate: Authenticate = currentUser) {
         now,
       )
       .run()
-    const players = await recompute(db, owner, position)
+    const players = await recompute(db, groupId, position)
+    await bumpRev(db, groupId).run()
     return c.json({
       player: players.find((entry) => entry.id === id) ?? null,
       players,
     })
   })
 
-  app.get('/api/matches', async (c) => {
+  // ---- matches ------------------------------------------------------------
+
+  app.get('/api/groups/:groupId/matches', async (c) => {
     const db = c.get('db')
-    const owner = c.get('user').sub
+    const groupId = c.get('groupId')
     const squash = await db
-      .prepare('SELECT removed, squashed_at FROM log_squashes WHERE owner_sub = ?')
-      .bind(owner)
+      .prepare('SELECT removed, squashed_at FROM group_squashes WHERE group_id = ?')
+      .bind(groupId)
       .first<{ removed: number; squashed_at: number }>()
     return c.json({
-      kFactor: await getKFactor(db, owner),
+      kFactor: await getKFactor(db, groupId),
       squashed: squash
         ? { removed: squash.removed, at: squash.squashed_at }
         : null,
-      events: await matchViews(db, owner),
+      events: await matchViews(db, groupId),
     })
   })
 
-  app.post('/api/matches', async (c) => {
+  app.post('/api/groups/:groupId/matches', async (c) => {
     const body: unknown = await c.req.json().catch(() => null)
     const input = readMatchInput(body)
-    if (!input)
-      return c.json(
-        {
-          error: MATCH_ERROR,
-        },
-        400,
-      )
+    if (!input) return c.json({ error: MATCH_ERROR }, 400)
     const db = c.get('db')
-    const owner = c.get('user').sub
+    const groupId = c.get('groupId')
     const tracked = input.teams.flatMap((team) =>
       team.players.filter((player) => player.tracked).map((player) => player.id),
     )
-    if (!(await trackedIdsExist(db, owner, tracked)))
-      return c.json({ error: 'Those players are no longer on your roster.' }, 400)
-    // A full log is compacted, never refused: the oldest half is folded into the
-    // players' anchors, which leaves every rating exactly where it was.
-    if (!(await makeRoom(db, owner)))
+    if (!(await trackedIdsExist(db, groupId, tracked)))
+      return c.json({ error: "Those players are no longer on this group's roster." }, 400)
+    if (!(await makeRoom(db, groupId)))
       return c.json(
         { error: `The log holds ${MAX_EVENTS} events. Delete one to add another.` },
         400,
       )
-    const position = await nextPosition(db, owner)
+    const position = await nextPosition(db, groupId)
     const id = crypto.randomUUID()
     const now = Date.now()
-    const kFactor = await getKFactor(db, owner)
-    // Freeze the K that produced all older history before this event can use a
-    // different one. The row is additive; no event or result is rewritten.
-    await pinLegacyK(db, owner, kFactor)
+    const kFactor = await getKFactor(db, groupId)
+    await pinLegacyK(db, groupId, kFactor)
     const payload: MatchInput = {
       ...input,
       formula: FLAT_K_FORMULA,
@@ -1081,19 +1418,29 @@ export function createApp(authenticate: Authenticate = currentUser) {
     }
     await db
       .prepare(
-        'INSERT INTO rating_events (id, owner_sub, position, kind, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO rating_events (id, owner_sub, group_id, position, kind, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       )
-      .bind(id, owner, position, 'match', JSON.stringify(payload), now, now)
+      .bind(
+        id,
+        c.get('user').sub,
+        groupId,
+        position,
+        'match',
+        JSON.stringify(payload),
+        now,
+        now,
+      )
       .run()
-    const players = await recompute(db, owner, position)
+    const players = await recompute(db, groupId, position)
+    await bumpRev(db, groupId).run()
     return c.json({ match: { id, position }, players }, 201)
   })
 
-  app.patch('/api/matches/:id', async (c) => {
+  app.patch('/api/groups/:groupId/matches/:matchId', async (c) => {
     const db = c.get('db')
-    const owner = c.get('user').sub
-    const id = c.req.param('id')
-    const row = await findEvent(db, owner, id)
+    const groupId = c.get('groupId')
+    const id = c.req.param('matchId')
+    const row = await findEvent(db, groupId, id)
     if (!row || row.kind !== 'match')
       return c.json({ error: 'Match not found.' }, 404)
     const body: unknown = await c.req.json().catch(() => null)
@@ -1114,21 +1461,12 @@ export function createApp(authenticate: Authenticate = currentUser) {
     let from = row.position
     if ('input' in patch) {
       const input = readMatchInput(patch.input)
-      if (!input)
-        return c.json(
-          { error: MATCH_ERROR },
-          400,
-        )
+      if (!input) return c.json({ error: MATCH_ERROR }, 400)
       const tracked = input.teams.flatMap((team) =>
         team.players.filter((player) => player.tracked).map((player) => player.id),
       )
-      // An edit may keep a player who was archived after the match was logged:
-      // their row still seeds the replay, so the lineup stays editable.
-      if (!(await trackedIdsExist(db, owner, tracked, true)))
-        return c.json({ error: 'Those players are no longer on your roster.' }, 400)
-      // Editing never upgrades or re-rates an event: a legacy match stays
-      // legacy (and keeps its frozen K), and a marked match keeps the formula
-      // and K it was rated with.
+      if (!(await trackedIdsExist(db, groupId, tracked, true)))
+        return c.json({ error: "Those players are no longer on this group's roster." }, 400)
       let marker: { formula?: 2 | 3 | 4; k?: number } = {}
       try {
         const existing = JSON.parse(row.payload) as MatchInput
@@ -1143,18 +1481,18 @@ export function createApp(authenticate: Authenticate = currentUser) {
       const nextInput: MatchInput = { ...input, ...marker }
       await db
         .prepare(
-          'UPDATE rating_events SET payload = ?, updated_at = ? WHERE id = ? AND owner_sub = ?',
+          'UPDATE rating_events SET payload = ?, updated_at = ? WHERE id = ? AND group_id = ?',
         )
-        .bind(JSON.stringify(nextInput), Date.now(), id, owner)
+        .bind(JSON.stringify(nextInput), Date.now(), id, groupId)
         .run()
     }
 
     if ('position' in patch) {
       const all = await db
         .prepare(
-          'SELECT id FROM rating_events WHERE owner_sub = ? ORDER BY position ASC, created_at ASC, id ASC',
+          'SELECT id FROM rating_events WHERE group_id = ? ORDER BY position ASC, created_at ASC, id ASC',
         )
-        .bind(owner)
+        .bind(groupId)
         .all<{ id: string }>()
       const ids = all.results.map((entry) => entry.id)
       const current = ids.indexOf(id)
@@ -1170,41 +1508,45 @@ export function createApp(authenticate: Authenticate = currentUser) {
           ids.map((eventId, index) =>
             db
               .prepare(
-                'UPDATE rating_events SET position = ? WHERE id = ? AND owner_sub = ?',
+                'UPDATE rating_events SET position = ? WHERE id = ? AND group_id = ?',
               )
-              .bind(index, eventId, owner),
+              .bind(index, eventId, groupId),
           ),
         )
       }
     }
 
-    const players = await recompute(db, owner, from)
+    const players = await recompute(db, groupId, from)
+    await bumpRev(db, groupId).run()
     return c.json({ ok: true, players })
   })
 
-  app.delete('/api/matches/:id', async (c) => {
+  app.delete('/api/groups/:groupId/matches/:matchId', async (c) => {
     const db = c.get('db')
-    const owner = c.get('user').sub
-    const id = c.req.param('id')
-    const row = await findEvent(db, owner, id)
+    const groupId = c.get('groupId')
+    const id = c.req.param('matchId')
+    const row = await findEvent(db, groupId, id)
     if (!row) return c.json({ error: 'Match not found.' }, 404)
     await db.batch([
       db
-        .prepare('DELETE FROM rating_results WHERE event_id = ? AND owner_sub = ?')
-        .bind(id, owner),
+        .prepare('DELETE FROM rating_results WHERE event_id = ? AND group_id = ?')
+        .bind(id, groupId),
       db
-        .prepare('DELETE FROM rating_events WHERE id = ? AND owner_sub = ?')
-        .bind(id, owner),
+        .prepare('DELETE FROM rating_events WHERE id = ? AND group_id = ?')
+        .bind(id, groupId),
     ])
-    const players = await recompute(db, owner, row.position)
+    const players = await recompute(db, groupId, row.position)
+    await bumpRev(db, groupId).run()
     return c.json({ ok: true, players })
   })
 
-  app.get('/api/settings', async (c) =>
-    c.json({ kFactor: await getKFactor(c.get('db'), c.get('user').sub) }),
+  // ---- settings -----------------------------------------------------------
+
+  app.get('/api/groups/:groupId/settings', async (c) =>
+    c.json({ kFactor: await getKFactor(c.get('db'), c.get('groupId')) }),
   )
 
-  app.put('/api/settings', async (c) => {
+  app.put('/api/groups/:groupId/settings', async (c) => {
     const body: unknown = await c.req.json().catch(() => null)
     if (!body || typeof body !== 'object' || Array.isArray(body))
       return c.json({ error: 'Nothing to update.' }, 400)
@@ -1212,75 +1554,41 @@ export function createApp(authenticate: Authenticate = currentUser) {
     if (!isKFactor(kFactor))
       return c.json({ error: 'K must be a whole number from 8 to 64.' }, 400)
     const db = c.get('db')
-    const owner = c.get('user').sub
-    // Forward-only: freeze the K that produced existing history, then change
-    // the speed of future matches. No replay, no rewritten ratings.
-    await pinLegacyK(db, owner, await getKFactor(db, owner))
-    await db
-      .prepare(
-        'INSERT INTO settings (owner_sub, k_factor, updated_at) VALUES (?, ?, ?) ON CONFLICT(owner_sub) DO UPDATE SET k_factor = excluded.k_factor, updated_at = excluded.updated_at',
-      )
-      .bind(owner, kFactor, Date.now())
-      .run()
-    const players = await loadPlayers(db, owner)
-    return c.json({ kFactor, players })
+    const groupId = c.get('groupId')
+    await pinLegacyK(db, groupId, await getKFactor(db, groupId))
+    await db.batch([
+      db
+        .prepare('UPDATE groups SET k_factor = ?, updated_at = ? WHERE id = ?')
+        .bind(kFactor, Date.now(), groupId),
+      bumpRev(db, groupId),
+    ])
+    const tags = (await loadTags(db, groupId)).map((tag) => tag.id)
+    return c.json({
+      kFactor,
+      players: await loadPlayers(db, groupId, tags),
+    })
   })
 
-  app.get('/api/rounds', async (c) => {
+  // ---- legacy saved rounds ------------------------------------------------
+
+  /**
+   * Saved rounds are per-device now. This read-only route exists so the owner
+   * can import the snapshots that used to live in the account; nothing writes
+   * rounds on the server any more.
+   */
+  app.get('/api/groups/:groupId/rounds', async (c) => {
     const result = await c
       .get('db')
       .prepare(
-        'SELECT id, config, created_at FROM rounds WHERE owner_sub = ? ORDER BY created_at DESC, id DESC LIMIT 60',
+        'SELECT id, config, created_at FROM rounds WHERE group_id = ? ORDER BY created_at DESC, id DESC LIMIT 60',
       )
-      .bind(c.get('user').sub)
+      .bind(c.get('groupId'))
       .all<RoundRow>()
     return c.json({
       rounds: result.results
         .map((row) => mapRound(row))
         .filter((round): round is NonNullable<typeof round> => round !== null),
     })
-  })
-
-  app.post('/api/rounds', async (c) => {
-    const body: unknown = await c.req.json().catch(() => null)
-    const config =
-      body && typeof body === 'object' && !Array.isArray(body)
-        ? readRoundConfig((body as Record<string, unknown>).config)
-        : null
-    if (!config)
-      return c.json({ error: "That round's teams could not be saved." }, 400)
-    const db = c.get('db')
-    const owner = c.get('user').sub
-    const round = {
-      id: crypto.randomUUID(),
-      createdAt: Date.now(),
-      config,
-    }
-    await db
-      .prepare(
-        'INSERT INTO rounds (id, owner_sub, config, created_at) VALUES (?, ?, ?, ?)',
-      )
-      .bind(round.id, owner, JSON.stringify(config), round.createdAt)
-      .run()
-    // Keep the newest rounds only: the list is a memory aid, not an archive.
-    await db
-      .prepare(
-        'DELETE FROM rounds WHERE owner_sub = ? AND id NOT IN (SELECT id FROM rounds WHERE owner_sub = ? ORDER BY created_at DESC, id DESC LIMIT ?)',
-      )
-      .bind(owner, owner, MAX_ROUNDS)
-      .run()
-    return c.json({ round }, 201)
-  })
-
-  app.delete('/api/rounds/:id', async (c) => {
-    const removed = await c
-      .get('db')
-      .prepare('DELETE FROM rounds WHERE id = ? AND owner_sub = ? RETURNING id')
-      .bind(c.req.param('id'), c.get('user').sub)
-      .first()
-    return removed
-      ? c.json({ ok: true })
-      : c.json({ error: 'Round not found.' }, 404)
   })
 
   app.notFound((c) =>
@@ -1295,3 +1603,30 @@ export function createApp(authenticate: Authenticate = currentUser) {
   )
   return app
 }
+
+type InviteRow = { group_id: string; role: string; name: string }
+
+/** Looks up a live invite by the hash of its token. */
+async function loadInvite(
+  db: Database,
+  token: string,
+): Promise<{ groupId: string; name: string; role: 'editor' | 'viewer' } | null> {
+  if (!token || token.length > 128) return null
+  const row = await db
+    .prepare(
+      `SELECT i.group_id, i.role, g.name FROM group_invites i
+       JOIN groups g ON g.id = i.group_id
+       WHERE i.token_hash = ? AND i.revoked_at IS NULL AND g.deleted_at IS NULL
+         AND (i.expires_at IS NULL OR i.expires_at > ?)`,
+    )
+    .bind(await hashInviteToken(token), Date.now())
+    .first<InviteRow>()
+  if (!row) return null
+  return {
+    groupId: row.group_id,
+    name: row.name,
+    role: row.role === 'editor' ? 'editor' : 'viewer',
+  }
+}
+
+export type { MemberRow, GroupRole }

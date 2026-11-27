@@ -6,7 +6,7 @@
  */
 
 import { clampElo } from './elo'
-import { normalizeTags, ROLE_COUNT, roleMask } from './roles'
+import { normalizeTags } from './roles'
 
 export type SolverPlayer = {
   id: string
@@ -51,6 +51,11 @@ export type SolverOptions = {
    * teams. Defaults to true; ignored when nobody has tags.
    */
   spreadRoles?: boolean
+  /**
+   * The group's tag ids, in display order. Coverage is indexed against this
+   * list; without it the ids carried by the players are used.
+   */
+  tagIds?: string[]
 }
 
 export type SolveResult = {
@@ -284,11 +289,16 @@ export function solve(
   playersIn: SolverPlayer[],
   options: SolverOptions,
 ): SolveResult {
+  // A group owns its tag list; without one, the tags present on the players
+  // keep the solver useful (and the legacy role catalogue still resolves).
+  const tagIds = options.tagIds
+    ? [...new Set(options.tagIds)]
+    : [...new Set(playersIn.flatMap((player) => player.tags ?? []))]
   const players = playersIn.map((player) => ({
     id: player.id,
     name: player.name,
     elo: clampElo(player.elo),
-    tags: normalizeTags(player.tags),
+    tags: normalizeTags(player.tags, tagIds),
   }))
   const spreadRoles = options.spreadRoles !== false
   const teamCount = Math.min(8, Math.max(1, Math.round(options.teamCount)))
@@ -339,7 +349,12 @@ export function solve(
   const assign = new Int8Array(playerCount)
   const members: number[][] = Array.from({ length: teamCount }, () => [])
   const sums = new Array<number>(teamCount).fill(0)
-  const tagMasks = players.map((player) => roleMask(player.tags))
+  const tagBit = new Map(
+    tagIds.slice(0, 31).map((id, index) => [id, 1 << index] as const),
+  )
+  const tagMasks = players.map((player) =>
+    player.tags.reduce((mask, tag) => mask | (tagBit.get(tag) ?? 0), 0),
+  )
   const anyTags = spreadRoles && tagMasks.some((mask) => mask !== 0)
   const togetherWith: number[][] = Array.from({ length: playerCount }, () => [])
   const apartFrom: number[][] = Array.from({ length: playerCount }, () => [])
@@ -372,7 +387,7 @@ export function solve(
   // secondary criterion once two splits are equally close on elo.
   const roleGapNow = () => {
     let gap = 0
-    for (let bit = 0; bit < ROLE_COUNT; bit++) {
+    for (let bit = 0; bit < Math.min(tagIds.length, 31); bit++) {
       const mask = 1 << bit
       let total = 0
       let missing = 0
@@ -544,11 +559,16 @@ export function solve(
  * as strong as possible.
  */
 export function suggestSitOuts(
-  players: { id: string; elo: number; sittingOut: boolean }[],
+  players: { id: string; elo: number; sittingOut?: boolean }[],
   teamCount: number,
   sitCounts: Record<string, number>,
+  /** The device's local sit-out set. Without it, `sittingOut` is used. */
+  sitOutIds?: readonly string[],
 ): string[] {
-  const available = players.filter((player) => !player.sittingOut)
+  const benched = sitOutIds ? new Set(sitOutIds) : null
+  const available = players.filter((player) =>
+    benched ? !benched.has(player.id) : !player.sittingOut,
+  )
   const needed = available.length % Math.max(1, teamCount)
   if (needed === 0 || available.length - needed < teamCount) return []
   return [...available]

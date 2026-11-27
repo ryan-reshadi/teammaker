@@ -1,30 +1,34 @@
-import { ROLES } from '../../shared/roles'
+import type { GroupTag } from '../../shared/types'
 
 type Props = {
+  tags: GroupTag[]
   value: string[]
   onChange: (tags: string[]) => void
   label: string
 }
 
-/** Any number of roles can be on at once; a player can be a sniper and an IGL. */
-export function RolePicker({ value, onChange, label }: Props) {
+/** Any number of the group's tags can be on at once. */
+export function RolePicker({ tags, value, onChange, label }: Props) {
   const toggle = (id: string) =>
     onChange(value.includes(id) ? value.filter((tag) => tag !== id) : [...value, id])
 
+  if (tags.length === 0)
+    return <span className="role-empty">This group has no skill tags yet.</span>
+
   return (
     <div className="role-picker" role="group" aria-label={label}>
-      {ROLES.map((role) => {
-        const on = value.includes(role.id)
+      {tags.map((tag) => {
+        const on = value.includes(tag.id)
         return (
           <button
-            key={role.id}
+            key={tag.id}
             type="button"
             className={`role-option${on ? ' on' : ''}`}
             aria-pressed={on}
-            title={role.hint}
-            onClick={() => toggle(role.id)}
+            title={tag.label}
+            onClick={() => toggle(tag.id)}
           >
-            {role.label}
+            {tag.label}
           </button>
         )
       })}

@@ -2,28 +2,29 @@ import { useEffect, useState, type CSSProperties } from 'react'
 import type { PairRule, SolveResult, SolverTeam } from '../../shared/balance'
 import { expectationsFromStrengths } from '../../shared/elo'
 import {
-  normalizeTags,
   roleCoverage,
-  roleLabel,
-  roleShort,
+  tagLabel,
+  tagShort,
 } from '../../shared/roles'
-import type { Player, RoundConfig } from '../../shared/types'
+import type { GroupTag, Player, RoundConfig } from '../../shared/types'
 import { teamColor } from '../colors'
 import { syncPairRules } from '../pairRules'
 import { solveInWorker } from '../solverClient'
 import { describeSolveResult } from '../solvePresentation'
 import { ResultStatus } from './ResultStatus'
 
-function countRoles(players: SolverTeam['players']): Record<string, number> {
+function countRoles(players: SolverTeam['players'], tagIds: string[]): Record<string, number> {
   const counts: Record<string, number> = {}
   for (const player of players)
-    for (const tag of normalizeTags(player.tags))
-      counts[tag] = (counts[tag] ?? 0) + 1
+    for (const tag of player.tags ?? [])
+      if (tagIds.includes(tag)) counts[tag] = (counts[tag] ?? 0) + 1
   return counts
 }
 
 type Props = {
   players: Player[]
+  tags: GroupTag[]
+  sitOutIds: string[]
   teamCount: number
   tolerance: number
   onTeamCount: (value: number) => void
@@ -40,13 +41,15 @@ function TeamColumn({
   index,
   max,
   odds,
+  tags,
 }: {
   team: SolverTeam
   index: number
   max: number
   odds: number
+  tags: GroupTag[]
 }) {
-  const roles = countRoles(team.players)
+  const roles = countRoles(team.players, tags.map((tag) => tag.id))
   return (
     <div
       className="team"
@@ -71,8 +74,8 @@ function TeamColumn({
       {Object.keys(roles).length > 0 && (
         <div className="team-roles">
           {Object.entries(roles).map(([role, count]) => (
-            <span className="team-role" key={role} title={`${roleLabel(role)}${count > 1 ? ` ×${count}` : ''}`}>
-              {roleShort(role)}
+            <span className="team-role" key={role} title={`${tagLabel(tags, role)}${count > 1 ? ` ×${count}` : ''}`}>
+              {tagShort(tags, role)}
               {count > 1 ? count : ''}
             </span>
           ))}
@@ -101,6 +104,8 @@ const toleranceHint = (tolerance: number) =>
 
 export function Build({
   players,
+  tags,
+  sitOutIds,
   teamCount,
   tolerance,
   onTeamCount,
@@ -124,8 +129,9 @@ export function Build({
   const [pairKind, setPairKind] = useState<PairRule['kind']>('together')
   const [pairNotice, setPairNotice] = useState('')
 
-  const available = players.filter((player) => !player.sittingOut)
-  const hasRoles = available.some((player) => player.tags.length > 0)
+  const benched = new Set(sitOutIds)
+  const available = players.filter((player) => !benched.has(player.id))
+  const hasRoles = tags.length > 0 && available.some((player) => player.tags.length > 0)
   const { rules: activePairRules, notice: pairDrop } = syncPairRules(
     pairRules,
     available.map((player) => player.id),
@@ -144,9 +150,9 @@ export function Build({
   const currentSignature = `${teamCount}:${tolerance}:${spreadRoles}:${roleAllowance}:${pairSignature}:${players
     .map(
       (player) =>
-        `${player.id}${player.elo}${player.sittingOut ? 'x' : ''}${player.tags.join('+')}`,
-    )
-    .join('|')}`
+                `${player.id}${player.elo}${benched.has(player.id) ? 'x' : ''}${player.tags.join('+')}`,
+      )
+      .join('|')}`
   const stale = Boolean(result) && signature !== currentSignature
   const arrangements = result?.arrangements ?? []
   const shown = arrangements[index] ?? null
@@ -178,6 +184,7 @@ export function Build({
           spreadRoles: hasRoles ? spreadRoles : false,
           roleAllowance: hasRoles && spreadRoles ? roleAllowance : 0,
           pairRules: activePairRules,
+          tagIds: tags.map((tag) => tag.id),
         },
       )
       setResult(next)
@@ -516,6 +523,7 @@ export function Build({
                   index={position}
                   max={max}
                   odds={odds[position] ?? 0}
+                  tags={tags}
                 />
               ))}
             </div>
@@ -536,7 +544,10 @@ export function Build({
             )}
             {hasRoles &&
               (() => {
-                const { missing } = roleCoverage(shown.teams)
+                const { missing } = roleCoverage(
+                  shown.teams,
+                  tags.map((tag) => tag.id),
+                )
                 if (missing.length === 0)
                   return (
                     <p className="caption role-gaps good">
@@ -544,7 +555,7 @@ export function Build({
                     </p>
                   )
                 const shownGaps = missing.slice(0, 3).map(
-                  (gap) => `Team ${gap.teamIndex + 1} has no ${roleLabel(gap.role)}`,
+                  (gap) => `Team ${gap.teamIndex + 1} has no ${tagLabel(tags, gap.role)}`,
                 )
                 return (
                   <p className="caption role-gaps">
@@ -582,7 +593,7 @@ export function Build({
                       })),
                     })),
                     benchedIds: players
-                      .filter((player) => player.sittingOut)
+                      .filter((player) => benched.has(player.id))
                       .map((player) => player.id),
                   })
                 }
