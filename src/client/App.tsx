@@ -10,11 +10,34 @@ import {
   type RatingEventView,
   type SquashInfo,
 } from '../shared/elo'
-import type { Player, Round, RoundConfig, Session } from '../shared/types'
+import type {
+  GroupDetail,
+  GroupRole,
+  GroupSummary,
+  GroupTag,
+  Player,
+  Round,
+  RoundConfig,
+  Session,
+} from '../shared/types'
 import { Build } from './components/Build'
+import { GroupSettingsDialog, JoinPanel, NewGroupDialog, ShareDialog, TagsDialog } from './components/Groups'
 import { History } from './components/History'
 import { Matches } from './components/Matches'
 import { Roster } from './components/Roster'
+import {
+  importLegacyRounds,
+  readActiveGroupId,
+  readGuestTags,
+  readLocalRounds,
+  readSitOuts,
+  removeLocalRound,
+  saveLocalRound,
+  wereLegacyRoundsImported,
+  writeActiveGroupId,
+  writeGuestTags,
+  writeSitOuts,
+} from './localState'
 import {
   createStore,
   readLocalPlayers,
@@ -23,10 +46,27 @@ import {
   type Store,
 } from './store'
 
-const message = (problem: unknown) =>
-  problem instanceof Error
-    ? problem.message
+const message = (problemValue: unknown) =>
+  problemValue instanceof Error
+    ? problemValue.message
     : 'Something went wrong. Please try again.'
+
+async function api<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, init)
+  const body = (await response.json().catch(() => ({}))) as T & { error?: string }
+  if (!response.ok)
+    throw new Error(body.error || 'The request failed. Please try again.')
+  return body
+}
+
+const json = (method: string, body: unknown): RequestInit => ({
+  method,
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(body),
+})
+
+const roleName = (role: GroupRole) =>
+  role === 'owner' ? 'Owner' : role === 'editor' ? 'Can edit' : 'View only'
 
 /** Keep the elo and its 1-10 mirror consistent while a request is in flight. */
 function applyPatch(player: Player, patch: PlayerPatch): Player {
@@ -41,11 +81,20 @@ function applyPatch(player: Player, patch: PlayerPatch): Player {
   return next
 }
 
+const initialJoinToken = () => {
+  const match = window.location.pathname.match(/^\/join\/(.+)$/)
+  return match ? decodeURIComponent(match[1]!) : null
+}
+
 export function App() {
   const [session, setSession] = useState<Session | null>(null)
-  const [ready, setReady] = useState(false)
+  const [groups, setGroups] = useState<GroupSummary[]>([])
+  const [group, setGroup] = useState<GroupDetail | null>(null)
+  const [activeId, setActiveId] = useState<string | null>(null)
+  const [guestTags, setGuestTags] = useState<GroupTag[]>([])
   const [players, setPlayers] = useState<Player[]>([])
   const [rounds, setRounds] = useState<Round[]>([])
+  const [sitOuts, setSitOuts] = useState<string[]>([])
   const [events, setEvents] = useState<RatingEventView[]>([])
   const [kFactor, setKFactor] = useState(DEFAULT_K_FACTOR)
   const [squashed, setSquashed] = useState<SquashInfo | null>(null)
@@ -53,78 +102,262 @@ export function App() {
   const [tolerance, setTolerance] = useState(300)
   const [error, setError] = useState('')
   const [saved, setSaved] = useState('')
+  const [live, setLive] = useState('')
   const [importable, setImportable] = useState<Player[]>([])
+  const [ready, setReady] = useState(false)
+  const [nonce, setNonce] = useState(0)
+  const [dialog, setDialog] = useState<
+    null | 'new' | 'share' | 'settings' | 'tags'
+  >(null)
+  const [joinToken, setJoinToken] = useState<string | null>(initialJoinToken)
 
   const remote = Boolean(session?.user && session.database)
+
+  const guestGroup = useMemo<GroupDetail | null>(() => {
+    if (!session || remote) return null
+    return {
+      id: 'local',
+      name: 'This device',
+      role: 'owner',
+      kFactor: DEFAULT_K_FACTOR,
+      rev: 0,
+      playerCount: players.length,
+      memberCount: 1,
+      updatedAt: 0,
+      ownerName: 'You',
+      tags: guestTags,
+      members: [],
+    }
+  }, [session, remote, players.length, guestTags])
+  const activeGroup: GroupDetail | null = remote ? group : guestGroup
+  const role: GroupRole = activeGroup?.role ?? 'viewer'
+  const canEdit = role !== 'viewer'
+  const groupBase = activeId ? `/api/groups/${encodeURIComponent(activeId)}` : ''
+
   const store = useMemo<Store | null>(
-    () => (session ? createStore(remote) : null),
-    [session, remote],
+    () => (session && activeId ? createStore(remote, activeId) : null),
+    [session, remote, activeId],
   )
 
   useEffect(() => {
-    let live = true
+    let liveRequest = true
     void (async () => {
       try {
         const response = await fetch('/api/session')
         const current = (await response.json()) as Session
-        if (live) setSession(current)
+        if (liveRequest) setSession(current)
       } catch {
-        if (!live) return
-        // No server session: fall back to this device so the tool still works.
+        if (!liveRequest) return
         setSession({ user: null, mode: 'setup', database: false })
         setError('Could not reach the workspace server — saving on this device.')
       }
     })()
     return () => {
-      live = false
+      liveRequest = false
     }
   }, [])
 
+  const refreshGroups = useCallback(
+    async (preferId?: string): Promise<GroupSummary[]> => {
+      const body = await api<{ groups: GroupSummary[] }>('/api/groups')
+      setGroups(body.groups)
+      const stored = preferId ?? readActiveGroupId()
+      const next =
+        body.groups.find((entry) => entry.id === stored) ?? body.groups[0] ?? null
+      setActiveId(next?.id ?? null)
+      if (!next) {
+        setGroup(null)
+        setReady(true)
+      }
+      return body.groups
+    },
+    [],
+  )
+
   useEffect(() => {
-    if (!store) return
-    let live = true
+    if (!session) return
+    if (!remote) {
+      setGroups([])
+      setActiveId('local')
+      setGroup(null)
+      setGuestTags(readGuestTags())
+      return
+    }
+    let liveRequest = true
     setReady(false)
     void (async () => {
       try {
-        // Load the sections independently: a missing match log must not blank
-        // the roster and rounds, and one failed request should not discard the
-        // sections that answered.
-        const results = await Promise.allSettled([
-          store.players(),
-          store.rounds(),
-          store.matches(),
-        ])
-        if (!live) return
-        const [loadedPlayers, loadedRounds, loadedMatches] = results
-        if (loadedPlayers.status === 'fulfilled')
-          setPlayers(loadedPlayers.value)
-        if (loadedRounds.status === 'fulfilled') setRounds(loadedRounds.value)
-        if (loadedMatches.status === 'fulfilled') {
-          setEvents(loadedMatches.value.events)
-          setKFactor(loadedMatches.value.kFactor)
-          setSquashed(loadedMatches.value.squashed)
+        const list = await api<{ groups: GroupSummary[] }>('/api/groups')
+        if (!liveRequest) return
+        setGroups(list.groups)
+        const stored = readActiveGroupId()
+        const next =
+          list.groups.find((entry) => entry.id === stored) ?? list.groups[0] ?? null
+        setActiveId(next?.id ?? null)
+        if (!next) {
+          setGroup(null)
+          setReady(true)
         }
-        const failure = results.find(
-          (result): result is PromiseRejectedResult => result.status === 'rejected',
-        )
-        if (failure) setError(message(failure.reason))
-      } finally {
-        if (live) setReady(true)
+      } catch (problemValue) {
+        if (liveRequest) {
+          setError(message(problemValue))
+          setReady(true)
+        }
       }
     })()
     return () => {
-      live = false
+      liveRequest = false
     }
-  }, [store])
+  }, [session, remote])
+
+  useEffect(() => {
+    if (!session || !activeId) return
+    let liveRequest = true
+    setReady(false)
+    void (async () => {
+      try {
+        const current = createStore(remote, activeId)
+        const [loadedPlayers, loadedMatches] = await Promise.all([
+          current.players(),
+          current.matches(),
+        ])
+        if (!liveRequest) return
+        setPlayers(loadedPlayers)
+        setEvents(loadedMatches.events)
+        setKFactor(loadedMatches.kFactor)
+        setSquashed(loadedMatches.squashed)
+        setRounds(readLocalRounds(activeId))
+        setSitOuts(readSitOuts(activeId))
+        setError('')
+        if (remote) {
+          const response = await fetch(
+            `/api/groups/${encodeURIComponent(activeId)}`,
+          )
+          const body = (await response.json().catch(() => null)) as {
+            group?: GroupDetail
+            error?: string
+          } | null
+          if (!liveRequest) return
+          if (response.ok && body?.group) {
+            setGroup(body.group)
+            // Snaps saved before groups lived on the account. Bring them into
+            // this browser once; the server copy stays read-only.
+            if (
+              body.group.role === 'owner' &&
+              !wereLegacyRoundsImported(activeId)
+            ) {
+              const legacyResponse = await fetch(
+                `/api/groups/${encodeURIComponent(activeId)}/rounds`,
+                { cache: 'no-store' },
+              )
+              if (legacyResponse.ok) {
+                const legacy = (await legacyResponse.json().catch(() => null)) as {
+                  rounds?: Round[]
+                } | null
+                const merged = importLegacyRounds(activeId, legacy?.rounds ?? [])
+                if (merged && liveRequest) setRounds(merged)
+              }
+            }
+          } else if (body?.error) setError(body.error)
+        }
+      } catch (problemValue) {
+        if (liveRequest) setError(message(problemValue))
+      } finally {
+        if (liveRequest) setReady(true)
+      }
+    })()
+    return () => {
+      liveRequest = false
+    }
+  }, [session, remote, activeId, nonce])
+
+  const reloadGroup = useCallback(async () => {
+    if (!remote || !activeId) return
+    const response = await fetch(`/api/groups/${encodeURIComponent(activeId)}`)
+    const body = (await response.json().catch(() => null)) as {
+      group?: GroupDetail
+    } | null
+    if (response.ok && body?.group) setGroup(body.group)
+  }, [remote, activeId])
+
+  const reloadWorkspace = useCallback(async () => {
+    if (!activeId) return
+    const current = createStore(remote, activeId)
+    const [loadedPlayers, loadedMatches] = await Promise.all([
+      current.players(),
+      current.matches(),
+    ])
+    setPlayers(loadedPlayers)
+    setEvents(loadedMatches.events)
+    setKFactor(loadedMatches.kFactor)
+    setSquashed(loadedMatches.squashed)
+    await reloadGroup()
+  }, [activeId, remote, reloadGroup])
+
+  /** Membership can be revoked while the tab is open; drop what was shared. */
+  const loseAccess = useCallback(async () => {
+    setGroup(null)
+    setPlayers([])
+    setEvents([])
+    setRounds([])
+    setSitOuts([])
+    setLive('')
+    setReady(true)
+    setError('You no longer have access to this group.')
+    await refreshGroups()
+  }, [refreshGroups])
+
+  // Live sync: every content write bumps the group's rev, so one small poll is
+  // enough to know when to reload the authoritative data.
+  useEffect(() => {
+    if (!remote || !activeId || !group) return
+    let cancelled = false
+    let known = group.rev
+    const tick = async () => {
+      if (document.visibilityState !== 'visible') return
+      try {
+        const response = await fetch(
+          `/api/groups/${encodeURIComponent(activeId)}/rev`,
+          { cache: 'no-store' },
+        )
+        if (cancelled) return
+        if (response.status === 404 || response.status === 403) {
+          await loseAccess()
+          return
+        }
+        if (!response.ok) return
+        const body = (await response.json()) as { rev: number }
+        if (body.rev === known) return
+        known = body.rev
+        await reloadWorkspace()
+        if (!cancelled) {
+          setLive('Updated from a teammate')
+          window.setTimeout(() => setLive(''), 4000)
+        }
+      } catch {
+        // A missed poll is harmless; the next one retries.
+      }
+    }
+    const timer = window.setInterval(() => void tick(), 2500)
+    const onFocus = () => void tick()
+    window.addEventListener('focus', onFocus)
+    document.addEventListener('visibilitychange', onFocus)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+      window.removeEventListener('focus', onFocus)
+      document.removeEventListener('visibilitychange', onFocus)
+    }
+  }, [remote, activeId, group, reloadWorkspace, loseAccess])
 
   // A guest who signs in can bring the roster from this device.
   useEffect(() => {
-    if (!remote || !ready || players.length > 0) {
-      setImportable([])
+    if (!remote || !ready || !activeGroup?.id || !canEdit || players.length > 0) {
+      setImportable((previous) => (previous.length === 0 ? previous : []))
       return
     }
     setImportable(readLocalPlayers())
-  }, [remote, ready, players.length])
+  }, [remote, ready, activeGroup?.id, canEdit, players.length])
 
   const refreshMatches = useCallback(async () => {
     if (!store) return
@@ -136,21 +369,21 @@ export function App() {
 
   const addPlayers = useCallback(
     async (drafts: PlayerDraft[]) => {
-      if (!store) return
+      if (!store || !canEdit) return
       try {
         const created = await store.addPlayers(drafts)
         setPlayers((previous) => [...previous, ...created])
         setError('')
-      } catch (problem) {
-        setError(message(problem))
+      } catch (problemValue) {
+        setError(message(problemValue))
       }
     },
-    [store],
+    [store, canEdit],
   )
 
   const updatePlayer = useCallback(
     async (id: string, patch: PlayerPatch) => {
-      if (!store) return
+      if (!store || !canEdit) return
       setPlayers((previous) =>
         previous.map((player) =>
           player.id === id ? applyPatch(player, patch) : player,
@@ -162,37 +395,35 @@ export function App() {
           previous.map((player) => (player.id === id ? next : player)),
         )
         setError('')
-        // A re-rating is a logged adjustment: every later match is replayed.
         if (patch.skill !== undefined || patch.elo !== undefined)
           await refreshMatches()
-      } catch (problem) {
-        setError(message(problem))
+      } catch (problemValue) {
+        setError(message(problemValue))
         setPlayers(await store.players())
       }
     },
-    [store, refreshMatches],
+    [store, canEdit, refreshMatches],
   )
 
   const removePlayer = useCallback(
     async (id: string) => {
-      if (!store) return
+      if (!store || !canEdit) return
       setPlayers((previous) => previous.filter((player) => player.id !== id))
       try {
         await store.removePlayer(id)
         setError('')
-        // Removing a player can also remove their manual rating entries.
         await refreshMatches()
-      } catch (problem) {
-        setError(message(problem))
+      } catch (problemValue) {
+        setError(message(problemValue))
         setPlayers(await store.players())
       }
     },
-    [store, refreshMatches],
+    [store, canEdit, refreshMatches],
   )
 
   const saveMatch = useCallback(
     async (input: MatchInput, id?: string) => {
-      if (!store) return
+      if (!store || !canEdit) return
       const next = id
         ? await store.updateMatch(id, input)
         : await store.addMatch(input)
@@ -200,90 +431,211 @@ export function App() {
       await refreshMatches()
       setError('')
     },
-    [store, refreshMatches],
+    [store, canEdit, refreshMatches],
   )
 
   const removeMatch = useCallback(
     async (id: string) => {
-      if (!store) return
+      if (!store || !canEdit) return
       const next = await store.removeMatch(id)
       setPlayers(next)
       await refreshMatches()
       setError('')
     },
-    [store, refreshMatches],
+    [store, canEdit, refreshMatches],
   )
 
   const moveMatch = useCallback(
     async (id: string, position: number) => {
-      if (!store) return
+      if (!store || !canEdit) return
       const next = await store.moveMatch(id, position)
       setPlayers(next)
       await refreshMatches()
       setError('')
     },
-    [store, refreshMatches],
+    [store, canEdit, refreshMatches],
   )
 
   const changeKFactor = useCallback(
     async (k: number) => {
-      if (!store) return
+      if (!store || !canEdit) return
       const next = await store.setKFactor(k)
       setPlayers(next.players)
       setKFactor(next.kFactor)
       await refreshMatches()
+      await reloadGroup()
       setError('')
     },
-    [store, refreshMatches],
+    [store, canEdit, refreshMatches, reloadGroup],
   )
 
-  const saveRound = useCallback(
-    async (config: RoundConfig) => {
-      if (!store) return
-      try {
-        const round = await store.addRound(config)
-        setRounds((previous) => [round, ...previous].slice(0, 60))
-        setSaved(`Round saved · spread ${config.spread} elo`)
-        window.setTimeout(() => setSaved(''), 3000)
-        setError('')
-      } catch (problem) {
-        setError(message(problem))
-      }
+  const toggleSit = useCallback(
+    (id: string) => {
+      if (!activeId) return
+      setSitOuts((previous) => {
+        const next = previous.includes(id)
+          ? previous.filter((entry) => entry !== id)
+          : [...previous, id]
+        writeSitOuts(activeId, next)
+        return next
+      })
     },
-    [store],
-  )
-
-  const removeRound = useCallback(
-    async (id: string) => {
-      if (!store) return
-      try {
-        await store.removeRound(id)
-        setRounds((previous) => previous.filter((round) => round.id !== id))
-        setError('')
-      } catch (problem) {
-        setError(message(problem))
-      }
-    },
-    [store],
+    [activeId],
   )
 
   const applySitOuts = useCallback(
     (ids: string[]) => {
-      for (const id of ids) void updatePlayer(id, { sittingOut: true })
+      if (!activeId) return
+      setSitOuts((previous) => {
+        const next = [...new Set([...previous, ...ids])]
+        writeSitOuts(activeId, next)
+        return next
+      })
     },
-    [updatePlayer],
+    [activeId],
   )
 
+  const saveRound = useCallback(
+    async (config: RoundConfig) => {
+      if (!activeId) return
+      const round: Round = {
+        id: crypto.randomUUID(),
+        createdAt: Date.now(),
+        config,
+      }
+      const next = saveLocalRound(activeId, round)
+      setRounds(next)
+      setSaved(`Round saved on this device · spread ${config.spread} elo`)
+      window.setTimeout(() => setSaved(''), 3000)
+    },
+    [activeId],
+  )
+
+  const removeRound = useCallback(
+    async (id: string) => {
+      if (!activeId) return
+      setRounds(removeLocalRound(activeId, id))
+    },
+    [activeId],
+  )
+
+  const createGroupAction = async (name: string) => {
+    const body = await api<{ group: GroupSummary }>(
+      '/api/groups',
+      json('POST', { name }),
+    )
+    writeActiveGroupId(body.group.id)
+    await refreshGroups(body.group.id)
+    setNonce((value) => value + 1)
+  }
+
+  const deleteGroupAction = async () => {
+    if (!activeId) return
+    await api(groupBase, { method: 'DELETE' })
+    writeActiveGroupId(null)
+    await refreshGroups()
+    setNonce((value) => value + 1)
+  }
+
+  const saveGroupSettings = (updated: GroupDetail) => {
+    setGroup(updated)
+    setGroups((previous) =>
+      previous.map((entry) =>
+        entry.id === updated.id
+          ? { ...entry, name: updated.name, kFactor: updated.kFactor }
+          : entry,
+      ),
+    )
+  }
+
+  const addTag = async (label: string, short: string) => {
+    if (!remote) {
+      const next = [
+        ...guestTags,
+        { id: crypto.randomUUID(), label, short, sort: guestTags.length },
+      ]
+      setGuestTags(next)
+      writeGuestTags(next)
+      return
+    }
+    await api(`${groupBase}/tags`, json('POST', { label, short }))
+    await reloadGroup()
+  }
+
+  const renameTag = async (id: string, label: string, short: string) => {
+    if (!remote) {
+      const next = guestTags.map((tag) =>
+        tag.id === id ? { ...tag, label, short } : tag,
+      )
+      setGuestTags(next)
+      writeGuestTags(next)
+      return
+    }
+    await api(`${groupBase}/tags/${encodeURIComponent(id)}`, json('PATCH', { label, short }))
+    await reloadGroup()
+  }
+
+  const deleteTag = async (id: string) => {
+    if (!remote) {
+      const nextTags = guestTags.filter((tag) => tag.id !== id)
+      setGuestTags(nextTags)
+      writeGuestTags(nextTags)
+      if (store) {
+        const affected = players.filter((player) => player.tags.includes(id))
+        for (const player of affected)
+          await store.updatePlayer(player.id, {
+            tags: player.tags.filter((tag) => tag !== id),
+          })
+        setPlayers(await store.players())
+      }
+      return
+    }
+    await api(`${groupBase}/tags/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    await reloadWorkspace()
+  }
+
   const importRoster = useCallback(async () => {
+    if (!activeGroup || !canEdit || !store) return
+    const guestList = readGuestTags()
+    let targetTags = activeGroup.tags
+    const byLabel = new Map(
+      targetTags.map((tag) => [tag.label.toLowerCase(), tag.id]),
+    )
+    if (remote) {
+      for (const tag of guestList) {
+        const label = tag.label.toLowerCase()
+        if (byLabel.has(label)) continue
+        const created = await api<{ tag: GroupTag }>(
+          `${groupBase}/tags`,
+          json('POST', { label: tag.label, short: tag.short }),
+        )
+        targetTags = [...targetTags, created.tag]
+        byLabel.set(created.tag.label.toLowerCase(), created.tag.id)
+      }
+      await reloadGroup()
+    }
+    const guestLabel = new Map(guestList.map((tag) => [tag.id, tag.label.toLowerCase()]))
     const drafts = importable.map((player) => ({
       name: player.name,
       username: player.username,
       skill: player.skill,
-      tags: player.tags,
+      tags: player.tags
+        .map((tag) => byLabel.get(guestLabel.get(tag) ?? '') ?? '')
+        .filter(Boolean),
     }))
     setImportable([])
     await addPlayers(drafts)
-  }, [importable, addPlayers])
+  }, [activeGroup, canEdit, store, remote, groupBase, importable, addPlayers, reloadGroup])
+
+  const finishJoin = (groupId: string) => {
+    writeActiveGroupId(groupId)
+    setJoinToken(null)
+    window.history.replaceState({}, '', '/')
+    void refreshGroups(groupId).then(() => {
+      setActiveId(groupId)
+      setNonce((value) => value + 1)
+    })
+  }
 
   const bench = useMemo(
     () => sitOutCounts(events, rounds, players),
@@ -293,15 +645,34 @@ export function App() {
     bench.source === 'matches'
       ? `from ${bench.matchCount} logged ${bench.matchCount === 1 ? 'match' : 'matches'}`
       : bench.source === 'rounds'
-        ? 'from saved rounds'
+        ? 'from saved rounds on this device'
         : 'so far'
   const suggestions = useMemo(
-    () => suggestSitOuts(players, teamCount, bench.counts),
-    [players, teamCount, bench.counts],
+    () => suggestSitOuts(players, teamCount, bench.counts, sitOuts),
+    [players, teamCount, bench.counts, sitOuts],
   )
 
-  const accountName =
-    session?.user?.name || session?.user?.email || 'Signed in'
+  const accountName = session?.user?.name || session?.user?.email || 'Signed in'
+
+  if (!session)
+    return (
+      <div className="app">
+        <main className="page">
+          <p className="empty-state">Loading…</p>
+        </main>
+      </div>
+    )
+
+  if (joinToken)
+    return (
+      <JoinPanel
+        token={joinToken}
+        signedIn={Boolean(session.user)}
+        onDone={finishJoin}
+      />
+    )
+
+  const showWorkspace = Boolean(activeGroup)
 
   return (
     <div className="app">
@@ -315,22 +686,89 @@ export function App() {
           <span className="brand-name">Teammaker</span>
         </div>
         <div className="header-right">
+          {remote ? (
+            <div className="group-switcher">
+              <select
+                className="input group-select"
+                value={activeId ?? ''}
+                aria-label="Open group"
+                onChange={(event) => {
+                  const next = event.target.value
+                  writeActiveGroupId(next)
+                  setActiveId(next)
+                  setGroup(null)
+                  setNonce((value) => value + 1)
+                }}
+              >
+                {groups.length === 0 && <option value="">No groups yet</option>}
+                {groups.map((entry) => (
+                  <option key={entry.id} value={entry.id}>
+                    {entry.name}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                className="quiet"
+                onClick={() => setDialog('new')}
+              >
+                + New
+              </button>
+            </div>
+          ) : (
+            <span className="group-switcher">
+              <span className="group-label">This device</span>
+            </span>
+          )}
+          {activeGroup && <span className="chip">{roleName(role)}</span>}
+          {remote && activeGroup && (
+            <button
+              type="button"
+              className="quiet"
+              onClick={() => setDialog('settings')}
+              disabled={!canEdit}
+              title={
+                canEdit ? 'Group settings' : 'Only editors can change group settings'
+              }
+            >
+              Settings
+            </button>
+          )}
+          {activeGroup && canEdit && (
+            <button
+              type="button"
+              className="quiet"
+              onClick={() => setDialog('tags')}
+            >
+              Tags
+            </button>
+          )}
+          {remote && activeGroup && role === 'owner' && (
+            <button
+              type="button"
+              className="primary share-button"
+              onClick={() => setDialog('share')}
+            >
+              Share
+            </button>
+          )}
+          {live && <span className="chip good">{live}</span>}
           <span className={`chip${remote ? ' good' : ''}`}>
             {remote ? 'Synced' : 'This device only'}
           </span>
           <div className="account">
-            {session?.mode === 'local' ? (
+            {session.mode === 'local' ? (
               <span className="account-name">Local preview</span>
-            ) : session?.user ? (
+            ) : session.user ? (
               <>
                 <span className="account-name">{accountName}</span>
                 <form method="post" action="/auth/freebuff/signout">
                   <button className="link-button">Sign out</button>
                 </form>
               </>
-            ) : session?.mode === 'freebuff' ? (
+            ) : session.mode === 'freebuff' ? (
               <a className="link-button" href="/auth/freebuff/signin?returnTo=%2F">
-                Sign in to sync
+                Sign in to share
               </a>
             ) : null}
           </div>
@@ -341,47 +779,72 @@ export function App() {
         <div className="intro">
           <h1>Balanced teams, every round.</h1>
           <p>
-            Rate everyone once, then let match damage tune their elo. Pick how
-            many teams you need and how close they have to be — we search for
-            the splits that fit and show the most different ones.
+            Shared groups keep the roster, ratings and match history in sync.
+            Anyone with the link can build teams; only editors change elo.
+            <br />
+            Who is sitting out and the teams you generate stay on your device.
           </p>
         </div>
 
-        {session?.mode === 'freebuff' && !session.user && (
+        {session.mode === 'freebuff' && !session.user && (
           <p className="notice">
-            You are working on this device only.{' '}
-            <a href="/auth/freebuff/signin?returnTo=%2F">Sign in</a> to keep the
-            roster, saved rounds and match ratings across sessions.
+            You are working in a device-only group.{' '}
+            <a href="/auth/freebuff/signin?returnTo=%2F">Sign in</a> to create
+            shared groups and sync across devices.
           </p>
         )}
-        {/* An unreachable server sets `error` below, so these notices only
-            describe a server that answered without storage or sign-in. */}
-        {session?.mode === 'setup' && session.database === false && !error && (
+        {session.mode === 'setup' && session.database === false && !error && (
           <p className="notice">
             This deployment has no database configured, so this roster is saved
             in this browser only.
           </p>
         )}
-        {session?.mode === 'setup' && session.database && !error && (
+        {session.mode === 'setup' && session.database && !error && (
           <p className="notice">
             Sign-in is not configured on this deployment, so this roster is
             saved in this browser only.
           </p>
         )}
-        {session?.mode === 'local' && (
+        {session.mode === 'local' && (
           <p className="notice">
             Local preview: everything works here. Published projects use your
             Freebuff account.
           </p>
         )}
-        {importable.length > 0 && (
+
+        {remote && !activeGroup && ready && groups.length === 0 && (
+          <section className="panel empty-group">
+            <h2>Create your first group</h2>
+            <p>
+              A group is one roster with its own elo history and skill tags. Make
+              one per game or friend circle, then share a viewer or editor link.
+            </p>
+            <button
+              type="button"
+              className="primary"
+              onClick={() => setDialog('new')}
+            >
+              New group
+            </button>
+          </section>
+        )}
+
+        {remote && !activeGroup && groups.length > 0 && (
+          <p className="empty-state">Open a group to get started.</p>
+        )}
+
+        {importable.length > 0 && activeGroup && (
           <div className="notice import">
             <span>
               This device has {importable.length} saved{' '}
               {importable.length === 1 ? 'player' : 'players'}.
             </span>
-            <button type="button" className="quiet" onClick={() => void importRoster()}>
-              Import to my account
+            <button
+              type="button"
+              className="quiet"
+              onClick={() => void importRoster()}
+            >
+              Import into “{activeGroup.name}”
             </button>
           </div>
         )}
@@ -391,53 +854,96 @@ export function App() {
           </p>
         )}
 
-        <div className="columns">
-          <div className="column">
-            <Roster
-              players={players}
-              events={events}
-              kFactor={kFactor}
-              suggestions={suggestions}
-              onAdd={addPlayers}
-              onUpdate={updatePlayer}
-              onRemove={removePlayer}
-            />
+        {showWorkspace && activeGroup && (
+          <div className="columns">
+            <div className="column">
+              <Roster
+                players={players}
+                events={events}
+                kFactor={kFactor}
+                tags={activeGroup.tags}
+                sitOutIds={sitOuts}
+                suggestions={suggestions}
+                canEdit={canEdit}
+                onAdd={addPlayers}
+                onUpdate={updatePlayer}
+                onRemove={removePlayer}
+                onToggleSit={toggleSit}
+              />
+            </div>
+            <div className="column">
+              <Build
+                players={players}
+                tags={activeGroup.tags}
+                sitOutIds={sitOuts}
+                teamCount={teamCount}
+                tolerance={tolerance}
+                onTeamCount={setTeamCount}
+                onTolerance={setTolerance}
+                suggestions={suggestions}
+                benchNote={benchNote}
+                onSitOut={applySitOuts}
+                onSaveRound={saveRound}
+                saved={saved}
+              />
+              <History rounds={rounds} onRemove={removeRound} />
+            </div>
           </div>
-          <div className="column">
-            <Build
-              players={players}
-              teamCount={teamCount}
-              tolerance={tolerance}
-              onTeamCount={setTeamCount}
-              onTolerance={setTolerance}
-              suggestions={suggestions}
-              benchNote={benchNote}
-              onSitOut={applySitOuts}
-              onSaveRound={saveRound}
-              saved={saved}
-            />
-            <History rounds={rounds} onRemove={removeRound} />
-          </div>
-        </div>
+        )}
 
-        <Matches
-          players={players}
-          events={events}
-          kFactor={kFactor}
-          squashed={squashed}
-          remote={remote}
-          onSave={saveMatch}
-          onDelete={removeMatch}
-          onMove={moveMatch}
-          onKFactor={changeKFactor}
-          onRefresh={refreshMatches}
-          onScan={(file, onProgress, signal) =>
-            store
-              ? store.scanRivals(file, onProgress, signal)
-              : Promise.reject(new Error('Sign in to import screenshots.'))
-          }
-        />
+        {showWorkspace && (
+          <Matches
+            players={players}
+            events={events}
+            kFactor={kFactor}
+            squashed={squashed}
+            remote={remote}
+            canEdit={canEdit}
+            onSave={saveMatch}
+            onDelete={removeMatch}
+            onMove={moveMatch}
+            onKFactor={changeKFactor}
+            onRefresh={refreshMatches}
+            onScan={(file, onProgress, signal) =>
+              store
+                ? store.scanRivals(file, onProgress, signal)
+                : Promise.reject(new Error('Sign in to import screenshots.'))
+            }
+          />
+        )}
       </main>
+
+      {dialog === 'new' && (
+        <NewGroupDialog
+          onClose={() => setDialog(null)}
+          onCreate={createGroupAction}
+        />
+      )}
+      {dialog === 'share' && group && role === 'owner' && (
+        <ShareDialog
+          group={group}
+          onClose={() => setDialog(null)}
+          onChanged={reloadGroup}
+        />
+      )}
+      {dialog === 'settings' && group && canEdit && (
+        <GroupSettingsDialog
+          group={group}
+          canDelete={role === 'owner'}
+          onClose={() => setDialog(null)}
+          onSaved={saveGroupSettings}
+          onDeleted={deleteGroupAction}
+        />
+      )}
+      {dialog === 'tags' && activeGroup && canEdit && (
+        <TagsDialog
+          tags={activeGroup.tags}
+          onClose={() => setDialog(null)}
+          onAdd={addTag}
+          onRename={renameTag}
+          onDelete={deleteTag}
+        />
+      )}
     </div>
   )
 }

@@ -191,6 +191,7 @@ const runtime = new Miniflare({
 
 let env: Env = {}
 let app: ReturnType<typeof createAppFactory>
+let groupId = ''
 
 const originalFetch = globalThis.fetch
 
@@ -299,11 +300,21 @@ beforeAll(async () => {
   }
   app = createApp(async () => ({ sub: 'browser-test' }))
 
+  const headers = { Origin: ORIGIN, 'Content-Type': 'application/json' }
+  const created = await app.request(
+    `${ORIGIN}/api/groups`,
+    { method: 'POST', headers, body: JSON.stringify({ name: 'Browser test' }) },
+    env,
+  )
+  expect(created.status).toBe(201)
+  const { group } = (await created.json()) as { group: { id: string } }
+  groupId = group.id
+
   const seeded = await app.request(
-    `${ORIGIN}/api/players`,
+    `${ORIGIN}/api/groups/${group.id}/players`,
     {
       method: 'POST',
-      headers: { Origin: ORIGIN, 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({
         players: [
           { name: 'Sniper King', username: 'sniperking', skill: 7 },
@@ -441,7 +452,11 @@ test('upload → scan → review → submit creates a replayed match and refresh
   expect(text()).toContain('Team 1 won')
 
   const log = (await (
-    await app.request(`${ORIGIN}/api/matches`, { headers: { Origin: ORIGIN } }, env)
+    await app.request(
+      `${ORIGIN}/api/groups/${groupId}/matches`,
+      { headers: { Origin: ORIGIN } },
+      env,
+    )
   ).json()) as { events: { label: string; winner: number }[] }
   expect(log.events).toHaveLength(1)
   expect(log.events[0]?.label).toBe('RIVALS Screenshot Import')

@@ -7,11 +7,66 @@ export type Player = {
   skill: number
   /** 100 - 1000. 100 points is one point on the 1-10 scale. */
   elo: number
-  /** Any number of ids from the role catalogue (see shared/roles.ts). */
+  /** Any number of ids from the group's tag list (see shared/types GroupTag). */
   tags: string[]
-  sittingOut: boolean
+  /**
+   * Local only. The API never sends it and never accepts it: who is sitting
+   * out is a per-device decision stored in localStorage.
+   */
+  sittingOut?: boolean
   createdAt: number
   updatedAt: number
+}
+
+export type GroupRole = 'owner' | 'editor' | 'viewer'
+
+/** A group's skill tag. Ids are unique within their group. */
+export type GroupTag = {
+  id: string
+  label: string
+  short: string
+  sort: number
+}
+
+export type GroupSummary = {
+  id: string
+  name: string
+  role: GroupRole
+  kFactor: number
+  /** Bumped by every content write, for the live refresh poll. */
+  rev: number
+  playerCount: number
+  memberCount: number
+  updatedAt: number
+}
+
+export type GroupMember = {
+  /** The member's user sub; the owner is included with role "owner". */
+  id: string
+  name: string
+  role: GroupRole
+  isYou: boolean
+  joinedAt: number
+}
+
+export type GroupDetail = GroupSummary & {
+  ownerName: string
+  tags: GroupTag[]
+  members: GroupMember[]
+}
+
+export type GroupInvite = {
+  id: string
+  role: 'editor' | 'viewer'
+  createdAt: number
+  /** Only present in the response that creates the link. */
+  url?: string
+}
+
+export type GroupInvitePreview = {
+  groupId: string
+  name: string
+  role: 'editor' | 'viewer'
 }
 
 export type RoundPlayer = {

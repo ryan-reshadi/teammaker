@@ -54,15 +54,56 @@ const app = createApp(async (request) => {
   const sub = request.headers.get('test-user')
   return sub ? { sub } : null
 })
-const call = (
+const groupIds = new Map<string, string>()
+
+/** Resolves (and creates) the user's group without going through `call`. */
+async function groupFor(user: string): Promise<string> {
+  const known = groupIds.get(user)
+  if (known) return known
+  const headers = {
+    'test-user': user,
+    Origin: env.APP_ORIGIN!,
+    'Content-Type': 'application/json',
+  }
+  const listed = await app.request(
+    'https://app.example.test/api/groups',
+    { headers },
+    env,
+  )
+  const body = (await listed.json()) as { groups: { id: string }[] }
+  if (body.groups[0]) {
+    groupIds.set(user, body.groups[0].id)
+    return body.groups[0].id
+  }
+  const created = await app.request(
+    'https://app.example.test/api/groups',
+    { method: 'POST', headers, body: JSON.stringify({ name: `Test ${user}` }) },
+    env,
+  )
+  const { group } = (await created.json()) as { group: { id: string } }
+  groupIds.set(user, group.id)
+  return group.id
+}
+
+const groupPath = async (user: string, sub: string) =>
+  `/api/groups/${await groupFor(user)}${sub}`
+
+const DATA_ROUTES = ['/api/players', '/api/matches', '/api/settings', '/api/rounds']
+
+/** Data routes live inside the user's group; the helper scopes them for tests. */
+async function call(
   path: string,
   user?: string,
   method = 'GET',
   body?: unknown,
   origin = env.APP_ORIGIN!,
-) =>
-  app.request(
-    `https://app.example.test${path}`,
+): Promise<Response> {
+  const scopedPath =
+    user && DATA_ROUTES.some((route) => path === route || path.startsWith(`${route}/`))
+      ? `/api/groups/${await groupFor(user)}${path.slice('/api'.length)}`
+      : path
+  return app.request(
+    `https://app.example.test${scopedPath}`,
     {
       method,
       headers: {
@@ -74,6 +115,7 @@ const call = (
     },
     env,
   )
+}
 
 const roundConfig = {
   version: 2,
@@ -101,20 +143,21 @@ const roundConfig = {
 
 test('unauthenticated data routes refuse access and public assets remain public', async () => {
   for (const [path, method] of [
-    ['/api/players', 'GET'],
-    ['/api/players', 'POST'],
-    ['/api/players/absent', 'PATCH'],
-    ['/api/players/absent', 'DELETE'],
-    ['/api/rounds', 'GET'],
-    ['/api/rounds', 'POST'],
-    ['/api/rounds/absent', 'DELETE'],
-    ['/api/matches', 'GET'],
-    ['/api/matches', 'POST'],
-    ['/api/matches/absent', 'PATCH'],
-    ['/api/matches/absent', 'DELETE'],
-    ['/api/players/absent/elo', 'POST'],
-    ['/api/settings', 'GET'],
-    ['/api/settings', 'PUT'],
+    ['/api/groups/missing/players', 'GET'],
+    ['/api/groups/missing/players', 'POST'],
+    ['/api/groups/missing/players/absent', 'PATCH'],
+    ['/api/groups/missing/players/absent', 'DELETE'],
+    ['/api/groups/missing/rounds', 'GET'],
+    ['/api/groups/missing/matches', 'GET'],
+    ['/api/groups/missing/matches', 'POST'],
+    ['/api/groups/missing/matches/absent', 'PATCH'],
+    ['/api/groups/missing/matches/absent', 'DELETE'],
+    ['/api/groups/missing/players/absent/elo', 'POST'],
+    ['/api/groups/missing/settings', 'GET'],
+    ['/api/groups/missing/settings', 'PUT'],
+    ['/api/groups/missing', 'GET'],
+    ['/api/groups/missing', 'DELETE'],
+    ['/api/groups/missing/invites', 'POST'],
   ]) {
     const response = await call(path!, undefined, method)
     expect(response.status).toBe(401)
@@ -138,7 +181,6 @@ test('players can be added in bulk, renamed, rated, benched and removed by their
       name: string
       username: string
       skill: number
-      sittingOut: boolean
     }[]
   }
   expect(players).toHaveLength(2)
@@ -147,7 +189,6 @@ test('players can be added in bulk, renamed, rated, benched and removed by their
     username: 'ada#1',
     skill: 9,
     elo: 900,
-    sittingOut: false,
   })
   expect(players[1]!.username).toBe('')
 
@@ -180,12 +221,17 @@ test('players can be added in bulk, renamed, rated, benched and removed by their
   const patched = await call(`/api/players/${id}`, 'alice', 'PATCH', {
     name: 'Bea',
     skill: 6,
-    sittingOut: true,
   })
   expect(patched.status).toBe(200)
   expect(await patched.json()).toMatchObject({
-    player: { name: 'Bea', username: '', skill: 6, elo: 600, sittingOut: true },
+    player: { name: 'Bea', username: '', skill: 6, elo: 600 },
   })
+
+  // Sitting out is a per-device decision now, never group data.
+  expect(
+    (await call(`/api/players/${id}`, 'alice', 'PATCH', { sittingOut: true }))
+      .status,
+  ).toBe(400)
 
   expect(
     (await call(`/api/players/${id}`, 'bob', 'PATCH', { skill: 2 })).status,
@@ -198,35 +244,55 @@ test('players can be added in bulk, renamed, rated, benched and removed by their
   ).toHaveLength(1)
 })
 
-test('rounds are saved with a snapshot and stay private to their owner', async () => {
-  const created = await call('/api/rounds', 'carol', 'POST', {
-    config: roundConfig,
-  })
-  expect(created.status).toBe(201)
-  const { round } = (await created.json()) as { round: { id: string } }
+test('legacy saved rounds are read-only and belong to one group', async () => {
+  const groupId = await groupFor('carol')
+  const db = env.DB as unknown as Database
+  const config = {
+    ...roundConfig,
+    benchedIds: ['e'],
+  }
+  await db
+    .prepare(
+      'INSERT INTO rounds (id, owner_sub, group_id, config, created_at) VALUES (?, ?, ?, ?, ?)',
+    )
+    .bind('legacy-round', 'carol', groupId, JSON.stringify(config), 1)
+    .run()
+
   const listed = (await (await call('/api/rounds', 'carol')).json()) as {
-    rounds: { config: { teamCount: number; benchedIds: string[] } }[]
+    rounds: { id: string; config: { teamCount: number; benchedIds: string[] } }[]
   }
   expect(listed.rounds).toHaveLength(1)
   expect(listed.rounds[0]!.config.teamCount).toBe(2)
   expect(listed.rounds[0]!.config.benchedIds).toEqual(['e'])
 
+  // Nothing writes saved rounds to the group any more; they are per device.
+  expect(
+    (await call('/api/rounds', 'carol', 'POST', { config })).status,
+  ).toBe(404)
+  expect((await call('/api/rounds/legacy-round', 'carol', 'DELETE')).status).toBe(404)
+
   expect(
     ((await (await call('/api/rounds', 'dave')).json()) as { rounds: unknown[] })
       .rounds,
   ).toHaveLength(0)
-  expect((await call(`/api/rounds/${round.id}`, 'dave', 'DELETE')).status).toBe(
-    404,
-  )
-  expect(
-    (await call(`/api/rounds/${round.id}`, 'carol', 'DELETE')).status,
-  ).toBe(200)
 })
 
-test('role tags round-trip, reject unknown ids and survive in round snapshots', async () => {
+test('a group defines its own tags, and players reject ids from outside it', async () => {
+  const addTag = async (label: string, short: string) => {
+    const response = await call(await groupPath('erin', '/tags'), 'erin', 'POST', {
+      label,
+      short,
+    })
+    expect(response.status).toBe(201)
+    return ((await response.json()) as { tag: { id: string } }).tag.id
+  }
+  const sniper = await addTag('Sniper', 'SN')
+  const igl = await addTag('IGL', 'IG')
+  const anti = await addTag('Anti-push', 'AP')
+
   const created = await call('/api/players', 'erin', 'POST', {
     players: [
-      { name: 'Sniper Sam', skill: 8, tags: ['sniper', 'igl'] },
+      { name: 'Sniper Sam', skill: 8, tags: [sniper, igl] },
       { name: 'Plain Pat', skill: 5 },
     ],
   })
@@ -234,19 +300,21 @@ test('role tags round-trip, reject unknown ids and survive in round snapshots', 
   const { players } = (await created.json()) as {
     players: { id: string; name: string; tags: string[] }[]
   }
-  expect(players[0]!.tags).toEqual(['sniper', 'igl'])
+  expect(players[0]!.tags).toEqual([sniper, igl])
   expect(players[1]!.tags).toEqual([])
 
   const id = players[1]!.id
   const patched = await call(`/api/players/${id}`, 'erin', 'PATCH', {
-    tags: ['antipush', 'sniper', 'sniper'],
+    tags: [anti, sniper, sniper],
   })
   expect(patched.status).toBe(200)
   expect(await patched.json()).toMatchObject({
-    player: { tags: ['sniper', 'antipush'] },
+    player: { tags: [sniper, anti] },
   })
 
-  for (const tags of [['wizard'], 'sniper', [1], ['sniper', 'sniper', 'nope']]) {
+  // Unknown ids, legacy role ids from another catalogue and malformed lists are
+  // rejected rather than silently dropped.
+  for (const tags of [['wizard'], 'sniper', [1], [sniper, sniper, 'nope']]) {
     expect((await call(`/api/players/${id}`, 'erin', 'PATCH', { tags })).status).toBe(
       400,
     )
@@ -255,31 +323,18 @@ test('role tags round-trip, reject unknown ids and survive in round snapshots', 
   const listed = (await (await call('/api/players', 'erin')).json()) as {
     players: { name: string; tags: string[] }[]
   }
-  expect(listed.players[1]!.tags).toEqual(['sniper', 'antipush'])
+  expect(listed.players[1]!.tags).toEqual([sniper, anti])
 
-  const withTags = {
-    ...roundConfig,
-    teams: [
-      {
-        sum: 800,
-        players: [{ id: 'a', name: 'Sam', elo: 800, tags: ['sniper'] }],
-      },
-      {
-        sum: 500,
-        players: [{ id: 'b', name: 'Pat', elo: 500, tags: ['sniper', 'antipush'] }],
-      },
-    ],
-  }
+  // Deleting a tag strips it from every player in the group.
   expect(
-    (await call('/api/rounds', 'erin', 'POST', { config: withTags })).status,
-  ).toBe(201)
-  const rounds = (await (await call('/api/rounds', 'erin')).json()) as {
-    rounds: { config: { teams: { players: { tags: string[] }[] }[] } }[]
+    (
+      await call(await groupPath('erin', `/tags/${anti}`), 'erin', 'DELETE')
+    ).status,
+  ).toBe(200)
+  const stripped = (await (await call('/api/players', 'erin')).json()) as {
+    players: { name: string; tags: string[] }[]
   }
-  expect(rounds.rounds[0]!.config.teams[1]!.players[0]!.tags).toEqual([
-    'sniper',
-    'antipush',
-  ])
+  expect(stripped.players[1]!.tags).toEqual([sniper])
 })
 
 test('rejects foreign and absent origins, spoofing, malformed input and oversized bodies', async () => {
@@ -297,7 +352,7 @@ test('rejects foreign and absent origins, spoofing, malformed input and oversize
   expect(
     (
       await app.request(
-        'https://app.example.test/api/players',
+        'https://app.example.test/api/groups/anything/players',
         { method: 'POST', headers: { 'test-user': 'alice' } },
         env,
       )
@@ -338,25 +393,15 @@ test('rejects foreign and absent origins, spoofing, malformed input and oversize
 
   expect(
     (
-      await call('/api/rounds', 'alice', 'POST', {
-        config: { ...roundConfig, teamCount: 3 },
+      await call(await groupPath('alice', '/tags'), 'alice', 'POST', {
+        label: '',
       })
     ).status,
   ).toBe(400)
   expect(
     (
-      await call('/api/rounds', 'alice', 'POST', {
-        config: { ...roundConfig, tolerance: -1 },
-      })
-    ).status,
-  ).toBe(400)
-  expect(
-    (
-      await call('/api/rounds', 'alice', 'POST', {
-        config: {
-          ...roundConfig,
-          teams: [{ sum: 1, players: [{ id: 'a', name: 'Ada', elo: 9900 }] }],
-        },
+      await call(await groupPath('alice', '/invites'), 'alice', 'POST', {
+        role: 'owner',
       })
     ).status,
   ).toBe(400)
@@ -364,7 +409,7 @@ test('rejects foreign and absent origins, spoofing, malformed input and oversize
 
 test('missing database reports setup and local preview identity never activates on hosted origins', async () => {
   const noDb = await app.request(
-    'https://app.example.test/api/players',
+    'https://app.example.test/api/groups/anything/players',
     { headers: { 'test-user': 'alice' } },
     { ...env, DB: undefined },
   )
@@ -949,6 +994,7 @@ type SeedPlayer = { id: string; name: string; elo: number }
  */
 async function seedLog(user: string, count: number, legacyAt = -1) {
   const db = env.DB as unknown as Database
+  const groupId = await groupFor(user)
   const created = await call('/api/players', user, 'POST', {
     players: [
       { name: 'Ada', skill: 6 },
@@ -1001,11 +1047,12 @@ async function seedLog(user: string, count: number, legacyAt = -1) {
       return [
         db
           .prepare(
-            'INSERT INTO rating_events (id, owner_sub, position, kind, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            'INSERT INTO rating_events (id, owner_sub, group_id, position, kind, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
           )
           .bind(
             event.id,
             user,
+            groupId,
             event.position,
             'match',
             JSON.stringify(event.payload),
@@ -1015,11 +1062,12 @@ async function seedLog(user: string, count: number, legacyAt = -1) {
         ...rows.map(({ player, slot }) =>
           db
             .prepare(
-              'INSERT INTO rating_results (event_id, owner_sub, slot, player_id, name, elo_before, elo_after, delta) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+              'INSERT INTO rating_results (event_id, owner_sub, group_id, slot, player_id, name, elo_before, elo_after, delta) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
             )
             .bind(
               event.id,
               user,
+              groupId,
               slot,
               player.id,
               player.name,
@@ -1072,7 +1120,7 @@ test(
         .squashed,
     ).toBeNull()
 
-    expect(await compactLog(db, user)).toEqual({ removed: 500, kept: 500 })
+    expect(await compactLog(db, await groupFor(user))).toEqual({ removed: 500, kept: 500 })
     expect(await rowCounts(db, user)).toEqual({ events: 500, results: 1500 })
 
     for (const player of await rosterNow(user))
@@ -1149,7 +1197,7 @@ test(
     const user = 'squash-legacy'
     const { db } = await seedLog(user, 300, 200)
     const before = await rosterNow(user)
-    expect(await compactLog(db, user, 100)).toEqual({ removed: 201, kept: 99 })
+    expect(await compactLog(db, await groupFor(user), 100)).toEqual({ removed: 201, kept: 99 })
     for (const player of await rosterNow(user))
       expect(player.elo).toBe(before.find((entry) => entry.id === player.id)!.elo)
 
@@ -1157,7 +1205,7 @@ test(
     const clean = 'squash-legacy-prefix'
     const second = await seedLog(clean, 300, 10)
     const beforeClean = await rosterNow(clean)
-    expect(await compactLog(second.db, clean, 100)).toEqual({
+    expect(await compactLog(second.db, await groupFor(clean), 100)).toEqual({
       removed: 200,
       kept: 100,
     })
@@ -1176,7 +1224,7 @@ test(
     expect((await call(`/api/players/${archived.id}`, user, 'DELETE')).status).toBe(200)
     const before = await rosterNow(user)
 
-    expect(await compactLog(db, user, 100)).toEqual({ removed: 100, kept: 100 })
+    expect(await compactLog(db, await groupFor(user), 100)).toEqual({ removed: 100, kept: 100 })
     for (const player of await rosterNow(user))
       expect(player.elo).toBe(before.find((entry) => entry.id === player.id)!.elo)
 
@@ -1197,7 +1245,7 @@ test(
   async () => {
     const user = 'squash-edit'
     const { db, events, roster } = await seedLog(user, 200)
-    expect(await compactLog(db, user, 100)).toEqual({ removed: 100, kept: 100 })
+    expect(await compactLog(db, await groupFor(user), 100)).toEqual({ removed: 100, kept: 100 })
 
     const log = (await (await call('/api/matches', user)).json()) as {
       events: { id: string }[]

@@ -20,9 +20,59 @@ export type Database = {
 }
 
 const schema = [
+  // A group is the shared workspace: one roster, one rating log, one tag list.
+  `CREATE TABLE IF NOT EXISTS groups (
+    id TEXT PRIMARY KEY,
+    owner_sub TEXT NOT NULL,
+    owner_name TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL,
+    k_factor INTEGER NOT NULL DEFAULT 32,
+    rev INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    deleted_at INTEGER
+  )`,
+  `CREATE INDEX IF NOT EXISTS groups_owner ON groups(owner_sub, deleted_at)`,
+  `CREATE TABLE IF NOT EXISTS group_members (
+    group_id TEXT NOT NULL,
+    user_sub TEXT NOT NULL,
+    role TEXT NOT NULL,
+    display_name TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (group_id, user_sub)
+  )`,
+  `CREATE INDEX IF NOT EXISTS group_members_user ON group_members(user_sub)`,
+  // Only a hash of the invite token is stored, so a database leak cannot be
+  // replayed as a working invite.
+  `CREATE TABLE IF NOT EXISTS group_invites (
+    id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_by_sub TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    revoked_at INTEGER,
+    expires_at INTEGER
+  )`,
+  `CREATE INDEX IF NOT EXISTS group_invites_group ON group_invites(group_id, revoked_at)`,
+  // Tag ids are scoped to their group, which lets a migrated legacy role keep
+  // its id and a custom tag use any short slug.
+  `CREATE TABLE IF NOT EXISTS group_tags (
+    group_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    label TEXT NOT NULL,
+    short TEXT NOT NULL DEFAULT '',
+    sort INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (group_id, id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS group_tags_order ON group_tags(group_id, sort, id)`,
   `CREATE TABLE IF NOT EXISTS players (
     id TEXT PRIMARY KEY,
     owner_sub TEXT NOT NULL,
+    group_id TEXT,
     name TEXT NOT NULL,
     username TEXT NOT NULL DEFAULT '',
     skill INTEGER NOT NULL,
@@ -38,6 +88,7 @@ const schema = [
   `CREATE TABLE IF NOT EXISTS rounds (
     id TEXT PRIMARY KEY,
     owner_sub TEXT NOT NULL,
+    group_id TEXT,
     config TEXT NOT NULL,
     created_at INTEGER NOT NULL
   )`,
@@ -45,6 +96,7 @@ const schema = [
   `CREATE TABLE IF NOT EXISTS rating_events (
     id TEXT PRIMARY KEY,
     owner_sub TEXT NOT NULL,
+    group_id TEXT,
     position INTEGER NOT NULL,
     kind TEXT NOT NULL,
     payload TEXT NOT NULL,
@@ -55,6 +107,7 @@ const schema = [
   `CREATE TABLE IF NOT EXISTS rating_results (
     event_id TEXT NOT NULL,
     owner_sub TEXT NOT NULL,
+    group_id TEXT,
     slot TEXT NOT NULL,
     player_id TEXT,
     name TEXT NOT NULL,
@@ -77,6 +130,12 @@ const schema = [
     legacy_k INTEGER NOT NULL,
     created_at INTEGER NOT NULL
   )`,
+  // Per-group copies of the two account-level bookkeeping rows above.
+  `CREATE TABLE IF NOT EXISTS group_rating_meta (
+    group_id TEXT PRIMARY KEY,
+    legacy_k INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+  )`,
   // What a squash removed, and when. Nothing replays from it: it only lets the
   // match list say why older history is missing.
   `CREATE TABLE IF NOT EXISTS log_squashes (
@@ -84,7 +143,28 @@ const schema = [
     removed INTEGER NOT NULL,
     squashed_at INTEGER NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS group_squashes (
+    group_id TEXT PRIMARY KEY,
+    removed INTEGER NOT NULL,
+    squashed_at INTEGER NOT NULL
+  )`,
 ]
+
+export const REQUIRED_TABLES = [
+  'players',
+  'rounds',
+  'rating_events',
+  'rating_results',
+  'settings',
+  'rating_meta',
+  'log_squashes',
+  'groups',
+  'group_members',
+  'group_invites',
+  'group_tags',
+  'group_rating_meta',
+  'group_squashes',
+] as const
 
 const TAG_COLUMN = `ALTER TABLE players ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'`
 const USERNAME_COLUMN = `ALTER TABLE players ADD COLUMN username TEXT NOT NULL DEFAULT ''`
@@ -95,7 +175,17 @@ const BASE_ELO_COLUMN = `ALTER TABLE players ADD COLUMN base_elo INTEGER NOT NUL
 // roster.
 const DELETED_AT_COLUMN = `ALTER TABLE players ADD COLUMN deleted_at INTEGER`
 
-const TABLES = `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('players', 'rounds', 'rating_events', 'rating_results', 'settings', 'rating_meta', 'log_squashes')`
+const GROUP_COLUMNS = [
+  ['players', 'group_id TEXT'],
+  ['rating_events', 'group_id TEXT'],
+  ['rating_results', 'group_id TEXT'],
+  ['rounds', 'group_id TEXT'],
+  ['log_squashes', 'group_id TEXT'],
+] as const
+
+const TABLES = `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (${REQUIRED_TABLES.map(
+  (table) => `'${table}'`,
+).join(', ')})`
 // A table-valued function rather than `PRAGMA table_info`: it is an ordinary
 // SELECT, so it stays valid on hosts that only proxy plain queries.
 const COLUMNS = "SELECT name FROM pragma_table_info('players')"
@@ -122,17 +212,45 @@ const ensureColumns = async (db: Database): Promise<void> => {
       )
       .run()
   }
+  await ensureGroupColumns(db)
 }
+
+/** Adds the per-group foreign keys to databases created before groups. */
+const ensureGroupColumns = async (db: Database): Promise<void> => {
+  const statements: Statement[] = []
+  for (const [table, column] of GROUP_COLUMNS) {
+    const info = await db
+      .prepare(`SELECT name FROM pragma_table_info('${table}')`)
+      .all<{ name: string }>()
+    if (!info.results.some((entry) => entry.name === 'group_id'))
+      statements.push(db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column}`))
+  }
+  if (statements.length > 0) await db.batch(statements)
+}
+
+/**
+ * Indexes over `group_id` run after the column guard: a database created before
+ * groups keeps its old `players` table, so creating the index in the same batch
+ * as `CREATE TABLE IF NOT EXISTS` would reference a column that only exists
+ * after `ALTER TABLE`.
+ */
+const groupIndexes = [
+  `CREATE INDEX IF NOT EXISTS players_group ON players(group_id, created_at ASC, id ASC)`,
+  `CREATE INDEX IF NOT EXISTS rounds_group ON rounds(group_id, created_at DESC, id DESC)`,
+  `CREATE INDEX IF NOT EXISTS rating_events_group ON rating_events(group_id, position ASC, created_at ASC)`,
+  `CREATE INDEX IF NOT EXISTS rating_results_group ON rating_results(group_id, event_id)`,
+]
 
 const bootstrap = async (db: Database): Promise<void> => {
   // Read before writing: a remote database charges a write transaction (and a
   // lock on the primary) for every CREATE TABLE IF NOT EXISTS, while a local
   // file makes that free. A cold start on a healthy database should only read.
   const tables = await db.prepare(TABLES).all<{ name: string }>()
-  if (tables.results.length < 7) {
+  if (tables.results.length < REQUIRED_TABLES.length) {
     await db.batch(schema.map((sql) => db.prepare(sql)))
   }
   await ensureColumns(db)
+  await db.batch(groupIndexes.map((sql) => db.prepare(sql)))
 }
 
 const ready = new WeakMap<Database, Promise<void>>()
@@ -160,10 +278,13 @@ export function ensureSchema(db: Database): Promise<void> {
   return pending
 }
 
-const parseTags = (value: string | null | undefined): string[] => {
+const parseTags = (
+  value: string | null | undefined,
+  allowed?: readonly string[],
+): string[] => {
   if (!value) return []
   try {
-    return normalizeTags(JSON.parse(value))
+    return normalizeTags(JSON.parse(value), allowed)
   } catch {
     return []
   }
@@ -183,14 +304,16 @@ export type PlayerRow = {
   updated_at: number
 }
 
-export const mapPlayer = (row: PlayerRow): Player => ({
+export const mapPlayer = (
+  row: PlayerRow,
+  allowedTags?: readonly string[],
+): Player => ({
   id: row.id,
   name: row.name,
   username: row.username ?? '',
   skill: skillFromElo(row.elo),
   elo: row.elo,
-  tags: parseTags(row.tags),
-  sittingOut: row.sitting_out === 1,
+  tags: parseTags(row.tags, allowedTags),
   createdAt: row.created_at,
   updatedAt: row.updated_at,
 })

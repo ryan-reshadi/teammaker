@@ -6,9 +6,8 @@ import {
   type MatchInput,
   type MatchesResponse,
 } from '../shared/elo'
-import { normalizeTags } from '../shared/roles'
 import type { RivalsScan } from '../shared/rivals'
-import type { Player, Round, RoundConfig } from '../shared/types'
+import type { Player } from '../shared/types'
 
 export type PlayerDraft = {
   name: string
@@ -17,7 +16,7 @@ export type PlayerDraft = {
   tags?: string[]
 }
 export type PlayerPatch = Partial<
-  Pick<Player, 'name' | 'username' | 'skill' | 'elo' | 'tags' | 'sittingOut'>
+  Pick<Player, 'name' | 'username' | 'skill' | 'elo' | 'tags'>
 >
 
 export type Store = {
@@ -31,9 +30,6 @@ export type Store = {
   moveMatch: (id: string, position: number) => Promise<Player[]>
   removeMatch: (id: string) => Promise<Player[]>
   setKFactor: (kFactor: number) => Promise<{ kFactor: number; players: Player[] }>
-  rounds: () => Promise<Round[]>
-  addRound: (config: RoundConfig) => Promise<Round>
-  removeRound: (id: string) => Promise<void>
   /**
    * Reads a scoreboard screenshot on this device. `onProgress` carries the
    * engine's loading and reading messages straight to the panel.
@@ -45,8 +41,10 @@ export type Store = {
   ) => Promise<RivalsScan>
 }
 
-const PLAYERS_KEY = 'teammaker.players.v1'
-const ROUNDS_KEY = 'teammaker.rounds.v1'
+const LEGACY_PLAYERS_KEY = 'teammaker.players.v1'
+
+const localKey = (groupId: string) =>
+  groupId === 'local' ? LEGACY_PLAYERS_KEY : `teammaker.players.v2:${groupId}`
 
 function readLocal<T>(key: string): T[] {
   try {
@@ -75,9 +73,12 @@ function withElo(player: Player): Player {
   return { ...player, elo, skill: skillFromElo(elo) }
 }
 
+const cleanTags = (value?: string[]): string[] =>
+  [...new Set((value ?? []).filter((tag) => typeof tag === 'string'))]
+
 /** Used by the import prompt when a guest signs in on a device with a roster. */
 export function readLocalPlayers(): Player[] {
-  return readLocal<Player>(PLAYERS_KEY)
+  return readLocal<Player>(LEGACY_PLAYERS_KEY)
     .filter(
       (player) =>
         player &&
@@ -89,20 +90,21 @@ export function readLocalPlayers(): Player[] {
       ...withElo(player),
       username:
         typeof player.username === 'string' ? player.username.slice(0, 32) : '',
-      tags: normalizeTags(player.tags),
+      tags: cleanTags(player.tags),
     }))
 }
 
-function localStore(): Store {
+function localStore(groupId: string): Store {
+  const key = localKey(groupId)
   const unsupported = async (): Promise<never> => {
     throw new Error('Sign in to track matches and tune elo.')
   }
   return {
     async players() {
-      return readLocal<Player>(PLAYERS_KEY).map(withElo)
+      return readLocal<Player>(key).map(withElo)
     },
     async addPlayers(drafts) {
-      const players = readLocal<Player>(PLAYERS_KEY).map(withElo)
+      const players = readLocal<Player>(key).map(withElo)
       const now = Date.now()
       const created = drafts.map((draft, index) => {
         const elo = eloFromSkill(Math.min(10, Math.max(1, Math.round(draft.skill))))
@@ -112,17 +114,16 @@ function localStore(): Store {
           username: (draft.username ?? '').trim().slice(0, 32),
           skill: skillFromElo(elo),
           elo,
-          tags: normalizeTags(draft.tags),
-          sittingOut: false,
+          tags: cleanTags(draft.tags),
           createdAt: now + index,
           updatedAt: now + index,
         }
       })
-      writeLocal(PLAYERS_KEY, [...players, ...created])
+      writeLocal(key, [...players, ...created])
       return created
     },
     async updatePlayer(id, patch) {
-      const players = readLocal<Player>(PLAYERS_KEY).map(withElo)
+      const players = readLocal<Player>(key).map(withElo)
       const current = players.find((player) => player.id === id)
       if (!current) throw new Error('That player is no longer on the roster.')
       const merged = { ...current, ...patch, updatedAt: Date.now() }
@@ -134,20 +135,20 @@ function localStore(): Store {
           : merged,
       )
       writeLocal(
-        PLAYERS_KEY,
+        key,
         players.map((player) => (player.id === id ? next : player)),
       )
       return next
     },
     async removePlayer(id) {
       writeLocal(
-        PLAYERS_KEY,
-        readLocal<Player>(PLAYERS_KEY).filter((player) => player.id !== id),
+        key,
+        readLocal<Player>(key).filter((player) => player.id !== id),
       )
     },
     async matches() {
       // Device-only mode has no match log by design: guests rate by hand and
-      // nothing is replayed. A future local log must return it from here.
+      // nothing is replayed.
       return { kFactor: DEFAULT_K_FACTOR, events: [], squashed: null }
     },
     addMatch: unsupported,
@@ -155,22 +156,10 @@ function localStore(): Store {
     moveMatch: unsupported,
     removeMatch: unsupported,
     setKFactor: unsupported,
-    async rounds() {
-      return readLocal<Round>(ROUNDS_KEY)
+    async scanRivals(file, onProgress, signal) {
+      const { scanScreenshot } = await import('./ocr')
+      return scanScreenshot(file, onProgress, { signal })
     },
-    async addRound(config) {
-      const rounds = readLocal<Round>(ROUNDS_KEY)
-      const round: Round = { id: crypto.randomUUID(), createdAt: Date.now(), config }
-      writeLocal(ROUNDS_KEY, [round, ...rounds].slice(0, 60))
-      return round
-    },
-    async removeRound(id) {
-      writeLocal(
-        ROUNDS_KEY,
-        readLocal<Round>(ROUNDS_KEY).filter((round) => round.id !== id),
-      )
-    },
-    scanRivals: unsupported,
   }
 }
 
@@ -190,64 +179,52 @@ const json = (method: string, body: unknown): RequestInit => ({
   body: JSON.stringify(body),
 })
 
-function remoteStore(): Store {
+function remoteStore(groupId: string): Store {
+  const base = `/api/groups/${encodeURIComponent(groupId)}`
   const playerList = async (url: string, init: RequestInit) =>
     (await request<{ players: Player[] }>(url, init)).players
   return {
     async players() {
-      return playerList('/api/players', { method: 'GET' })
+      return playerList(`${base}/players`, { method: 'GET' })
     },
     async addPlayers(drafts) {
-      return playerList('/api/players', json('POST', { players: drafts }))
+      return playerList(`${base}/players`, json('POST', { players: drafts }))
     },
     async updatePlayer(id, patch) {
       return (
         await request<{ player: Player }>(
-          `/api/players/${id}`,
+          `${base}/players/${encodeURIComponent(id)}`,
           json('PATCH', patch),
         )
       ).player
     },
     async removePlayer(id) {
-      await request(`/api/players/${id}`, { method: 'DELETE' })
+      await request(`${base}/players/${encodeURIComponent(id)}`, { method: 'DELETE' })
     },
     async matches() {
-      return request<MatchesResponse>('/api/matches')
+      return request<MatchesResponse>(`${base}/matches`)
     },
     async addMatch(input) {
-      return playerList('/api/matches', json('POST', input))
+      return playerList(`${base}/matches`, json('POST', input))
     },
     async updateMatch(id, input) {
-      return playerList(`/api/matches/${id}`, json('PATCH', { input }))
+      return playerList(`${base}/matches/${encodeURIComponent(id)}`, json('PATCH', { input }))
     },
     async moveMatch(id, position) {
-      return playerList(`/api/matches/${id}`, json('PATCH', { position }))
+      return playerList(`${base}/matches/${encodeURIComponent(id)}`, json('PATCH', { position }))
     },
     async removeMatch(id) {
-      return playerList(`/api/matches/${id}`, { method: 'DELETE' })
+      return playerList(`${base}/matches/${encodeURIComponent(id)}`, { method: 'DELETE' })
     },
     async setKFactor(kFactor) {
       return request<{ kFactor: number; players: Player[] }>(
-        '/api/settings',
+        `${base}/settings`,
         json('PUT', { kFactor }),
       )
-    },
-    async rounds() {
-      return (await request<{ rounds: Round[] }>('/api/rounds')).rounds
-    },
-    async addRound(config) {
-      return (await request<{ round: Round }>('/api/rounds', json('POST', { config })))
-        .round
-    },
-    async removeRound(id) {
-      await request(`/api/rounds/${id}`, { method: 'DELETE' })
     },
     async scanRivals(file, onProgress, signal) {
       // The whole scan runs in this tab: the screenshot never leaves the device,
       // so there is no service to keep running and no per-import cost.
-      //
-      // Imported on demand: the engine plus its WASM is tens of megabytes, and a
-      // user who never imports a screenshot should never download any of it.
       const { scanScreenshot } = await import('./ocr')
       return scanScreenshot(file, onProgress, { signal })
     },
@@ -255,6 +232,6 @@ function remoteStore(): Store {
 }
 
 export { DEFAULT_K_FACTOR }
-export function createStore(remote: boolean): Store {
-  return remote ? remoteStore() : localStore()
+export function createStore(remote: boolean, groupId = 'local'): Store {
+  return remote ? remoteStore(groupId) : localStore(groupId)
 }
