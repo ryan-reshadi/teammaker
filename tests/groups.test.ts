@@ -299,6 +299,44 @@ test('non-members see nothing, and groups stay isolated from each other', async 
   expect(firstSettings.kFactor).toBe(32)
 })
 
+test('a removed member gets a 404 everywhere while the owner keeps access', async () => {
+  const group = await createGroup('cut-owner')
+  const seeded = await call(base(group, '/players'), 'cut-owner', 'POST', {
+    players: [{ name: 'Ada', skill: 5 }],
+  })
+  expect(seeded.status).toBe(201)
+  const viewer = await invite(group, 'cut-owner', 'viewer')
+  expect(
+    (await call(`/api/invites/${viewer.token}/accept`, 'cut-member', 'POST')).status,
+  ).toBe(200)
+  expect((await call(base(group, '/players'), 'cut-member')).status).toBe(200)
+
+  expect(
+    (await call(base(group, '/members/cut-member'), 'cut-owner', 'DELETE')).status,
+  ).toBe(200)
+
+  // A non-member learns nothing: reads, the live poll and writes are all 404.
+  for (const path of [
+    base(group),
+    base(group, '/players'),
+    base(group, '/matches'),
+    base(group, '/rev'),
+  ])
+    expect((await call(path, 'cut-member')).status).toBe(404)
+  expect(
+    (await call(base(group, '/players'), 'cut-member', 'POST', { name: 'X', skill: 5 }))
+      .status,
+  ).toBe(404)
+  const listed = (await (await call('/api/groups', 'cut-member')).json()) as {
+    groups: { id: string }[]
+  }
+  expect(listed.groups.map((entry) => entry.id)).not.toContain(group.id)
+
+  // The group itself keeps working for the owner.
+  expect((await call(base(group), 'cut-owner')).status).toBe(200)
+  expect((await call(base(group, '/players'), 'cut-owner')).status).toBe(200)
+})
+
 test('tags belong to their group and deleting one strips it from players', async () => {
   const group = await createGroup('tag-owner')
   const sniper = await addTag(group, 'tag-owner', 'Sniper', 'SN')

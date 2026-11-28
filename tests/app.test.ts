@@ -838,6 +838,12 @@ test('deleting a player archives them and never moves anyone elo', async () => {
     position: number
     label?: string
     winner?: number
+    playerId?: string | null
+    name?: string
+    reason?: string
+    eloBefore?: number
+    eloAfter?: number
+    delta?: number
     teams?: { players: LogPlayer[] }[]
   }
   type Log = { events: LogEvent[] }
@@ -895,23 +901,45 @@ test('deleting a player archives them and never moves anyone elo', async () => {
         players: RosterPlayer[]
       }
     ).players
+  // Every stored rating row, match and manual adjustment alike: archiving a
+  // player must not drop either kind from the log.
   const snapshot = (log: Log) =>
     log.events.map((event) => ({
       id: event.id,
       position: event.position,
-      players: (event.teams ?? []).flatMap((team) =>
-        team.players.map((player) => ({
-          id: player.id,
-          name: player.name,
-          eloBefore: player.eloBefore,
-          eloAfter: player.eloAfter,
-          delta: player.delta,
-        })),
-      ),
+      rows:
+        event.kind === 'adjust'
+          ? [
+              {
+                id: event.playerId ?? null,
+                name: event.name ?? '',
+                eloBefore: event.eloBefore,
+                eloAfter: event.eloAfter,
+                delta: event.delta,
+              },
+            ]
+          : (event.teams ?? []).flatMap((team) =>
+              team.players.map((player) => ({
+                id: player.id,
+                name: player.name,
+                eloBefore: player.eloBefore,
+                eloAfter: player.eloAfter,
+                delta: player.delta,
+              })),
+            ),
     }))
 
+  // A manual adjustment is a log row of its own, and it holds the rating Cy is
+  // last recorded with, so it has to survive the archive replay too.
+  const adjusted = await call(`/api/players/${cy!.id}/elo`, 'ivy', 'POST', {
+    elo: 825,
+    reason: 'Warm-up correction',
+  })
+  expect(adjusted.status).toBe(200)
+
   const logBefore = await listed()
-  expect(logBefore.events).toHaveLength(2)
+  expect(logBefore.events).toHaveLength(3)
+  const adjustmentBefore = logBefore.events.find((event) => event.kind === 'adjust')!
   const elosBefore = new Map(
     (await rosterNow()).map((player) => [player.name, player.elo]),
   )
@@ -947,6 +975,17 @@ test('deleting a player archives them and never moves anyone elo', async () => {
       ),
     ),
   ).toHaveLength(1)
+
+  // Cy's manual adjustment is still theirs, with the same stored ratings.
+  const adjustmentAfter = logAfter.events.find((event) => event.kind === 'adjust')!
+  expect(adjustmentAfter).toMatchObject({
+    id: adjustmentBefore.id,
+    playerId: cy!.id,
+    reason: 'Warm-up correction',
+    eloBefore: adjustmentBefore.eloBefore,
+    eloAfter: 825,
+    delta: adjustmentBefore.delta,
+  })
   for (const player of await rosterNow())
     expect(player.elo).toBe(elosBefore.get(player.name)!)
 
@@ -1148,6 +1187,30 @@ test(
     expect(log.squashed?.removed).toBe(500)
     expect(log.squashed?.at).toBeGreaterThan(0)
     expect(before).toHaveLength(3)
+  },
+  60_000,
+)
+
+test(
+  'a second squash adds to what the match list says is missing',
+  async () => {
+    const user = 'squash-note'
+    const { db } = await seedLog(user, 300)
+    const groupId = await groupFor(user)
+
+    expect(await compactLog(db, groupId, 200)).toEqual({ removed: 100, kept: 200 })
+    const first = (await (await call('/api/matches', user)).json()) as {
+      squashed: { removed: number; at: number } | null
+    }
+    expect(first.squashed?.removed).toBe(100)
+
+    expect(await compactLog(db, groupId, 100)).toEqual({ removed: 100, kept: 100 })
+    const second = (await (await call('/api/matches', user)).json()) as {
+      squashed: { removed: number; at: number } | null
+    }
+    // The note accounts for everything that has gone, not just the latest cut.
+    expect(second.squashed?.removed).toBe(200)
+    expect(second.squashed?.at).toBeGreaterThanOrEqual(first.squashed!.at)
   },
   60_000,
 )

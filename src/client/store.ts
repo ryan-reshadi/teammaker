@@ -95,6 +95,18 @@ export function readLocalPlayers(): Player[] {
     }))
 }
 
+/**
+ * The scan runs in this tab for every store, guest or signed in: the screenshot
+ * never leaves the device, so there is no service to keep running and no
+ * per-import cost.
+ */
+const scanRivals: Store['scanRivals'] = async (file, onProgress, signal) => {
+  // Imported on demand: the engine plus its WASM is tens of megabytes, and a
+  // user who never imports a screenshot should never download any of it.
+  const { scanScreenshot } = await import('./ocr')
+  return scanScreenshot(file, onProgress, { signal })
+}
+
 function localStore(groupId: string): Store {
   const key = localKey(groupId)
   const unsupported = async (): Promise<never> => {
@@ -127,8 +139,6 @@ function localStore(groupId: string): Store {
       const players = readLocal<Player>(key).map(withElo)
       const current = players.find((player) => player.id === id)
       if (!current) throw new Error('That player is no longer on the roster.')
-      // The 1-10 control sends a skill-only patch, and elo is the stored
-      // rating: convert it the way the remote route does. An explicit elo wins.
       const next: Player = {
         ...current,
         ...patch,
@@ -157,10 +167,7 @@ function localStore(groupId: string): Store {
     moveMatch: unsupported,
     removeMatch: unsupported,
     setKFactor: unsupported,
-    async scanRivals(file, onProgress, signal) {
-      const { scanScreenshot } = await import('./ocr')
-      return scanScreenshot(file, onProgress, { signal })
-    },
+    scanRivals,
   }
 }
 
@@ -223,12 +230,7 @@ function remoteStore(groupId: string): Store {
         json('PUT', { kFactor }),
       )
     },
-    async scanRivals(file, onProgress, signal) {
-      // The whole scan runs in this tab: the screenshot never leaves the device,
-      // so there is no service to keep running and no per-import cost.
-      const { scanScreenshot } = await import('./ocr')
-      return scanScreenshot(file, onProgress, { signal })
-    },
+    scanRivals,
   }
 }
 

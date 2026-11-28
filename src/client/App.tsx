@@ -5,6 +5,7 @@ import {
   DEFAULT_K_FACTOR,
   ratingFromPatch,
   type MatchInput,
+  type MatchesResponse,
   type RatingEventView,
   type SquashInfo,
 } from '../shared/elo'
@@ -71,6 +72,23 @@ function applyPatch(player: Player, patch: PlayerPatch): Player {
   return { ...player, ...patch, ...ratingFromPatch(player, patch) }
 }
 
+/**
+ * Load the two store sections together. One that fails must not blank the one
+ * that answered, so each is applied on its own and one message covers the rest.
+ */
+async function loadWorkspace(store: Store) {
+  const [players, matches] = await Promise.allSettled([
+    store.players(),
+    store.matches(),
+  ])
+  const failed = [players, matches].find((result) => result.status === 'rejected')
+  return {
+    players: players.status === 'fulfilled' ? players.value : null,
+    matches: matches.status === 'fulfilled' ? matches.value : null,
+    failure: failed?.status === 'rejected' ? message(failed.reason) : null,
+  }
+}
+
 const initialJoinToken = () => {
   const match = window.location.pathname.match(/^\/join\/(.+)$/)
   return match ? decodeURIComponent(match[1]!) : null
@@ -91,6 +109,7 @@ export function App() {
   const [teamCount, setTeamCount] = useState(3)
   const [tolerance, setTolerance] = useState(300)
   const [error, setError] = useState('')
+  const [offline, setOffline] = useState(false)
   const [saved, setSaved] = useState('')
   const [live, setLive] = useState('')
   const [importable, setImportable] = useState<Player[]>([])
@@ -129,6 +148,13 @@ export function App() {
     [session, remote, activeId],
   )
 
+  /** The match log arrives whole: every response carries all three fields. */
+  const applyMatches = useCallback((loaded: MatchesResponse) => {
+    setEvents(loaded.events)
+    setKFactor(loaded.kFactor)
+    setSquashed(loaded.squashed)
+  }, [])
+
   useEffect(() => {
     let liveRequest = true
     void (async () => {
@@ -139,7 +165,7 @@ export function App() {
       } catch {
         if (!liveRequest) return
         setSession({ user: null, mode: 'setup', database: false })
-        setError('Could not reach the workspace server — saving on this device.')
+        setOffline(true)
       }
     })()
     return () => {
@@ -207,18 +233,13 @@ export function App() {
     void (async () => {
       try {
         const current = createStore(remote, activeId)
-        const [loadedPlayers, loadedMatches] = await Promise.all([
-          current.players(),
-          current.matches(),
-        ])
+        const loaded = await loadWorkspace(current)
         if (!liveRequest) return
-        setPlayers(loadedPlayers)
-        setEvents(loadedMatches.events)
-        setKFactor(loadedMatches.kFactor)
-        setSquashed(loadedMatches.squashed)
+        if (loaded.players) setPlayers(loaded.players)
+        if (loaded.matches) applyMatches(loaded.matches)
         setRounds(readLocalRounds(activeId))
         setSitOuts(readSitOuts(activeId))
-        setError('')
+        setError(loaded.failure ?? '')
         if (remote) {
           const response = await fetch(
             `/api/groups/${encodeURIComponent(activeId)}`,
@@ -259,7 +280,7 @@ export function App() {
     return () => {
       liveRequest = false
     }
-  }, [session, remote, activeId, nonce])
+  }, [session, remote, activeId, nonce, applyMatches])
 
   const reloadGroup = useCallback(async () => {
     if (!remote || !activeId) return
@@ -272,17 +293,13 @@ export function App() {
 
   const reloadWorkspace = useCallback(async () => {
     if (!activeId) return
-    const current = createStore(remote, activeId)
-    const [loadedPlayers, loadedMatches] = await Promise.all([
-      current.players(),
-      current.matches(),
-    ])
-    setPlayers(loadedPlayers)
-    setEvents(loadedMatches.events)
-    setKFactor(loadedMatches.kFactor)
-    setSquashed(loadedMatches.squashed)
+    const loaded = await loadWorkspace(createStore(remote, activeId))
+    // Live sync stays all-or-nothing: never mix a new roster with an old log.
+    if (loaded.failure) return
+    if (loaded.players) setPlayers(loaded.players)
+    if (loaded.matches) applyMatches(loaded.matches)
     await reloadGroup()
-  }, [activeId, remote, reloadGroup])
+  }, [activeId, remote, reloadGroup, applyMatches])
 
   /** Membership can be revoked while the tab is open; drop what was shared. */
   const loseAccess = useCallback(async () => {
@@ -351,11 +368,8 @@ export function App() {
 
   const refreshMatches = useCallback(async () => {
     if (!store) return
-    const loaded = await store.matches()
-    setEvents(loaded.events)
-    setKFactor(loaded.kFactor)
-    setSquashed(loaded.squashed)
-  }, [store])
+    applyMatches(await store.matches())
+  }, [store, applyMatches])
 
   const addPlayers = useCallback(
     async (drafts: PlayerDraft[]) => {
@@ -783,13 +797,22 @@ export function App() {
             shared groups and sync across devices.
           </p>
         )}
-        {session.mode === 'setup' && session.database === false && !error && (
+        {offline && (
           <p className="notice">
-            This deployment has no database configured, so this roster is saved
-            in this browser only.
+            Could not reach the workspace server, so this roster is saved in
+            this browser only.
           </p>
         )}
-        {session.mode === 'setup' && session.database && !error && (
+        {session.mode === 'setup' &&
+          session.database === false &&
+          !error &&
+          !offline && (
+            <p className="notice">
+              This deployment has no database configured, so this roster is
+              saved in this browser only.
+            </p>
+          )}
+        {session.mode === 'setup' && session.database && !error && !offline && (
           <p className="notice">
             Sign-in is not configured on this deployment, so this roster is
             saved in this browser only.
