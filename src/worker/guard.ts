@@ -85,9 +85,13 @@ export function groupGuard(
       const after = c.req.path.replace(/^\/api\/groups\/[^/]+/, '')
       const sharing = after.startsWith('/invites') || after.startsWith('/members')
       const deleting = c.req.method === 'DELETE' && after === ''
+      // Filing or cancelling your own player request is a member action, not an
+      // editorial one: a viewer who just joined may ask to be connected. The
+      // route still refuses approve/dismiss unless the caller can edit.
+      const requesting = after.startsWith('/player-requests')
       if ((sharing || deleting) && role !== 'owner')
         return c.json({ error: 'Only the group owner can do that.' }, 403)
-      if (!sharing && !deleting && role === 'viewer')
+      if (!sharing && !deleting && !requesting && role === 'viewer')
         return c.json({ error: 'You have view-only access to this group.' }, 403)
     }
 

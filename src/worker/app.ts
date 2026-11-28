@@ -24,7 +24,7 @@ import {
   type ReplayResult,
 } from '../shared/elo'
 import { normalizeTags, ROLE_IDS } from '../shared/roles'
-import type { GroupRole, Player } from '../shared/types'
+import type { GroupPlayerRequest, GroupRole, Player } from '../shared/types'
 import { appOrigin, currentUser, isLocalPreview } from './auth'
 import {
   ensureSchema,
@@ -37,8 +37,10 @@ import {
   type Statement,
 } from './db'
 import {
+  MAX_EMAILS_PER_PLAYER,
   MAX_GROUPS,
   MAX_MEMBERS,
+  MAX_REQUEST_NOTE,
   MAX_TAGS,
   bumpRev,
   countOwnedGroups,
@@ -50,7 +52,9 @@ import {
   loadGroupDetail,
   loadTags,
   newInviteToken,
+  readEmail,
   readGroupName,
+  readNote,
   readTagLabel,
   readTagShort,
   roleFor,
@@ -108,6 +112,87 @@ const readTags = (
 
 const readRole = (value: unknown): 'editor' | 'viewer' | null =>
   value === 'editor' || value === 'viewer' ? value : null
+
+/** A claim on a roster player, or a proposal to add one. */
+type Claim =
+  | { kind: 'link'; playerId: string }
+  | { kind: 'create'; name: string; username: string }
+
+function readClaim(value: unknown): Claim | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const record = value as Record<string, unknown>
+  if (record.kind === 'link') {
+    if (Object.keys(record).some((key) => key !== 'kind' && key !== 'playerId'))
+      return null
+    if (
+      typeof record.playerId !== 'string' ||
+      record.playerId.length < 1 ||
+      record.playerId.length > 64
+    )
+      return null
+    return { kind: 'link', playerId: record.playerId }
+  }
+  if (record.kind === 'create') {
+    if (
+      Object.keys(record).some(
+        (key) => key !== 'kind' && key !== 'name' && key !== 'username',
+      )
+    )
+      return null
+    const name = readName(record.name)
+    const username = readUsername(record.username)
+    // A new player arrives with both details and no elo field, so nobody can
+    // seed themselves a rating.
+    if (!name || !username) return null
+    return { kind: 'create', name, username }
+  }
+  return null
+}
+
+type ClaimDraft = { claim: Claim; note: string; email: string }
+
+/**
+ * The account's own email is attached automatically. Only an account without
+ * one may supply an address, so a form cannot file a request for somebody
+ * else's mailbox.
+ */
+function readClaimDraft(
+  body: Record<string, unknown>,
+  user: { email?: string },
+): { draft: ClaimDraft | null; error: string } {
+  if (
+    Object.keys(body).some(
+      (key) => key !== 'claim' && key !== 'note' && key !== 'email',
+    )
+  )
+    return { draft: null, error: 'Choose a player to connect.' }
+  const claim = readClaim(body.claim)
+  if (!claim)
+    return {
+      draft: null,
+      error:
+        'Choose a player from the roster, or add one with a name and username.',
+    }
+  const note = readNote(body.note)
+  if (note === null)
+    return {
+      draft: null,
+      error: `A note is up to ${MAX_REQUEST_NOTE} characters.`,
+    }
+  const accountEmail =
+    typeof user.email === 'string' && user.email.trim() ? user.email : null
+  const email = accountEmail ? readEmail(accountEmail) : readEmail(body.email)
+  if (!email)
+    return {
+      draft: null,
+      error: accountEmail
+        ? 'Your account email cannot be used for this request.'
+        : typeof body.email === 'string' && body.email.trim()
+          ? 'That does not look like an email address.'
+          : 'Enter the email to connect before sending the request.',
+    }
+  return { draft: { claim, note, email }, error: '' }
+}
 
 type Draft = { name: string; username: string; skill: number; tags: string[] }
 
@@ -339,7 +424,251 @@ async function loadPlayers(
     )
     .bind(groupId)
     .all<PlayerRow>()
-  return result.results.map((row) => mapPlayer(row, allowedTags))
+  const emails = await loadEmailMap(db, groupId)
+  return result.results.map((row) =>
+    mapPlayer(row, allowedTags, emails.get(row.id) ?? []),
+  )
+}
+
+type EmailRow = { player_id: string; email: string }
+
+async function loadPlayerEmailList(
+  db: Database,
+  groupId: string,
+  playerId: string,
+): Promise<string[]> {
+  const rows = await db
+    .prepare(
+      'SELECT email FROM group_player_emails WHERE group_id = ? AND player_id = ? ORDER BY email ASC',
+    )
+    .bind(groupId, playerId)
+    .all<{ email: string }>()
+  return rows.results.map((row) => row.email)
+}
+
+/** Every player's connected emails, in one query for the whole roster. */
+async function loadEmailMap(
+  db: Database,
+  groupId: string,
+): Promise<Map<string, string[]>> {
+  const rows = await db
+    .prepare(
+      'SELECT player_id, email FROM group_player_emails WHERE group_id = ? ORDER BY email ASC',
+    )
+    .bind(groupId)
+    .all<EmailRow>()
+  const map = new Map<string, string[]>()
+  for (const row of rows.results) {
+    const emails = map.get(row.player_id)
+    if (emails) emails.push(row.email)
+    else map.set(row.player_id, [row.email])
+  }
+  return map
+}
+
+const linkEmailStatement = (
+  db: Database,
+  groupId: string,
+  playerId: string,
+  email: string,
+  sub: string,
+  at: number,
+): Statement =>
+  db
+    .prepare(
+      'INSERT INTO group_player_emails (group_id, player_id, email, added_by_sub, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(group_id, player_id, email) DO NOTHING',
+    )
+    .bind(groupId, playerId, email, sub, at)
+
+type RequestRow = {
+  id: string
+  requester_sub: string
+  requester_name: string
+  email: string
+  kind: string
+  player_id: string | null
+  name: string | null
+  username: string | null
+  note: string
+  created_at: number
+  player_name?: string | null
+}
+
+const mapRequest = (row: RequestRow, sub: string): GroupPlayerRequest => ({
+  id: row.id,
+  kind: row.kind === 'create' ? 'create' : 'link',
+  playerId: row.player_id,
+  playerName: row.player_name ?? null,
+  name: row.name,
+  username: row.username,
+  email: row.email,
+  note: row.note,
+  requesterName: row.requester_name || 'Member',
+  isYou: row.requester_sub === sub,
+  createdAt: row.created_at,
+})
+
+type FiledRequest =
+  | { ok: true; id: string; statement: Statement }
+  | { ok: false; error: string; status: 400 | 404 | 409 }
+
+/**
+ * Validates one pending request and prepares its insert. The caller writes it
+ * with its own batch, so joining a group and asking for a player happen
+ * together.
+ */
+async function filePlayerRequest(
+  db: Database,
+  groupId: string,
+  user: { sub: string; name?: string },
+  draft: ClaimDraft,
+  at: number,
+): Promise<FiledRequest> {
+  if (draft.claim.kind === 'link') {
+    const player = await db
+      .prepare(
+        'SELECT id FROM players WHERE id = ? AND group_id = ? AND deleted_at IS NULL',
+      )
+      .bind(draft.claim.playerId, groupId)
+      .first<{ id: string }>()
+    if (!player)
+      return {
+        ok: false,
+        error: 'That player is no longer on this roster.',
+        status: 404,
+      }
+    const linked = await db
+      .prepare(
+        'SELECT 1 AS found FROM group_player_emails WHERE group_id = ? AND player_id = ? AND email = ?',
+      )
+      .bind(groupId, draft.claim.playerId, draft.email)
+      .first<{ found: number }>()
+    if (linked)
+      return {
+        ok: false,
+        error: 'That email is already connected to this player.',
+        status: 409,
+      }
+  }
+  const pending = await db
+    .prepare(
+      "SELECT id FROM group_player_requests WHERE group_id = ? AND requester_sub = ? AND status = 'pending'",
+    )
+    .bind(groupId, user.sub)
+    .first<{ id: string }>()
+  if (pending)
+    return {
+      ok: false,
+      error: 'You already have a player request waiting for an editor.',
+      status: 409,
+    }
+  const id = crypto.randomUUID()
+  return {
+    ok: true,
+    id,
+    statement: db
+      .prepare(
+        `INSERT INTO group_player_requests (id, group_id, requester_sub, requester_name, email, kind, player_id, name, username, note, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+      )
+      .bind(
+        id,
+        groupId,
+        user.sub,
+        user.name ?? '',
+        draft.email,
+        draft.claim.kind,
+        draft.claim.kind === 'link' ? draft.claim.playerId : null,
+        draft.claim.kind === 'create' ? draft.claim.name : null,
+        draft.claim.kind === 'create' ? draft.claim.username : null,
+        draft.note,
+        at,
+        at,
+      ),
+  }
+}
+
+type AppliedRequest =
+  | { ok: true; playerId: string; statements: Statement[] }
+  | { ok: false; error: string; status: 400 | 409 }
+
+/** Turns an approved request into roster changes; it never edits an existing elo. */
+async function applyPlayerRequest(
+  db: Database,
+  groupId: string,
+  row: RequestRow,
+  at: number,
+): Promise<AppliedRequest> {
+  if (row.kind === 'link') {
+    if (!row.player_id)
+      return { ok: false, error: 'That request has no player.', status: 400 }
+    const player = await db
+      .prepare(
+        'SELECT id FROM players WHERE id = ? AND group_id = ? AND deleted_at IS NULL',
+      )
+      .bind(row.player_id, groupId)
+      .first<{ id: string }>()
+    if (!player)
+      return {
+        ok: false,
+        error:
+          'That player is no longer on the roster, so the request cannot be applied.',
+        status: 409,
+      }
+    return {
+      ok: true,
+      playerId: row.player_id,
+      statements: [
+        linkEmailStatement(
+          db,
+          groupId,
+          row.player_id,
+          row.email,
+          row.requester_sub,
+          at,
+        ),
+      ],
+    }
+  }
+  const name = row.name
+  const username = row.username
+  if (!name || !username)
+    return {
+      ok: false,
+      error: 'That request is missing a display name or username.',
+      status: 400,
+    }
+  const existing = await db
+    .prepare(
+      'SELECT COUNT(*) AS total FROM players WHERE group_id = ? AND deleted_at IS NULL',
+    )
+    .bind(groupId)
+    .first<{ total: number }>()
+  if ((existing?.total ?? 0) + 1 > ROSTER_LIMIT)
+    return { ok: false, error: 'A roster holds up to 200 players.', status: 400 }
+  const id = crypto.randomUUID()
+  return {
+    ok: true,
+    playerId: id,
+    statements: [
+      db
+        .prepare(
+          'INSERT INTO players (id, owner_sub, group_id, name, username, skill, elo, base_elo, tags, sitting_out, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, 0, ?, ?)',
+        )
+        .bind(
+          id,
+          row.requester_sub,
+          groupId,
+          name,
+          username,
+          skillFromElo(0),
+          '[]',
+          at,
+          at,
+        ),
+      linkEmailStatement(db, groupId, id, row.email, row.requester_sub, at),
+    ],
+  }
 }
 
 async function nextPosition(db: Database, groupId: string): Promise<number> {
@@ -469,6 +798,7 @@ async function recompute(
 
   const tags = await loadTags(db, groupId)
   const allowed = tags.map((tag) => tag.id)
+  const emails = await loadEmailMap(db, groupId)
   return players.results
     .filter((player) => !player.deleted_at)
     .map((player) =>
@@ -479,6 +809,7 @@ async function recompute(
           skill: skillFromElo(elos.get(player.id) ?? player.elo),
         },
         allowed,
+        emails.get(player.id) ?? [],
       ),
     )
 }
@@ -716,9 +1047,26 @@ export function createApp(authenticate: Authenticate = currentUser) {
       )
     await ensureSchema(c.env.DB)
     const invite = await loadInvite(c.env.DB, c.req.param('token'))
-    return invite
-      ? c.json({ invite })
-      : c.json({ error: 'That invite link is no longer valid.' }, 404)
+    if (!invite)
+      return c.json({ error: 'That invite link is no longer valid.' }, 404)
+    // The token is the credential, so the visitor may see enough of the roster
+    // to say "that's me" before joining. Emails stay out of this preview.
+    const roster = await c.env.DB.prepare(
+      'SELECT id, name, username, elo FROM players WHERE group_id = ? AND deleted_at IS NULL ORDER BY created_at ASC, id ASC',
+    )
+      .bind(invite.groupId)
+      .all<{ id: string; name: string; username: string | null; elo: number }>()
+    return c.json({
+      invite: {
+        ...invite,
+        players: roster.results.map((row) => ({
+          id: row.id,
+          name: row.name,
+          username: row.username ?? '',
+          elo: row.elo,
+        })),
+      },
+    })
   })
 
   // The group list and accepting an invite are account-level routes; everything
@@ -1074,7 +1422,26 @@ export function createApp(authenticate: Authenticate = currentUser) {
     const user = c.get('user')
     const invite = await loadInvite(db, c.req.param('token'))
     if (!invite) return c.json({ error: 'That invite link is no longer valid.' }, 404)
+
+    // An optional claim rides along with the join: membership is granted at
+    // once, and only the player connection waits for an editor.
+    const body: unknown = await c.req.json().catch(() => null)
+    let draft: ClaimDraft | null = null
+    if (body !== null) {
+      if (typeof body !== 'object' || Array.isArray(body))
+        return c.json({ error: 'Choose a player to connect.' }, 400)
+      const record = body as Record<string, unknown>
+      if (record.claim !== undefined) {
+        const parsed = readClaimDraft(record, user)
+        if (!parsed.draft) return c.json({ error: parsed.error }, 400)
+        draft = parsed.draft
+      } else if ('note' in record || 'email' in record) {
+        return c.json({ error: 'Choose a player to connect.' }, 400)
+      }
+    }
+
     const now = Date.now()
+    const statements: Statement[] = []
     const owner = await db
       .prepare('SELECT owner_sub FROM groups WHERE id = ?')
       .bind(invite.groupId)
@@ -1086,20 +1453,200 @@ export function createApp(authenticate: Authenticate = currentUser) {
         .first<{ total: number }>()
       if ((members?.total ?? 0) + 1 > MAX_MEMBERS)
         return c.json({ error: 'That group is full.' }, 400)
+      statements.push(
+        db
+          .prepare(
+            `INSERT INTO group_members (group_id, user_sub, role, display_name, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(group_id, user_sub) DO NOTHING`,
+          )
+          .bind(invite.groupId, user.sub, invite.role, user.name ?? '', now, now),
+      )
+    }
+    let requestId: string | null = null
+    if (draft) {
+      const filed = await filePlayerRequest(db, invite.groupId, user, draft, now)
+      if (!filed.ok) return c.json({ error: filed.error }, filed.status)
+      requestId = filed.id
+      statements.push(filed.statement)
+    }
+    statements.push(bumpRev(db, invite.groupId, now))
+    await db.batch(statements)
+    return c.json({
+      group: { id: invite.groupId, name: invite.name, role: invite.role },
+      request: requestId ? { id: requestId } : null,
+    })
+  })
+
+  // ---- player connections -------------------------------------------------
+
+  /** Editors review every pending claim; a member sees only their own. */
+  app.get('/api/groups/:groupId/player-requests', async (c) => {
+    const db = c.get('db')
+    const groupId = c.get('groupId')
+    const user = c.get('user')
+    const editor = c.get('role') !== 'viewer'
+    const rows = await db
+      .prepare(
+        `SELECT r.id, r.requester_sub, r.requester_name, r.email, r.kind,
+                r.player_id, r.name, r.username, r.note, r.created_at,
+                p.name AS player_name
+         FROM group_player_requests r
+         LEFT JOIN players p ON p.id = r.player_id AND p.group_id = r.group_id
+         WHERE r.group_id = ? AND r.status = 'pending'${
+           editor ? '' : ' AND r.requester_sub = ?'
+         }
+         ORDER BY r.created_at ASC, r.id ASC`,
+      )
+      .bind(...(editor ? [groupId] : [groupId, user.sub]))
+      .all<RequestRow>()
+    return c.json({ requests: rows.results.map((row) => mapRequest(row, user.sub)) })
+  })
+
+  /** Any member, viewers included, may ask to be connected to a player. */
+  app.post('/api/groups/:groupId/player-requests', async (c) => {
+    const body: unknown = await c.req.json().catch(() => null)
+    if (!body || typeof body !== 'object' || Array.isArray(body))
+      return c.json({ error: 'Choose a player to connect.' }, 400)
+    const parsed = readClaimDraft(body as Record<string, unknown>, c.get('user'))
+    if (!parsed.draft) return c.json({ error: parsed.error }, 400)
+    const db = c.get('db')
+    const groupId = c.get('groupId')
+    const now = Date.now()
+    const filed = await filePlayerRequest(db, groupId, c.get('user'), parsed.draft, now)
+    if (!filed.ok) return c.json({ error: filed.error }, filed.status)
+    await db.batch([filed.statement, bumpRev(db, groupId, now)])
+    return c.json({ request: { id: filed.id } }, 201)
+  })
+
+  app.post('/api/groups/:groupId/player-requests/:requestId/approve', async (c) => {
+    if (c.get('role') === 'viewer')
+      return c.json({ error: 'Only an editor can review player requests.' }, 403)
+    const db = c.get('db')
+    const groupId = c.get('groupId')
+    const id = c.req.param('requestId')
+    const row = await db
+      .prepare(
+        "SELECT id, requester_sub, requester_name, email, kind, player_id, name, username, note, created_at FROM group_player_requests WHERE id = ? AND group_id = ? AND status = 'pending'",
+      )
+      .bind(id, groupId)
+      .first<RequestRow>()
+    if (!row) return c.json({ error: 'Request not found.' }, 404)
+    const now = Date.now()
+    // Claim the row first, so two editors cannot both apply it.
+    const claimed = await db
+      .prepare(
+        `UPDATE group_player_requests SET status = 'approved', decided_by_sub = ?, decided_at = ?, updated_at = ?
+         WHERE id = ? AND group_id = ? AND status = 'pending' RETURNING id`,
+      )
+      .bind(c.get('user').sub, now, now, id, groupId)
+      .first<{ id: string }>()
+    if (!claimed)
+      return c.json({ error: 'That request was already handled.' }, 409)
+    const applied = await applyPlayerRequest(db, groupId, row, now)
+    if (!applied.ok) {
+      // Nothing was written: hand the request back so it stays reviewable.
       await db
         .prepare(
-          `INSERT INTO group_members (group_id, user_sub, role, display_name, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(group_id, user_sub) DO NOTHING`,
+          "UPDATE group_player_requests SET status = 'pending', decided_by_sub = NULL, decided_at = NULL, updated_at = ? WHERE id = ? AND group_id = ?",
         )
-        .bind(invite.groupId, user.sub, invite.role, user.name ?? '', now, now)
+        .bind(Date.now(), id, groupId)
         .run()
+      return c.json({ error: applied.error }, applied.status)
     }
-    await bumpRev(db, invite.groupId).run()
-    return c.json({ group: { id: invite.groupId, name: invite.name, role: invite.role } })
+    await db.batch([...applied.statements, bumpRev(db, groupId, now)])
+    return c.json({ ok: true, playerId: applied.playerId })
+  })
+
+  /** An editor dismisses any pending request; a member may cancel their own. */
+  app.delete('/api/groups/:groupId/player-requests/:requestId', async (c) => {
+    const db = c.get('db')
+    const groupId = c.get('groupId')
+    const id = c.req.param('requestId')
+    const row = await db
+      .prepare(
+        'SELECT requester_sub FROM group_player_requests WHERE id = ? AND group_id = ?',
+      )
+      .bind(id, groupId)
+      .first<{ requester_sub: string }>()
+    if (!row) return c.json({ error: 'Request not found.' }, 404)
+    if (c.get('role') === 'viewer' && row.requester_sub !== c.get('user').sub)
+      return c.json({ error: 'Only an editor can review player requests.' }, 403)
+    await db.batch([
+      db
+        .prepare('DELETE FROM group_player_requests WHERE id = ? AND group_id = ?')
+        .bind(id, groupId),
+      bumpRev(db, groupId),
+    ])
+    return c.json({ ok: true })
   })
 
   // ---- players ------------------------------------------------------------
+
+  app.post('/api/groups/:groupId/players/:playerId/emails', async (c) => {
+    const db = c.get('db')
+    const groupId = c.get('groupId')
+    const playerId = c.req.param('playerId')
+    const body: unknown = await c.req.json().catch(() => null)
+    if (!body || typeof body !== 'object' || Array.isArray(body))
+      return c.json({ error: 'Enter an email address.' }, 400)
+    const record = body as Record<string, unknown>
+    if (Object.keys(record).some((key) => key !== 'email'))
+      return c.json({ error: 'Enter an email address.' }, 400)
+    const email = readEmail(record.email)
+    if (!email)
+      return c.json({ error: 'That does not look like an email address.' }, 400)
+    const player = await db
+      .prepare(
+        'SELECT id FROM players WHERE id = ? AND group_id = ? AND deleted_at IS NULL',
+      )
+      .bind(playerId, groupId)
+      .first<{ id: string }>()
+    if (!player) return c.json({ error: 'Player not found.' }, 404)
+    const emails = await loadPlayerEmailList(db, groupId, playerId)
+    if (emails.includes(email)) return c.json({ ok: true, emails })
+    if (emails.length >= MAX_EMAILS_PER_PLAYER)
+      return c.json(
+        { error: `A player holds up to ${MAX_EMAILS_PER_PLAYER} emails.` },
+        400,
+      )
+    const now = Date.now()
+    await db.batch([
+      linkEmailStatement(db, groupId, playerId, email, c.get('user').sub, now),
+      bumpRev(db, groupId, now),
+    ])
+    return c.json(
+      { ok: true, emails: await loadPlayerEmailList(db, groupId, playerId) },
+      201,
+    )
+  })
+
+  app.delete('/api/groups/:groupId/players/:playerId/emails/:email', async (c) => {
+    const db = c.get('db')
+    const groupId = c.get('groupId')
+    const playerId = c.req.param('playerId')
+    const email = readEmail(c.req.param('email'))
+    if (!email) return c.json({ error: 'That email is not connected.' }, 404)
+    const player = await db
+      .prepare(
+        'SELECT id FROM players WHERE id = ? AND group_id = ? AND deleted_at IS NULL',
+      )
+      .bind(playerId, groupId)
+      .first<{ id: string }>()
+    if (!player) return c.json({ error: 'Player not found.' }, 404)
+    const removed = await db
+      .prepare(
+        'DELETE FROM group_player_emails WHERE group_id = ? AND player_id = ? AND email = ? RETURNING email',
+      )
+      .bind(groupId, playerId, email)
+      .first<{ email: string }>()
+    if (!removed) return c.json({ error: 'That email is not connected.' }, 404)
+    await bumpRev(db, groupId).run()
+    return c.json({
+      ok: true,
+      emails: await loadPlayerEmailList(db, groupId, playerId),
+    })
+  })
 
   app.get('/api/groups/:groupId/players', async (c) => {
     const db = c.get('db')
@@ -1286,9 +1833,10 @@ export function createApp(authenticate: Authenticate = currentUser) {
       )
       .bind(id, groupId)
       .first<PlayerRow>()
-    return row
-      ? c.json({ player: mapPlayer(row, allowed) })
-      : c.json({ error: 'Player not found.' }, 404)
+    if (!row) return c.json({ error: 'Player not found.' }, 404)
+    return c.json({
+      player: mapPlayer(row, allowed, await loadPlayerEmailList(db, groupId, id)),
+    })
   })
 
   app.delete('/api/groups/:groupId/players/:playerId', async (c) => {
@@ -1311,6 +1859,10 @@ export function createApp(authenticate: Authenticate = currentUser) {
           'UPDATE players SET deleted_at = ?, updated_at = ? WHERE id = ? AND group_id = ?',
         )
         .bind(now, now, id, groupId),
+      // An archived player has no one left to sign in as them.
+      db
+        .prepare('DELETE FROM group_player_emails WHERE group_id = ? AND player_id = ?')
+        .bind(groupId, id),
       bumpRev(db, groupId, now),
     ])
     return c.json({ ok: true })

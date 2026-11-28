@@ -24,6 +24,9 @@ type Props = {
   onUpdate: (id: string, patch: PlayerPatch) => Promise<void>
   onRemove: (id: string) => Promise<void>
   onToggleSit: (id: string) => void
+  /** Connects an email to this player; false means the server refused it. */
+  onConnectEmail: (id: string, email: string) => Promise<boolean>
+  onDisconnectEmail: (id: string, email: string) => Promise<void>
 }
 
 const parseNames = (text: string) =>
@@ -45,6 +48,8 @@ export function Roster({
   onUpdate,
   onRemove,
   onToggleSit,
+  onConnectEmail,
+  onDisconnectEmail,
 }: Props) {
   const [draftName, setDraftName] = useState('')
   const [draftUsername, setDraftUsername] = useState('')
@@ -61,6 +66,7 @@ export function Roster({
     username: string
   } | null>(null)
   const [historyFor, setHistoryFor] = useState<string | null>(null)
+  const [emailDraft, setEmailDraft] = useState('')
 
   const sitting = new Set(sitOutIds)
   const total = players.reduce((sum, player) => sum + player.elo, 0)
@@ -281,6 +287,58 @@ export function Roster({
                           Cancel
                         </button>
                       </div>
+                      <div className="player-emails">
+                        <span className="draft-roles-label">
+                          Connected emails
+                        </span>
+                        <ul className="email-list">
+                          {(player.emails ?? []).map((email) => (
+                            <li key={email}>
+                              <span className="email-chip">{email}</span>
+                              <button
+                                type="button"
+                                className="icon-button"
+                                aria-label={`Disconnect ${email} from ${player.name}`}
+                                title={`Disconnect ${email}`}
+                                onClick={() =>
+                                  void onDisconnectEmail(player.id, email)
+                                }
+                              >
+                                ×
+                              </button>
+                            </li>
+                          ))}
+                          {(player.emails ?? []).length === 0 && (
+                            <li className="muted">No emails connected.</li>
+                          )}
+                        </ul>
+                        <form
+                          className="email-add"
+                          onSubmit={(event) => {
+                            event.preventDefault()
+                            const email = emailDraft.trim()
+                            if (!email) return
+                            void onConnectEmail(player.id, email).then((ok) => {
+                              if (ok) setEmailDraft('')
+                            })
+                          }}
+                        >
+                          <input
+                            className="input"
+                            type="email"
+                            maxLength={254}
+                            placeholder="Add an email…"
+                            aria-label={`Email to connect to ${player.name}`}
+                            value={emailDraft}
+                            onChange={(event) =>
+                              setEmailDraft(event.target.value)
+                            }
+                          />
+                          <button className="quiet" disabled={!emailDraft.trim()}>
+                            Connect
+                          </button>
+                        </form>
+                      </div>
                     </div>
                   ) : (
                     <button
@@ -288,13 +346,14 @@ export function Roster({
                       className="player-name"
                       title={canEdit ? 'Edit name and username' : player.name}
                       disabled={!canEdit}
-                      onClick={() =>
+                      onClick={() => {
+                        setEmailDraft('')
                         setEditing({
                           id: player.id,
                           name: player.name,
                           username: player.username ?? '',
                         })
-                      }
+                      }}
                     >
                       <span className="player-name-line">
                         <span className="player-name-text">{player.name}</span>
@@ -304,6 +363,11 @@ export function Roster({
                       </span>
                       {player.username && (
                         <span className="player-username">{player.username}</span>
+                      )}
+                      {(player.emails ?? []).length > 0 && (
+                        <span className="player-emails-line">
+                          {(player.emails ?? []).join(' · ')}
+                        </span>
                       )}
                     </button>
                   )}

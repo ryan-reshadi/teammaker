@@ -11,6 +11,7 @@ import {
 } from '../shared/elo'
 import type {
   GroupDetail,
+  GroupPlayerRequest,
   GroupRole,
   GroupSummary,
   GroupTag,
@@ -23,10 +24,12 @@ import { Build } from './components/Build'
 import { GroupSettingsDialog, JoinPanel, NewGroupDialog, ShareDialog, TagsDialog } from './components/Groups'
 import { History } from './components/History'
 import { Matches } from './components/Matches'
+import { ConnectDialog, RequestsDialog, type ClaimPayload } from './components/Requests'
 import { Roster } from './components/Roster'
 import {
   importLegacyRounds,
   readActiveGroupId,
+  readClaimEmail,
   readGuestTags,
   readLocalRounds,
   readSitOuts,
@@ -34,6 +37,7 @@ import {
   saveLocalRound,
   wereLegacyRoundsImported,
   writeActiveGroupId,
+  writeClaimEmail,
   writeGuestTags,
   writeSitOuts,
 } from './localState'
@@ -116,9 +120,12 @@ export function App() {
   const [ready, setReady] = useState(false)
   const [nonce, setNonce] = useState(0)
   const [dialog, setDialog] = useState<
-    null | 'new' | 'share' | 'settings' | 'tags'
+    null | 'new' | 'share' | 'settings' | 'tags' | 'requests' | 'connect'
   >(null)
   const [joinToken, setJoinToken] = useState<string | null>(initialJoinToken)
+  const [requests, setRequests] = useState<GroupPlayerRequest[]>([])
+  /** The address this device used to claim a player, when the account has none. */
+  const [claimedEmail, setClaimedEmail] = useState<string | null>(null)
 
   const remote = Boolean(session?.user && session.database)
 
@@ -142,6 +149,13 @@ export function App() {
   const role: GroupRole = activeGroup?.role ?? 'viewer'
   const canEdit = role !== 'viewer'
   const groupBase = activeId ? `/api/groups/${encodeURIComponent(activeId)}` : ''
+  /** The account email is what a claim attaches; it is never an access key. */
+  const myEmail = (session?.user?.email ?? '').trim().toLowerCase()
+  const myRequest = requests.find((request) => request.isYou) ?? null
+  const connectedToMe =
+    players.some((player) => (player.emails ?? []).includes(myEmail)) ||
+    (claimedEmail !== null &&
+      players.some((player) => (player.emails ?? []).includes(claimedEmail)))
 
   const store = useMemo<Store | null>(
     () => (session && activeId ? createStore(remote, activeId) : null),
@@ -153,6 +167,19 @@ export function App() {
     setEvents(loaded.events)
     setKFactor(loaded.kFactor)
     setSquashed(loaded.squashed)
+  }, [])
+
+  /** Pending claims: editors see them all, everyone else only theirs. */
+  const loadRequests = useCallback(async (groupId: string) => {
+    try {
+      const body = await api<{ requests: GroupPlayerRequest[] }>(
+        `/api/groups/${encodeURIComponent(groupId)}/player-requests`,
+      )
+      setRequests(body.requests)
+    } catch {
+      // The review panel is secondary: a failed read simply leaves it empty.
+      setRequests([])
+    }
   }, [])
 
   useEffect(() => {
@@ -197,6 +224,8 @@ export function App() {
       setActiveId('local')
       setGroup(null)
       setGuestTags(readGuestTags())
+      setRequests([])
+      setClaimedEmail(null)
       return
     }
     let liveRequest = true
@@ -239,8 +268,10 @@ export function App() {
         if (loaded.matches) applyMatches(loaded.matches)
         setRounds(readLocalRounds(activeId))
         setSitOuts(readSitOuts(activeId))
+        setClaimedEmail(readClaimEmail(activeId))
         setError(loaded.failure ?? '')
         if (remote) {
+          await loadRequests(activeId)
           const response = await fetch(
             `/api/groups/${encodeURIComponent(activeId)}`,
           )
@@ -280,7 +311,7 @@ export function App() {
     return () => {
       liveRequest = false
     }
-  }, [session, remote, activeId, nonce, applyMatches])
+  }, [session, remote, activeId, nonce, applyMatches, loadRequests])
 
   const reloadGroup = useCallback(async () => {
     if (!remote || !activeId) return
@@ -299,7 +330,8 @@ export function App() {
     if (loaded.players) setPlayers(loaded.players)
     if (loaded.matches) applyMatches(loaded.matches)
     await reloadGroup()
-  }, [activeId, remote, reloadGroup, applyMatches])
+    await loadRequests(activeId)
+  }, [activeId, remote, reloadGroup, applyMatches, loadRequests])
 
   /** Membership can be revoked while the tab is open; drop what was shared. */
   const loseAccess = useCallback(async () => {
@@ -308,6 +340,8 @@ export function App() {
     setEvents([])
     setRounds([])
     setSitOuts([])
+    setRequests([])
+    setClaimedEmail(null)
     setLive('')
     setReady(true)
     setError('You no longer have access to this group.')
@@ -541,6 +575,77 @@ export function App() {
     setNonce((value) => value + 1)
   }
 
+  const connectEmail = useCallback(
+    async (id: string, email: string): Promise<boolean> => {
+      if (!activeId || !canEdit) return false
+      try {
+        await api(
+          `${groupBase}/players/${encodeURIComponent(id)}/emails`,
+          json('POST', { email }),
+        )
+        await reloadWorkspace()
+        setError('')
+        return true
+      } catch (problemValue) {
+        setError(message(problemValue))
+        return false
+      }
+    },
+    [activeId, canEdit, groupBase, reloadWorkspace],
+  )
+
+  const disconnectEmail = useCallback(
+    async (id: string, email: string) => {
+      if (!activeId || !canEdit) return
+      try {
+        await api(
+          `${groupBase}/players/${encodeURIComponent(id)}/emails/${encodeURIComponent(email)}`,
+          { method: 'DELETE' },
+        )
+        await reloadWorkspace()
+        setError('')
+      } catch (problemValue) {
+        setError(message(problemValue))
+      }
+    },
+    [activeId, canEdit, groupBase, reloadWorkspace],
+  )
+
+  const fileRequest = useCallback(
+    async (payload: ClaimPayload) => {
+      if (!activeId) throw new Error('Open a group first.')
+      await api(`${groupBase}/player-requests`, json('POST', payload))
+      writeClaimEmail(activeId, payload.email)
+      setClaimedEmail(payload.email)
+      await loadRequests(activeId)
+      await reloadGroup()
+    },
+    [activeId, groupBase, loadRequests, reloadGroup],
+  )
+
+  const approveRequest = useCallback(
+    async (id: string) => {
+      if (!activeId) return
+      await api(
+        `${groupBase}/player-requests/${encodeURIComponent(id)}/approve`,
+        { method: 'POST' },
+      )
+      await reloadWorkspace()
+    },
+    [activeId, groupBase, reloadWorkspace],
+  )
+
+  const dismissRequest = useCallback(
+    async (id: string) => {
+      if (!activeId) return
+      await api(`${groupBase}/player-requests/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      })
+      await loadRequests(activeId)
+    },
+    [activeId, groupBase, loadRequests],
+  )
+
   const saveGroupSettings = (updated: GroupDetail) => {
     setGroup(updated)
     setGroups((previous) =>
@@ -672,6 +777,8 @@ export function App() {
       <JoinPanel
         token={joinToken}
         signedIn={Boolean(session.user)}
+        email={session.user?.email}
+        onClaimedEmail={(groupId, claimed) => writeClaimEmail(groupId, claimed)}
         onDone={finishJoin}
       />
     )
@@ -745,6 +852,15 @@ export function App() {
               onClick={() => setDialog('tags')}
             >
               Tags
+            </button>
+          )}
+          {remote && activeGroup && canEdit && (
+            <button
+              type="button"
+              className="quiet"
+              onClick={() => setDialog('requests')}
+            >
+              Requests{requests.length > 0 ? ` (${requests.length})` : ''}
             </button>
           )}
           {remote && activeGroup && role === 'owner' && (
@@ -861,6 +977,50 @@ export function App() {
             </button>
           </div>
         )}
+        {activeGroup && myRequest && (
+          <div className="notice import">
+            <span>
+              {myRequest.kind === 'create' ? (
+                <>Your request to add “{myRequest.name}” is waiting for an editor.</>
+              ) : (
+                <>
+                  Your request to connect to
+                  {myRequest.playerName
+                    ? ` “${myRequest.playerName}”`
+                    : ' your player'}{' '}
+                  is waiting for an editor.
+                </>
+              )}
+            </span>
+            <button
+              type="button"
+              className="quiet"
+              onClick={() =>
+                void dismissRequest(myRequest.id).catch((problemValue) =>
+                  setError(message(problemValue)),
+                )
+              }
+            >
+              Cancel request
+            </button>
+          </div>
+        )}
+        {remote && activeGroup && !connectedToMe && !myRequest && (
+          <div className="notice import">
+            <span>
+              {myEmail
+                ? `No player is connected to ${myEmail} in this group.`
+                : 'No player is connected to your account yet.'}
+            </span>
+            <button
+              type="button"
+              className="quiet"
+              onClick={() => setDialog('connect')}
+            >
+              Connect a player
+            </button>
+          </div>
+        )}
         {error && (
           <p role="alert" className="error">
             {error}
@@ -882,6 +1042,8 @@ export function App() {
                 onUpdate={updatePlayer}
                 onRemove={removePlayer}
                 onToggleSit={toggleSit}
+                onConnectEmail={connectEmail}
+                onDisconnectEmail={disconnectEmail}
               />
             </div>
             <div className="column">
@@ -955,6 +1117,27 @@ export function App() {
           onAdd={addTag}
           onRename={renameTag}
           onDelete={deleteTag}
+        />
+      )}
+      {dialog === 'requests' && activeGroup && canEdit && (
+        <RequestsDialog
+          requests={requests}
+          onClose={() => setDialog(null)}
+          onApprove={approveRequest}
+          onDismiss={dismissRequest}
+        />
+      )}
+      {dialog === 'connect' && activeGroup && (
+        <ConnectDialog
+          players={players.map((player) => ({
+            id: player.id,
+            name: player.name,
+            username: player.username ?? '',
+            elo: player.elo,
+          }))}
+          accountEmail={session.user?.email}
+          onClose={() => setDialog(null)}
+          onSubmit={fileRequest}
         />
       )}
     </div>

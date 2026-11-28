@@ -8,6 +8,7 @@
   "exclude": [
     "tests/rivals-browser.test.tsx",
     "tests/sharing-browser.test.tsx",
+    "tests/connections-browser.test.tsx",
     "tests/store.test.ts",
     "tests/rivals-layout.test.ts"
   ]

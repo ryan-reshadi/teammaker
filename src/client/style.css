@@ -2364,6 +2364,124 @@ button.generate {
   font-size: 13px;
 }
 
+.claim-form {
+  display: grid;
+  gap: 10px;
+}
+
+.claim-modes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 13px;
+}
+
+.claim-mode {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.claim-email {
+  font-size: 13px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  background: var(--paper);
+  word-break: break-all;
+}
+
+.claim-note {
+  resize: vertical;
+  font-family: inherit;
+}
+
+.claim-dialog,
+.request-dialog {
+  width: min(560px, 100%);
+  max-height: calc(100vh - 40px);
+  overflow-y: auto;
+}
+
+.request-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.request-list li {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--paper);
+}
+
+.request-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.request-note {
+  margin: 0;
+  font-style: italic;
+  color: var(--ink-soft);
+}
+
+.request-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.player-emails-line {
+  display: block;
+  font-size: 12px;
+  color: var(--ink-soft);
+  word-break: break-all;
+}
+
+.player-emails {
+  display: grid;
+  gap: 6px;
+}
+
+.email-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.email-list li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.email-chip {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.email-add {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.email-add .input {
+  flex: 1;
+  font-size: 13px;
+}
+
 .share-section {
   display: grid;
   gap: 6px;

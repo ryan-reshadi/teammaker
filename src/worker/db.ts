@@ -69,6 +69,42 @@ const schema = [
     PRIMARY KEY (group_id, id)
   )`,
   `CREATE INDEX IF NOT EXISTS group_tags_order ON group_tags(group_id, sort, id)`,
+  // A player can be held by several accounts (alternate emails), and the same
+  // email may sit on more than one player. The email is a label for who someone
+  // is, never an authorization key: access stays keyed on the account sub.
+  `CREATE TABLE IF NOT EXISTS group_player_emails (
+    group_id TEXT NOT NULL,
+    player_id TEXT NOT NULL,
+    email TEXT NOT NULL,
+    added_by_sub TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (group_id, player_id, email)
+  )`,
+  `CREATE INDEX IF NOT EXISTS player_emails_player ON group_player_emails(group_id, player_id)`,
+  `CREATE INDEX IF NOT EXISTS player_emails_email ON group_player_emails(group_id, email)`,
+  // A claim on a roster player, or a proposal to add one. Members file them;
+  // editors apply or dismiss them. Applying is the only way a request changes
+  // the roster.
+  `CREATE TABLE IF NOT EXISTS group_player_requests (
+    id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL,
+    requester_sub TEXT NOT NULL,
+    requester_name TEXT NOT NULL DEFAULT '',
+    email TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    player_id TEXT,
+    name TEXT,
+    username TEXT,
+    note TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    decided_by_sub TEXT,
+    decided_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS player_requests_group ON group_player_requests(group_id, status, created_at)`,
+  // One open request per member per group.
+  `CREATE UNIQUE INDEX IF NOT EXISTS player_requests_pending ON group_player_requests(group_id, requester_sub) WHERE status = 'pending'`,
   `CREATE TABLE IF NOT EXISTS players (
     id TEXT PRIMARY KEY,
     owner_sub TEXT NOT NULL,
@@ -162,6 +198,8 @@ export const REQUIRED_TABLES = [
   'group_members',
   'group_invites',
   'group_tags',
+  'group_player_emails',
+  'group_player_requests',
   'group_rating_meta',
   'group_squashes',
 ] as const
@@ -307,6 +345,7 @@ export type PlayerRow = {
 export const mapPlayer = (
   row: PlayerRow,
   allowedTags?: readonly string[],
+  emails?: readonly string[],
 ): Player => ({
   id: row.id,
   name: row.name,
@@ -314,6 +353,7 @@ export const mapPlayer = (
   skill: skillFromElo(row.elo),
   elo: row.elo,
   tags: parseTags(row.tags, allowedTags),
+  emails: [...(emails ?? [])],
   createdAt: row.created_at,
   updatedAt: row.updated_at,
 })

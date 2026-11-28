@@ -41,7 +41,12 @@ afterAll(() => runtime.dispose())
 const app = createApp(async (request) => {
   const sub = request.headers.get('test-user')
   if (!sub) return null
-  return { sub, name: request.headers.get('test-name') ?? sub }
+  const email = request.headers.get('test-email')
+  return {
+    sub,
+    name: request.headers.get('test-name') ?? sub,
+    ...(email ? { email } : {}),
+  }
 })
 
 async function call(
@@ -50,6 +55,7 @@ async function call(
   method = 'GET',
   body?: unknown,
   origin: string | null = env.APP_ORIGIN!,
+  email?: string,
 ): Promise<Response> {
   return app.request(
     `https://app.example.test${path}`,
@@ -57,6 +63,7 @@ async function call(
       method,
       headers: {
         ...(user ? { 'test-user': user, 'test-name': `Name ${user}` } : {}),
+        ...(email ? { 'test-email': email } : {}),
         ...(origin ? { Origin: origin } : {}),
         ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
       },
@@ -471,6 +478,441 @@ test('a group is reachable only through its own encoded URL and health reports t
 
   const health = await call('/api/health')
   expect(await health.json()).toMatchObject({ ok: true, schema: 'ready' })
+})
+
+test('an invite previews the roster and a claim becomes a pending request', async () => {
+  const group = await createGroup('claim-owner')
+  const created = await call(base(group, '/players'), 'claim-owner', 'POST', {
+    name: 'Ada',
+    skill: 5,
+  })
+  const ada = (
+    (await created.json()) as { players: { id: string; elo: number }[] }
+  ).players[0]!
+  const link = await invite(group, 'claim-owner', 'viewer')
+
+  const preview = (await (
+    await call(`/api/invites/${link.token}`, 'claim-bo')
+  ).json()) as {
+    invite: { players: { id: string; name: string; username: string; elo: number }[] }
+  }
+  expect(preview.invite.players).toEqual([
+    { id: ada.id, name: 'Ada', username: '', elo: 500 },
+  ])
+
+  const accepted = await call(
+    `/api/invites/${link.token}/accept`,
+    'claim-bo',
+    'POST',
+    { claim: { kind: 'create', name: 'Bo', username: 'bo' }, note: 'That is me' },
+    env.APP_ORIGIN,
+    'bo@example.test',
+  )
+  expect(accepted.status).toBe(200)
+  expect(((await accepted.json()) as { request: unknown }).request).not.toBeNull()
+
+  // Joining happens at once; the roster waits for an editor.
+  const joiner = (await (await call(base(group), 'claim-bo')).json()) as {
+    group: Group
+  }
+  expect(joiner.group.role).toBe('viewer')
+  const roster = (await (
+    await call(base(group, '/players'), 'claim-owner')
+  ).json()) as { players: { name: string }[] }
+  expect(roster.players.map((player) => player.name)).toEqual(['Ada'])
+
+  const pending = (await (
+    await call(base(group, '/player-requests'), 'claim-owner')
+  ).json()) as {
+    requests: {
+      kind: string
+      name: string | null
+      email: string
+      note: string
+      isYou: boolean
+    }[]
+  }
+  expect(pending.requests).toHaveLength(1)
+  expect(pending.requests[0]).toMatchObject({
+    kind: 'create',
+    name: 'Bo',
+    email: 'bo@example.test',
+    note: 'That is me',
+    isYou: false,
+  })
+
+  // Another member sees nothing; the requester sees only their own.
+  const otherLink = await invite(group, 'claim-owner', 'viewer')
+  await call(
+    `/api/invites/${otherLink.token}/accept`,
+    'claim-other',
+    'POST',
+    undefined,
+    env.APP_ORIGIN,
+    'other@example.test',
+  )
+  const other = (await (
+    await call(base(group, '/player-requests'), 'claim-other')
+  ).json()) as { requests: unknown[] }
+  expect(other.requests).toHaveLength(0)
+  const mine = (await (
+    await call(base(group, '/player-requests'), 'claim-bo')
+  ).json()) as { requests: { isYou: boolean }[] }
+  expect(mine.requests).toHaveLength(1)
+  expect(mine.requests[0]!.isYou).toBe(true)
+
+  // A non-member cannot see the queue at all.
+  expect(
+    (await call(base(group, '/player-requests'), 'claim-stranger')).status,
+  ).toBe(404)
+})
+
+test('an approved new player starts at 0 elo with no tags and the proposer email', async () => {
+  const group = await createGroup('approve-owner')
+  const link = await invite(group, 'approve-owner', 'viewer')
+  await call(
+    `/api/invites/${link.token}/accept`,
+    'approve-new',
+    'POST',
+    { claim: { kind: 'create', name: 'Nova', username: 'nova' } },
+    env.APP_ORIGIN,
+    'nova@example.test',
+  )
+
+  const pending = (await (
+    await call(base(group, '/player-requests'), 'approve-owner')
+  ).json()) as { requests: { id: string }[] }
+  const id = pending.requests[0]!.id
+  expect(
+    (await call(base(group, `/player-requests/${id}/approve`), 'approve-new', 'POST'))
+      .status,
+  ).toBe(403)
+  expect(
+    (
+      await call(
+        base(group, `/player-requests/${id}/approve`),
+        'approve-owner',
+        'POST',
+      )
+    ).status,
+  ).toBe(200)
+
+  const roster = (await (
+    await call(base(group, '/players'), 'approve-owner')
+  ).json()) as {
+    players: {
+      name: string
+      username: string
+      elo: number
+      tags: string[]
+      emails: string[]
+    }[]
+  }
+  expect(roster.players).toHaveLength(1)
+  expect(roster.players[0]).toMatchObject({
+    name: 'Nova',
+    username: 'nova',
+    elo: 0,
+    tags: [],
+    emails: ['nova@example.test'],
+  })
+  const after = (await (
+    await call(base(group, '/player-requests'), 'approve-owner')
+  ).json()) as { requests: unknown[] }
+  expect(after.requests).toHaveLength(0)
+
+  // A handled request is gone, so approving it again cannot duplicate the player.
+  expect(
+    (
+      await call(
+        base(group, `/player-requests/${id}/approve`),
+        'approve-owner',
+        'POST',
+      )
+    ).status,
+  ).toBe(404)
+
+  // Nobody can slip an elo into a request, and a new player needs both details.
+  const sneak = await call(
+    `/api/invites/${link.token}/accept`,
+    'approve-sneak',
+    'POST',
+    {
+      claim: { kind: 'create', name: 'Sneak', username: 'sneak', elo: 900 },
+    },
+    env.APP_ORIGIN,
+    'sneak@example.test',
+  )
+  expect(sneak.status).toBe(400)
+  expect(
+    (await call(base(group), 'approve-sneak')).status,
+  ).toBe(404)
+  const nameless = await call(
+    `/api/invites/${link.token}/accept`,
+    'approve-nameless',
+    'POST',
+    { claim: { kind: 'create', name: 'No Handle' } },
+    env.APP_ORIGIN,
+    'nameless@example.test',
+  )
+  expect(nameless.status).toBe(400)
+})
+
+test('approving a link claim attaches the email and changes no rating', async () => {
+  const group = await createGroup('link-owner')
+  const created = await call(base(group, '/players'), 'link-owner', 'POST', {
+    name: 'Ada',
+    skill: 7,
+  })
+  const ada = (
+    (await created.json()) as { players: { id: string; elo: number }[] }
+  ).players[0]!
+  const link = await invite(group, 'link-owner', 'viewer')
+  await call(
+    `/api/invites/${link.token}/accept`,
+    'link-member',
+    'POST',
+    { claim: { kind: 'link', playerId: ada.id }, note: 'Ada here' },
+    env.APP_ORIGIN,
+    'ada@example.test',
+  )
+
+  const request = (
+    (await (
+      await call(base(group, '/player-requests'), 'link-owner')
+    ).json()) as {
+      requests: { id: string; kind: string; playerName: string | null }[]
+    }
+  ).requests[0]!
+  expect(request.kind).toBe('link')
+  expect(request.playerName).toBe('Ada')
+  expect(
+    (
+      await call(
+        base(group, `/player-requests/${request.id}/approve`),
+        'link-owner',
+        'POST',
+      )
+    ).status,
+  ).toBe(200)
+
+  const roster = (await (
+    await call(base(group, '/players'), 'link-owner')
+  ).json()) as { players: { elo: number; emails: string[] }[] }
+  expect(roster.players[0]).toMatchObject({
+    elo: ada.elo,
+    emails: ['ada@example.test'],
+  })
+})
+
+test('emails are editor-managed, several per player, and viewers can only ask', async () => {
+  const group = await createGroup('email-owner')
+  const created = await call(base(group, '/players'), 'email-owner', 'POST', {
+    name: 'Ada',
+    skill: 5,
+  })
+  const ada = (
+    (await created.json()) as { players: { id: string }[] }
+  ).players[0]!
+  const second = await call(base(group, '/players'), 'email-owner', 'POST', {
+    name: 'Bea',
+    skill: 5,
+  })
+  const bea = (
+    (await second.json()) as { players: { id: string }[] }
+  ).players[0]!
+
+  const link = await invite(group, 'email-owner', 'viewer')
+  await call(
+    `/api/invites/${link.token}/accept`,
+    'email-viewer',
+    'POST',
+    undefined,
+    env.APP_ORIGIN,
+    'viewer@example.test',
+  )
+
+  // A viewer may file their own request, one at a time, but not approve it.
+  const filed = await call(
+    base(group, '/player-requests'),
+    'email-viewer',
+    'POST',
+    { claim: { kind: 'link', playerId: ada.id }, note: 'me' },
+    env.APP_ORIGIN,
+    'viewer@example.test',
+  )
+  expect(filed.status).toBe(201)
+  const requestId = ((await filed.json()) as { request: { id: string } }).request.id
+  expect(
+    (
+      await call(
+        base(group, '/player-requests'),
+        'email-viewer',
+        'POST',
+        { claim: { kind: 'link', playerId: ada.id } },
+        env.APP_ORIGIN,
+        'viewer@example.test',
+      )
+    ).status,
+  ).toBe(409)
+  expect(
+    (
+      await call(
+        base(group, `/player-requests/${requestId}/approve`),
+        'email-viewer',
+        'POST',
+      )
+    ).status,
+  ).toBe(403)
+
+  // Emails are editorial.
+  expect(
+    (
+      await call(
+        base(group, `/players/${ada.id}/emails`),
+        'email-viewer',
+        'POST',
+        { email: 'a@example.test' },
+      )
+    ).status,
+  ).toBe(403)
+  const connected = await call(
+    base(group, `/players/${ada.id}/emails`),
+    'email-owner',
+    'POST',
+    { email: 'A@Example.test' },
+  )
+  expect(connected.status).toBe(201)
+  expect(((await connected.json()) as { emails: string[] }).emails).toEqual([
+    'a@example.test',
+  ])
+  expect(
+    (
+      await call(
+        base(group, `/players/${ada.id}/emails`),
+        'email-owner',
+        'POST',
+        { email: 'alt@example.test' },
+      )
+    ).status,
+  ).toBe(201)
+  // One email may sit on a second player too.
+  expect(
+    (
+      await call(
+        base(group, `/players/${bea.id}/emails`),
+        'email-owner',
+        'POST',
+        { email: 'a@example.test' },
+      )
+    ).status,
+  ).toBe(201)
+
+  const roster = (await (
+    await call(base(group, '/players'), 'email-owner')
+  ).json()) as { players: { id: string; emails: string[] }[] }
+  expect(roster.players.find((player) => player.id === ada.id)?.emails).toEqual([
+    'a@example.test',
+    'alt@example.test',
+  ])
+  expect(roster.players.find((player) => player.id === bea.id)?.emails).toEqual([
+    'a@example.test',
+  ])
+
+  // Disconnecting frees the address.
+  expect(
+    (
+      await call(
+        base(group, `/players/${ada.id}/emails/${encodeURIComponent('alt@example.test')}`),
+        'email-owner',
+        'DELETE',
+      )
+    ).status,
+  ).toBe(200)
+  const trimmed = (await (
+    await call(base(group, '/players'), 'email-owner')
+  ).json()) as { players: { id: string; emails: string[] }[] }
+  expect(trimmed.players.find((player) => player.id === ada.id)?.emails).toEqual([
+    'a@example.test',
+  ])
+
+  // The requester can withdraw, then ask again.
+  expect(
+    (
+      await call(
+        base(group, `/player-requests/${requestId}`),
+        'email-viewer',
+        'DELETE',
+      )
+    ).status,
+  ).toBe(200)
+  expect(
+    (
+      await call(
+        base(group, '/player-requests'),
+        'email-viewer',
+        'POST',
+        { claim: { kind: 'create', name: 'Vic', username: 'vic' } },
+        env.APP_ORIGIN,
+        'viewer@example.test',
+      )
+    ).status,
+  ).toBe(201)
+})
+
+test('archiving a player drops its emails and refuses later claims', async () => {
+  const group = await createGroup('archive-owner')
+  const created = await call(base(group, '/players'), 'archive-owner', 'POST', {
+    name: 'Ada',
+    skill: 5,
+  })
+  const ada = (
+    (await created.json()) as { players: { id: string }[] }
+  ).players[0]!
+  const link = await invite(group, 'archive-owner', 'viewer')
+  await call(
+    `/api/invites/${link.token}/accept`,
+    'archive-member',
+    'POST',
+    undefined,
+    env.APP_ORIGIN,
+    'arch@example.test',
+  )
+  expect(
+    (
+      await call(
+        base(group, `/players/${ada.id}/emails`),
+        'archive-owner',
+        'POST',
+        { email: 'arch@example.test' },
+      )
+    ).status,
+  ).toBe(201)
+  expect(
+    (await call(base(group, `/players/${ada.id}`), 'archive-owner', 'DELETE'))
+      .status,
+  ).toBe(200)
+
+  const links = await (env.DB as unknown as Database)
+    .prepare(
+      'SELECT email FROM group_player_emails WHERE group_id = ? AND player_id = ?',
+    )
+    .bind(group.id, ada.id)
+    .all<{ email: string }>()
+  expect(links.results).toHaveLength(0)
+
+  expect(
+    (
+      await call(
+        base(group, '/player-requests'),
+        'archive-member',
+        'POST',
+        { claim: { kind: 'link', playerId: ada.id } },
+        env.APP_ORIGIN,
+        'arch@example.test',
+      )
+    ).status,
+  ).toBe(404)
 })
 
 test('every refusal is private and carries no-store', async () => {

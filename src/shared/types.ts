@@ -10,6 +10,12 @@ export type Player = {
   /** Any number of ids from the group's tag list (see shared/types GroupTag). */
   tags: string[]
   /**
+   * Emails connected to this player. They let one person hold several accounts
+   * (or several people share one), and never decide access: every route keys
+   * on the account sub.
+   */
+  emails?: string[]
+  /**
    * Local only. The API never sends it and never accepts it: who is sitting
    * out is a per-device decision stored in localStorage.
    */
@@ -63,10 +69,41 @@ export type GroupInvite = {
   url?: string
 }
 
+export type InvitePlayer = {
+  id: string
+  name: string
+  username: string
+  elo: number
+}
+
 export type GroupInvitePreview = {
   groupId: string
   name: string
   role: 'editor' | 'viewer'
+  /** Enough of the roster to pick "that's me" before joining. */
+  players: InvitePlayer[]
+}
+
+/**
+ * A pending claim on a roster player, or a proposal to add one. Accepting an
+ * invite grants membership straight away; the player connection waits for an
+ * editor, who applies it from the group.
+ */
+export type GroupPlayerRequest = {
+  id: string
+  kind: 'link' | 'create'
+  /** The roster player a link request claims; null for a new player. */
+  playerId: string | null
+  /** That player's current name, when the row still exists. */
+  playerName: string | null
+  /** A proposed new player's display name. */
+  name: string | null
+  username: string | null
+  email: string
+  note: string
+  requesterName: string
+  isYou: boolean
+  createdAt: number
 }
 
 export type RoundPlayer = {

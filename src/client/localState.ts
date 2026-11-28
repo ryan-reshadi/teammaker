@@ -5,6 +5,7 @@ const SIT_KEY = 'teammaker.sitouts.v1'
 const ROUNDS_KEY = 'teammaker.rounds.v2'
 const LEGACY_ROUNDS_KEY = 'teammaker.rounds.v1'
 const GROUP_KEY = 'teammaker.activeGroup.v1'
+const CLAIM_EMAIL_KEY = 'teammaker.claimEmail.v1'
 const GUEST_TAGS_KEY = 'teammaker.guestTags.v1'
 const LEGACY_PLAYERS_KEY = 'teammaker.players.v1'
 const LEGACY_IMPORTED_KEY = 'teammaker.legacyRoundsImported.v1'
@@ -117,6 +118,23 @@ export function writeActiveGroupId(id: string | null) {
   } catch {
     // Nothing to do.
   }
+}
+
+/**
+ * The address a member used when asking to be connected to a player, per group,
+ * on this device. An account without an email has nothing else to recognise its
+ * own player by, and this keeps the connect prompt from nagging after approval.
+ */
+export function readClaimEmail(groupId: string): string | null {
+  const all = read<Record<string, string>>(CLAIM_EMAIL_KEY, {})
+  const email = all[groupId]
+  return typeof email === 'string' && email ? email : null
+}
+
+export function writeClaimEmail(groupId: string, email: string) {
+  const all = read<Record<string, string>>(CLAIM_EMAIL_KEY, {})
+  all[groupId] = email
+  write(CLAIM_EMAIL_KEY, all)
 }
 
 const legacyTag = (id: string): GroupTag | null => {

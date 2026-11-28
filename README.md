@@ -38,6 +38,17 @@ incomplete sign-in configuration.
   lists everyone with access: change a role or remove somebody at any time.
   Links can be revoked and are stored only as hashes. There is no email lookup
   or delivery, by design.
+- **Player connections** — after signing in on an invite, the visitor picks the
+  roster player they are (“I'm already on the roster”) or proposes a new one with
+  a display name and username — never an elo. Either choice is sent as a request
+  with their account email (an account without one is asked for an address on
+  the form) and an optional note; joining happens immediately, and any editor
+  approves or dismisses the claim from **Requests**. A member who joined without
+  connecting is prompted in the group and can file the same request from there.
+  An approved new
+  player starts at 0 elo with no tags and the proposer's email. Players can carry
+  several emails (alternate accounts) and one email can sit on several players;
+  editors connect or disconnect emails from a player's details.
 - **Roster** — add a player with a name and a rating. The ten-tick control shows
   the elo band and seeds a new player at rating × 100; the badge beside it shows
   the exact elo and opens an advanced field that edits it directly. Names rename
@@ -82,6 +93,8 @@ incomplete sign-in configuration.
 |---|---|---|---|
 | Read roster, tags, elo, match log | yes | yes | yes |
 | Add/rename/remove players, edit elo, tags, log/edit matches | yes | yes | — |
+| Connect/disconnect player emails, approve or dismiss player requests | yes | yes | — |
+| File or cancel your own player-link request | yes | yes | yes |
 | Rename group, change K | yes | yes | — |
 | Invite links, member roles, remove members, delete group | yes | — | — |
 | Sit-outs, generated teams, saved rounds (this device) | yes | yes | yes |
@@ -201,6 +214,16 @@ group_invites(id TEXT PRIMARY KEY, group_id TEXT, role TEXT,
               token_hash TEXT UNIQUE, created_by_sub TEXT, created_at INTEGER,
               revoked_at INTEGER, expires_at INTEGER)
 
+group_player_emails(group_id TEXT, player_id TEXT, email TEXT,
+                    added_by_sub TEXT, created_at INTEGER,
+                    PRIMARY KEY (group_id, player_id, email))
+
+group_player_requests(id TEXT PRIMARY KEY, group_id TEXT, requester_sub TEXT,
+                      requester_name TEXT, email TEXT, kind TEXT,
+                      player_id TEXT, name TEXT, username TEXT, note TEXT,
+                      status TEXT, decided_by_sub TEXT, decided_at INTEGER,
+                      created_at INTEGER, updated_at INTEGER)
+
 group_tags(group_id TEXT, id TEXT, label TEXT, short TEXT, sort INTEGER,
            created_at INTEGER, updated_at INTEGER,
            PRIMARY KEY (group_id, id))
@@ -232,6 +255,14 @@ but is no longer read or written; the API rejects it. `owner_sub` is the
 creator/audit column; every route scopes by `group_id` after checking
 membership. The old `settings`, `rating_meta` and `log_squashes` tables are read
 only during migration.
+
+`group_player_emails` is many-to-many on purpose: one player may be held by
+several emails (alternate accounts) and one email may sit on several players.
+Emails are labels, not identities — every route still authorizes on the account
+`sub`, and no membership or role is ever granted by email. `group_player_requests`
+holds pending claims (one per member per group); only an editor's approval touches
+the roster, and an approved new player is inserted at 0 elo with no tags and the
+requester's email attached.
 
 ## Guest mode vs shared
 
@@ -282,8 +313,14 @@ group is remembered per device too.
 | DELETE | `/api/groups/:id/invites/:inviteId` | revoke; owner |
 | GET | `/api/groups/:id/members` | people with access |
 | PATCH/DELETE | `/api/groups/:id/members/:userId` | role or removal; owner |
-| GET | `/api/invites/:token` | preview before joining |
-| POST | `/api/invites/:token/accept` | joins with the link's role |
+| GET | `/api/groups/:id/player-requests` | pending claims; editors see all, members their own |
+| POST | `/api/groups/:id/player-requests` | `{ claim, note? }`; any member, viewers included |
+| POST | `/api/groups/:id/player-requests/:rid/approve` | applies the claim; editor |
+| DELETE | `/api/groups/:id/player-requests/:rid` | dismiss (editor) or cancel your own |
+| POST | `/api/groups/:id/players/:pid/emails` | `{ email }`; editor, up to 10 per player |
+| DELETE | `/api/groups/:id/players/:pid/emails/:email` | disconnect an email; editor |
+| GET | `/api/invites/:token` | preview before joining, including the roster |
+| POST | `/api/invites/:token/accept` | joins with the link's role; an optional `{ claim, note? }` files a request |
 | GET | `/api/groups/:id/rounds` | legacy snapshots for one-time import |
 
 Data routes answer 401 when signed out, 404 for a group you cannot see, 403 for
@@ -292,12 +329,14 @@ a write your role does not allow (or a foreign origin), 400 for invalid input,
 
 ## Tests
 
-`bun test` runs these suites (162 tests):
+`bun test` runs these suites (179 tests):
 
 - `tests/groups.test.ts` — group CRUD, invite join/preview/revoke, viewer refusal
-  on every mutating route, non-member 404s, cross-group isolation, owner-only
-  sharing, tag scoping and stripping, device-local sit-outs, read-only legacy
-  rounds, and idempotent migration of a pre-groups workspace.
+  on every mutating route, player-claim requests (create and link, approval,
+  cancellation and the 0-elo start), editor-managed emails, non-member 404s,
+  cross-group isolation, owner-only sharing, tag scoping and stripping,
+  device-local sit-outs, read-only legacy rounds, and idempotent migration of a
+  pre-groups workspace.
 - `tests/elo.test.ts` — the scale, even and uneven matches, random inference,
   deterministic replay, edit/delete/reorder, K changes, squash behaviour and
   formula compatibility.
@@ -311,6 +350,12 @@ a write your role does not allow (or a foreign origin), 400 for invalid input,
   schema up/down migration, groups, tags, legacy events and squash.
 - `tests/rivals-browser.test.tsx` — the real import panel in a DOM, submitting
   through the actual Worker into a group.
+- `tests/connections-browser.test.tsx` — the whole player-connection journey
+  through the real components: invite preview, link and new-player claims,
+  joining without connecting, member-filed claims, invite-page claims where an
+  account with no email types an address (both link and create, validated and
+  normalised), viewer refusals, the editor review queue, cancellation and
+  dismissal, and the roster's email chips.
 - Plus `tests/history.test.ts`, `bench.test.ts`, `rematch.test.ts`,
   `rivals.test.ts`, `rivals-layout.test.ts`, `presentation.test.ts`,
   `pairRules.test.ts`, `store.test.ts` and `body-limit.test.ts`.
@@ -379,4 +424,6 @@ changing anything about sign-in.
 - Live updates are revision-polled (~2.5 s while the tab is visible). There is
   no presence indicator, and simultaneous edits are last-write-wins.
 - Invite links are multi-use until revoked; there is no expiry UI yet.
+- Player requests are reviewed in the app. Nothing is emailed, and a claim stays
+  pending until an editor applies or dismisses it.
 - Screenshot import runs entirely in the browser and needs no extra deployment.

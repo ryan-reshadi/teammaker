@@ -16,6 +16,11 @@ export const MAX_GROUP_NAME = 40
 export const MAX_TAG_LABEL = 24
 export const MAX_TAG_SHORT = 3
 export const MAX_TAG_ID = 40
+export const MAX_EMAIL_LENGTH = 254
+export const MAX_REQUEST_NOTE = 280
+export const MAX_EMAILS_PER_PLAYER = 10
+
+const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
 export type GroupRow = {
   id: string
@@ -47,6 +52,26 @@ export type MemberRow = {
 
 export const isGroupRole = (value: unknown): value is GroupRole =>
   value === 'owner' || value === 'editor' || value === 'viewer'
+
+/** Emails are labels on a player, stored lowercase and never used for access. */
+export const readEmail = (value: unknown): string | null => {
+  if (typeof value !== 'string') return null
+  const email = value.trim().toLowerCase()
+  return email.length >= 3 &&
+    email.length <= MAX_EMAIL_LENGTH &&
+    EMAIL_SHAPE.test(email) &&
+    !/[\u0000-\u001f\u007f]/.test(email)
+    ? email
+    : null
+}
+
+/** A request's personal note is optional free text with a small bound. */
+export const readNote = (value: unknown): string | null => {
+  if (value === undefined) return ''
+  if (typeof value !== 'string') return null
+  const note = value.trim().replace(/\s+/g, ' ')
+  return note.length <= MAX_REQUEST_NOTE ? note : null
+}
 
 export const readGroupName = (value: unknown): string | null => {
   if (typeof value !== 'string') return null

@@ -5,6 +5,7 @@ import type {
   GroupInvitePreview,
   GroupTag,
 } from '../../shared/types'
+import { PlayerClaimForm, type ClaimPayload } from './Requests'
 
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init)
@@ -533,10 +534,16 @@ export function TagsDialog({
 export function JoinPanel({
   token,
   signedIn,
+  email,
+  onClaimedEmail,
   onDone,
 }: {
   token: string
   signedIn: boolean
+  /** The signed-in account's email, shown on the claim form. */
+  email?: string
+  /** The address the visitor asked to connect, so this device can recognise it. */
+  onClaimedEmail?: (groupId: string, email: string) => void
   onDone: (groupId: string) => void
 }) {
   const [preview, setPreview] = useState<GroupInvitePreview | null>(null)
@@ -560,14 +567,16 @@ export function JoinPanel({
     }
   }, [token])
 
-  const accept = async () => {
+  /** Joining is immediate; a claim rides along as a pending request. */
+  const accept = async (payload?: ClaimPayload) => {
     setBusy(true)
     setError('')
     try {
       const body = await api<{ group: { id: string } }>(
         `/api/invites/${encodeURIComponent(token)}/accept`,
-        { method: 'POST' },
+        payload ? json('POST', payload) : { method: 'POST' },
       )
+      if (payload) onClaimedEmail?.(body.group.id, payload.email)
       onDone(body.group.id)
     } catch (problemValue) {
       setError(problem(problemValue))
@@ -579,7 +588,7 @@ export function JoinPanel({
     <div className="join-page">
       <div className="dialog join-dialog">
         <span className="brand-name">Teammaker</span>
-        {error ? (
+        {error && !preview ? (
           <>
             <h1>Invite unavailable</h1>
             <p role="alert" className="error">{error}</p>
@@ -607,14 +616,29 @@ export function JoinPanel({
             <h1>Join “{preview.name}”</h1>
             <p>
               You are joining as <strong>{roleLabel(preview.role)}</strong>.
+              Pick the player you are and an editor will connect your email to
+              them; you can also join now and ask later.
             </p>
+            {error && (
+              <p role="alert" className="error">
+                {error}
+              </p>
+            )}
+            <PlayerClaimForm
+              players={preview.players}
+              accountEmail={email}
+              submitLabel="Send request and join"
+              busy={busy}
+              onSubmit={(payload) => void accept(payload)}
+            />
             <div className="dialog-actions">
               <button
-                className="primary"
+                type="button"
+                className="quiet"
                 disabled={busy}
                 onClick={() => void accept()}
               >
-                {busy ? 'Joining…' : 'Join group'}
+                Continue without connecting
               </button>
               <a className="quiet link-button" href="/">
                 Not now
