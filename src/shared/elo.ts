@@ -59,6 +59,21 @@ export const skillFromElo = (elo: number): number =>
 export const eloFromSkill = (skill: number): number =>
   clampElo(Math.round(skill) * ELO_PER_SKILL)
 
+/**
+ * Elo is the stored rating and the 1-10 skill is its mirror. A patch that
+ * carries a skill moves the elo to that band's anchor; an explicit elo wins.
+ */
+export function ratingFromPatch(
+  current: { elo: number; skill: number },
+  patch: { elo?: number; skill?: number },
+): { elo: number; skill: number } {
+  const elo = clampElo(
+    patch.elo ??
+      (patch.skill === undefined ? current.elo : eloFromSkill(patch.skill)),
+  )
+  return { elo, skill: skillFromElo(elo) }
+}
+
 export const isKFactor = (value: unknown): value is number =>
   typeof value === 'number' &&
   Number.isInteger(value) &&

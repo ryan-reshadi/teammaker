@@ -2,6 +2,7 @@ import {
   DEFAULT_K_FACTOR,
   clampElo,
   eloFromSkill,
+  ratingFromPatch,
   skillFromElo,
   type MatchInput,
   type MatchesResponse,
@@ -126,14 +127,14 @@ function localStore(groupId: string): Store {
       const players = readLocal<Player>(key).map(withElo)
       const current = players.find((player) => player.id === id)
       if (!current) throw new Error('That player is no longer on the roster.')
-      const merged = { ...current, ...patch, updatedAt: Date.now() }
       // The 1-10 control sends a skill-only patch, and elo is the stored
       // rating: convert it the way the remote route does. An explicit elo wins.
-      const next = withElo(
-        patch.elo === undefined && patch.skill !== undefined
-          ? { ...merged, elo: eloFromSkill(patch.skill) }
-          : merged,
-      )
+      const next: Player = {
+        ...current,
+        ...patch,
+        ...ratingFromPatch(current, patch),
+        updatedAt: Date.now(),
+      }
       writeLocal(
         key,
         players.map((player) => (player.id === id ? next : player)),

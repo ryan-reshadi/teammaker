@@ -3,9 +3,7 @@ import { suggestSitOuts } from '../shared/balance'
 import { sitOutCounts } from '../shared/bench'
 import {
   DEFAULT_K_FACTOR,
-  clampElo,
-  eloFromSkill,
-  skillFromElo,
+  ratingFromPatch,
   type MatchInput,
   type RatingEventView,
   type SquashInfo,
@@ -70,15 +68,7 @@ const roleName = (role: GroupRole) =>
 
 /** Keep the elo and its 1-10 mirror consistent while a request is in flight. */
 function applyPatch(player: Player, patch: PlayerPatch): Player {
-  const next = { ...player, ...patch }
-  if (patch.elo !== undefined) {
-    next.elo = clampElo(patch.elo)
-    next.skill = skillFromElo(next.elo)
-  } else if (patch.skill !== undefined) {
-    next.elo = eloFromSkill(patch.skill)
-    next.skill = skillFromElo(next.elo)
-  }
-  return next
+  return { ...player, ...patch, ...ratingFromPatch(player, patch) }
 }
 
 const initialJoinToken = () => {

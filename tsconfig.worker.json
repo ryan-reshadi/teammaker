@@ -5,5 +5,10 @@
     "types": ["@cloudflare/workers-types", "bun"]
   },
   "include": ["src/worker", "src/shared", "src/server", "server", "scripts", "tests"],
-  "exclude": ["tests/rivals-browser.test.tsx", "tests/store.test.ts", "tests/rivals-layout.test.ts"]
+  "exclude": [
+    "tests/rivals-browser.test.tsx",
+    "tests/sharing-browser.test.tsx",
+    "tests/store.test.ts",
+    "tests/rivals-layout.test.ts"
+  ]
 }
